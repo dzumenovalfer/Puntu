@@ -1,0 +1,3 @@
+# Let members of the `input` group create the virtual keyboard via /dev/uinput,
+# so Puntu can run as a normal user service instead of root.
+KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"

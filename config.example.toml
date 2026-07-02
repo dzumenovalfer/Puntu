@@ -1,0 +1,48 @@
+# Example Puntu config. Copy to ~/.config/puntu/config.toml (the daemon also writes a default
+# there on first run). Hot-reloaded on save.
+
+# Detect but never inject — safe validation mode. For the IBus engine this turns OFF
+# auto-conversion: words stay exactly as typed and convert only on the manual flip (Ctrl+`).
+dry_run = false
+
+# Convert text pasted from the clipboard. With this on, "paste a word with Ctrl+V, then press
+# space" replaces a wrong-layout paste (ghbdtn → привет) in place. Off by default.
+# Toggle from the CLI with: `puntu config set paste_convert on`  (a future GUI uses the same file).
+paste_convert = false
+
+[detect]
+# Minimum word length considered for autocorrection.
+min_word_len = 2
+# How much better (mean trigram log-prob) the other layout must score to switch.
+switch_delta = 0.7
+# The other-layout candidate must itself score at least this high (look like a real word).
+alt_valid_min = -3.3
+
+# IBus engine hotkeys (the current, default front-end). Values are xkb keysym names
+# (case-insensitive); modifier taps are "Ctrl", "Shift", "Ctrl+Shift", …; "none" disables.
+[ibus_hotkeys]
+# Undo the last commit (restore exactly what you typed).
+undo_key = "Ctrl+grave"
+# Modifier tap that toggles EN auto-correct ↔ RU direct.
+mode_toggle = "Ctrl"
+# Modifier tap that converts the current mouse selection.
+convert_last = "Ctrl+Shift"
+# Regular hotkey (not a tap) for converting the selection — dependable if taps don't fire.
+convert_selection_key = "Ctrl+Alt+s"
+
+# ---- Legacy uinput daemon only (ignored by the IBus engine) ----
+# Hotkeys. code = Linux key code (119 = Pause/Break). Modifiers default to false.
+[hotkeys.undo]
+code = 119
+
+[hotkeys.convert_last]
+code = 119
+shift = true
+
+[hotkeys.add_exception]
+code = 119
+ctrl = true
+
+[hotkeys.force_correct]
+code = 119
+alt = true

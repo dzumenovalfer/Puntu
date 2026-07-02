@@ -1,0 +1,93 @@
+[package]
+name = "puntu"
+version = "0.2.0"
+edition = "2021"
+description = "Punto Switcher analog for Ubuntu (Wayland/GNOME): automatic keyboard layout corrector"
+license = "MIT"
+rust-version = "1.74"
+default-run = "puntu"
+
+[lib]
+name = "puntu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "puntu"
+path = "src/main.rs"
+
+# Offline n-gram inspection/generation helper.
+[[bin]]
+name = "puntu-train"
+path = "src/bin/train_ngram.rs"
+
+# System-tray front-end. Only built when the `gui` feature is on (keeps the default
+# daemon-only build free of zbus/tokio): `cargo build --features gui`.
+[[bin]]
+name = "puntu-gui"
+path = "src/bin/gui.rs"
+required-features = ["gui"]
+
+# IBus engine front-end. Built only with `--features ibus`. Receives the user's keystrokes
+# through IBus's input-method DBus protocol — no uinput, no clipboard hacks, no race
+# conditions with the user's concurrent typing (M5 in PLAN.md).
+[[bin]]
+name = "puntu-ibus"
+path = "src/bin/ibus_main.rs"
+required-features = ["ibus"]
+
+[features]
+# `daemon` pulls in the system-facing pieces (evdev capture/uinput, signal handling).
+# Core detection logic builds & tests without it: `cargo test --no-default-features --lib`.
+default = ["daemon"]
+daemon = ["dep:evdev", "dep:signal-hook"]
+# `gui` pulls in the StatusNotifierItem tray (ksni, pure-Rust zbus) + a small async runtime.
+# It only needs the always-available socket client (`ipc::send_command`), not evdev/uinput.
+gui = ["dep:ksni", "dep:tokio"]
+# `ibus` pulls in the IBus engine front-end (zbus DBus service over IBus's private bus).
+# An alternative to the uinput/clipboard correction path — the IBus engine receives the user's
+# keystrokes BEFORE they reach the app, so there are no race conditions to dodge. M5 in PLAN.md.
+ibus = ["dep:zbus", "dep:tokio", "dep:librush", "dep:xkeysym"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+crossbeam-channel = "0.5"
+notify = "6"
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+fst = "0.4"
+# `libc` is needed unconditionally for the `puntu mode` command's pidfile/kill logic, which
+# must work even in the no-default-features (core-only) build.
+libc = "0.2"
+
+# System-facing, optional (only with the `daemon` feature):
+evdev = { version = "0.12", optional = true }
+signal-hook = { version = "0.3", optional = true }
+
+# Tray front-end, optional (only with the `gui` feature):
+ksni = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal"], optional = true }
+
+# IBus engine front-end, optional (only with the `ibus` feature):
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
+# `librush` — pure-Rust IBus engine bindings (no GObject). Provides the correct IBusText /
+# IBusEngine serializers + DBus glue so we don't reimplement that from scratch.
+librush = { version = "0.2", default-features = false, features = ["tokio"], optional = true }
+xkeysym = { version = "0.2", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"   # keep unwinding so the panic hook can release the keyboard grab
+
+[patch.crates-io]
+# Vendored librush 0.2.2 with one addition: the `ContentType` DBus property is delegated to
+# `IBusEngine::set_content_type`, so the engine can see the input purpose (terminal/password)
+# of the focused field and go transparent there. Drop when upstream exposes it.
+librush = { path = "vendor/librush" }

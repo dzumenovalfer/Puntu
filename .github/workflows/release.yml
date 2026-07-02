@@ -1,0 +1,32 @@
+name: Release
+
+# Tag a commit `vX.Y.Z` and push the tag — this builds the IBus engine, compiles the big
+# Russian dictionary FST, and publishes puntu-x86_64-linux.tar.gz on a GitHub Release.
+# `install.sh` (remote mode) downloads exactly that artifact, so end users never need Rust.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (release, IBus engine)
+        run: cargo build --release --no-default-features --features ibus
+      - name: Build the big Russian dictionary FST (~2 MB from ~1.5M word forms)
+        run: ./target/release/puntu build-dict dictionaries/russian.utf-8 russian.fst
+      - name: Package
+        run: |
+          mkdir -p dist/puntu
+          cp target/release/puntu target/release/puntu-ibus russian.fst install.sh dist/puntu/
+          tar -C dist -czf puntu-x86_64-linux.tar.gz puntu
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: puntu-x86_64-linux.tar.gz
+          generate_release_notes: true

@@ -1,0 +1,18 @@
+[Unit]
+Description=Puntu — automatic keyboard layout corrector
+# Start once the graphical session (and thus GNOME/gsettings) is available.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Installed by `cargo install --path .` into ~/.cargo/bin.
+ExecStart=%h/.cargo/bin/puntu run
+Restart=on-failure
+RestartSec=2
+# If the daemon ever hangs while the keyboard is grabbed, killing the process closes the evdev
+# fd and the kernel releases EVIOCGRAB automatically. (sd_notify watchdog is a future add-on.)
+Environment=PUNTU_LOG=info
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # The IBus engine build — what release artifacts and install.sh use.
+      - name: Test (ibus engine)
+        run: cargo test --no-default-features --features ibus
+      # The legacy uinput daemon build still has to compile and pass its tests.
+      - name: Test (default / uinput daemon)
+        run: cargo test
+      # Lint report only — not a gate (yet).
+      - name: Clippy
+        run: cargo clippy --no-default-features --features ibus
+        continue-on-error: true
