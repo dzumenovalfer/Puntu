@@ -236,7 +236,8 @@ pub struct PuntuEngine {
     /// fully transparent — see [`Self::is_passthrough`].
     purpose: u32,
     /// True while an auxiliary-text hint is on screen, so the next letter can hide it.
-    hint_shown: bool,
+    /// Shared (`Arc`) because the async selection-conversion task also shows hints.
+    hint_shown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// `IBusInputPurpose` values we care about (mirror `GtkInputPurpose`).
@@ -264,7 +265,7 @@ impl PuntuEngine {
             hotkeys,
             autocorrect,
             purpose: 0,
-            hint_shown: false,
+            hint_shown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -277,15 +278,23 @@ impl PuntuEngine {
 
     /// Show a short auxiliary-text hint near the caret (hidden again on the next letter).
     async fn show_hint(&mut self, se: &SignalEmitter<'_>, text: &str) {
+        Self::show_hint_shared(se, &self.hint_shown, text).await;
+    }
+
+    /// [`Self::show_hint`] for contexts without `&mut self` (the async selection task).
+    async fn show_hint_shared(
+        se: &SignalEmitter<'_>,
+        hint_shown: &std::sync::atomic::AtomicBool,
+        text: &str,
+    ) {
         let _ = Self::update_auxiliary_text(se, text.to_string(), true).await;
-        self.hint_shown = true;
+        hint_shown.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Hide the auxiliary hint if one is showing.
     async fn hide_hint(&mut self, se: &SignalEmitter<'_>) {
-        if self.hint_shown {
+        if self.hint_shown.swap(false, std::sync::atomic::Ordering::Relaxed) {
             let _ = Self::update_auxiliary_text(se, String::new(), false).await;
-            self.hint_shown = false;
         }
     }
 
@@ -336,7 +345,7 @@ impl PuntuEngine {
             // delivered the modifier release events (known on some setups — use the
             // regular `convert_selection_key` hotkey there instead).
             tracing::info!("[puntu-engine {}] {kind:?} tap → convert selection", self.id);
-            self.handle_convert_last(se).await;
+            self.handle_convert_last(se);
         } else {
             // Recognised tap but no binding matches — silently ignore.
             debug!("[puntu-engine {}] {kind:?} tap → no binding", self.id);
@@ -384,62 +393,84 @@ impl PuntuEngine {
     /// Ctrl+Shift tap → **convert the current mouse selection**. Read the highlighted text from
     /// PRIMARY (read-only), transliterate it, delete the selection with one forwarded
     /// `Backspace` (a single Backspace clears the whole selection), then commit the converted
-    /// form over it. No clipboard write. No selection → no-op.
-    async fn handle_convert_last(&mut self, se: &SignalEmitter<'_>) {
+    /// form over it. No clipboard write. No selection → hint, no-op.
+    ///
+    /// The whole thing runs in a **detached task**, after `process_key_event` has returned.
+    /// Reading PRIMARY inline dead-locked: the compositor is still mid key event (waiting on
+    /// our reply) and won't service `wl-paste`, so every read hit the 0.4 s timeout —
+    /// `convert-selection: wl-paste failed (timeout/no owner)` on each attempt while the same
+    /// command finished in ~100 ms from a shell.
+    fn handle_convert_last(&mut self, se: &SignalEmitter<'_>) {
         // Do NOT flush the held word here: `commit_text` REPLACES an active selection in most
         // apps, so flushing would destroy the very selection we're about to convert. In
         // practice the mouse click that made the selection already triggered `reset()`, which
         // commits anything pending (see `flush_all`), so `held` is normally empty by now.
         let id = self.id;
-        let selection =
-            match tokio::task::spawn_blocking(move || read_primary_selection(id)).await {
-                Ok(sel) => sel,
-                Err(e) => {
-                    tracing::warn!("[puntu-engine {id}] convert-selection task failed: {e}");
-                    None
+        let detector = Arc::clone(&self.detector);
+        let dict = Arc::clone(&self.dict);
+        let hint_shown = Arc::clone(&self.hint_shown);
+        let se = se.to_owned();
+        tokio::spawn(async move {
+            let selection =
+                match tokio::task::spawn_blocking(move || read_primary_selection(id)).await {
+                    Ok(sel) => sel,
+                    Err(e) => {
+                        tracing::warn!("[puntu-engine {id}] convert-selection task failed: {e}");
+                        None
+                    }
+                };
+            let Some(selection) = selection else {
+                // The silent no-op here is what read as "Ctrl+Shift не работает" — say why.
+                Self::show_hint_shared(&se, &hint_shown, "Puntu: нет выделения").await;
+                return;
+            };
+            // Per-word detection first: only wrong-layout words convert; correctly-typed
+            // words, punctuation and spacing stay. This is what fixes a mixed selection like
+            // «почему то не переводит ghbdtn» — only the ghbdtn becomes привет, instead of
+            // the whole phrase being transliterated into gibberish by dominant script.
+            let converted = {
+                let dict = dict.lock().await;
+                crate::detect::convert_text(&selection, &detector, &dict)
+            };
+            // Fallback: the detector saw nothing to fix → the user wants a FORCE flip of text
+            // that reads as valid (e.g. they typed real English but meant the Russian keys).
+            // ONLY for a single non-command-shaped word: force-flipping a whole command line
+            // (`code --ozone-platform=wayland …` still in PRIMARY while pasting into a
+            // terminal with Ctrl+Shift+V, where the app swallows the V) appended garbage.
+            let converted = match converted {
+                Some(c) => c,
+                None if force_translit_allowed(&selection) => force_translit(&selection),
+                None => {
+                    tracing::info!(
+                        "[puntu-engine {id}] convert-selection: nothing to fix and selection \
+                         is multi-word/command-shaped — skipping {selection:?}"
+                    );
+                    Self::show_hint_shared(
+                        &se,
+                        &hint_shown,
+                        "Puntu: выделение не похоже на слово — не переведено",
+                    )
+                    .await;
+                    return;
                 }
             };
-        let Some(selection) = selection else {
-            // The silent no-op here is what read as "Ctrl+Shift не работает" — say why.
-            self.show_hint(se, "Puntu: нет выделения").await;
-            return;
-        };
-        // Per-word detection first: only wrong-layout words convert; correctly-typed words,
-        // punctuation and spacing stay. This is what fixes a mixed selection like
-        // «почему то не переводит ghbdtn» — only the ghbdtn becomes привет, instead of the
-        // whole phrase being transliterated into gibberish by dominant script.
-        let converted = {
-            let dict = self.dict.lock().await;
-            crate::detect::convert_text(&selection, &self.detector, &dict)
-        };
-        // Fallback: the detector saw nothing to fix → the user wants a FORCE flip of text
-        // that reads as valid (e.g. they typed real English but meant the Russian keys).
-        // ONLY for a single non-command-shaped word: force-flipping a whole command line
-        // (`code --ozone-platform=wayland …` still in PRIMARY while pasting into a terminal
-        // with Ctrl+Shift+V, where the app swallows the V) appended transliterated garbage.
-        let converted = match converted {
-            Some(c) => c,
-            None if force_translit_allowed(&selection) => force_translit(&selection),
-            None => {
+            if converted == selection {
                 tracing::info!(
-                    "[puntu-engine {id}] convert-selection: nothing to fix and selection is \
-                     multi-word/command-shaped — skipping {selection:?}"
+                    "[puntu-engine {id}] convert-selection: no change for {selection:?}"
                 );
-                self.show_hint(se, "Puntu: выделение не похоже на слово — не переведено").await;
+                Self::show_hint_shared(&se, &hint_shown, "Puntu: выделение уже в нужной раскладке")
+                    .await;
                 return;
             }
-        };
-        if converted == selection {
-            tracing::info!("[puntu-engine {id}] convert-selection: no change for {selection:?}");
-            self.show_hint(se, "Puntu: выделение уже в нужной раскладке").await;
-            return;
-        }
-        tracing::info!(
-            "[puntu-engine {id}] convert-selection: {selection:?} → {converted:?}"
-        );
-        forward_backspace(se).await;
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        self.commit_str(se, converted).await;
+            tracing::info!(
+                "[puntu-engine {id}] convert-selection: {selection:?} → {converted:?}"
+            );
+            forward_backspace(&se).await;
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            if let Err(e) = Self::commit_text(&se, converted).await {
+                tracing::warn!("[puntu-engine {id}] commit_text failed: {e}");
+            }
+        });
     }
 
     /// Commit the held word for real (it's now final) and clear the preedit. No-op if nothing
@@ -595,7 +626,7 @@ impl IBusEngine for PuntuEngine {
             if sel_hk.matches(keyval, &state) && !released {
                 debug!("[puntu-engine {}] convert-selection hotkey matched", self.id);
                 self.tap.cancel(); // same reason as the undo hotkey above
-                self.handle_convert_last(&se).await;
+                self.handle_convert_last(&se);
                 return Ok(true);
             }
         }
@@ -914,6 +945,15 @@ fn classify_keysym(keyval: Keysym, mods: Mods, lang: Lang) -> KeyEvent {
     match keyval {
         K::BackSpace => KeyEvent::Backspace,
         K::space | K::Return | K::Tab | K::KP_Enter => KeyEvent::Separator,
+        // Numpad text keys are ALWAYS separators — the numpad never types letters, so the
+        // main-row rule "'.' is ю in RU → part of a word" must not apply to KP_Decimal.
+        // (Without any classification they were Ignore → forwarded, and the forwarded char
+        // landed before the still-held preedit word: "+ctrl", "-порт".)
+        K::KP_0 | K::KP_1 | K::KP_2 | K::KP_3 | K::KP_4 | K::KP_5 | K::KP_6 | K::KP_7
+        | K::KP_8 | K::KP_9 | K::KP_Add | K::KP_Subtract | K::KP_Multiply | K::KP_Divide
+        | K::KP_Decimal | K::KP_Separator | K::KP_Equal | K::KP_Space => KeyEvent::Separator,
+        // Numpad navigation (NumLock off) moves the cursor exactly like the main-row keys —
+        // it must invalidate too, or the preedit desyncs from the moved cursor.
         K::Escape
         | K::Left
         | K::Right
@@ -924,7 +964,18 @@ fn classify_keysym(keyval: Keysym, mods: Mods, lang: Lang) -> KeyEvent {
         | K::Page_Up
         | K::Page_Down
         | K::Delete
-        | K::Insert => KeyEvent::Invalidate,
+        | K::Insert
+        | K::KP_Left
+        | K::KP_Right
+        | K::KP_Up
+        | K::KP_Down
+        | K::KP_Home
+        | K::KP_End
+        | K::KP_Page_Up
+        | K::KP_Page_Down
+        | K::KP_Delete
+        | K::KP_Insert
+        | K::KP_Begin => KeyEvent::Invalidate,
         _ => {
             let Some(cur_char) = keysym_to_char(keyval) else {
                 return KeyEvent::Ignore;
@@ -955,11 +1006,11 @@ fn classify_keysym(keyval: Keysym, mods: Mods, lang: Lang) -> KeyEvent {
 fn read_primary_selection(engine_id: u64) -> Option<String> {
     use std::process::Command;
 
-    // Run under `timeout` so a `wl-paste` that hangs (no primary-selection owner) can't freeze
-    // the engine — the IBus engine processes keys serially, so a stuck subprocess blocks ALL
-    // input until it returns. `timeout` kills it after 0.4s (exit 124 → treated as no selection).
+    // Run under `timeout` so a `wl-paste` that hangs (no primary-selection owner) can't leak
+    // a process. This runs in a detached task AFTER the key event completes, so it no longer
+    // blocks input — 1.5 s gives the compositor time to service wl-paste even under load.
     let out = match Command::new("timeout")
-        .args(["0.4", "wl-paste", "--primary", "--no-newline"])
+        .args(["1.5", "wl-paste", "--primary", "--no-newline"])
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -1222,7 +1273,34 @@ pub(crate) fn parse_tap_combo(s: &str) -> Option<TapKind> {
 
 /// Convert an IBus keysym to its Unicode character when one exists. For Latin-1 keysyms the
 /// keysym IS the Unicode code point; for `0x01000000..` the low 24 bits are.
+///
+/// Numpad keysyms (NumLock on) produce text but live outside the Latin-1 range, so they're
+/// mapped explicitly. Before this they classified as `Ignore` and were *forwarded* to the
+/// app while the last word was still held (uncommitted) in preedit — the forwarded char
+/// landed BEFORE the held word: typing `ctrl ` then numpad `+` produced `+ctrl `, and a
+/// numpad `-` before `порт ` produced `-порт` (the user-reported reorder bugs).
 fn keysym_to_char(keyval: Keysym) -> Option<char> {
+    match keyval {
+        Keysym::KP_0 => return Some('0'),
+        Keysym::KP_1 => return Some('1'),
+        Keysym::KP_2 => return Some('2'),
+        Keysym::KP_3 => return Some('3'),
+        Keysym::KP_4 => return Some('4'),
+        Keysym::KP_5 => return Some('5'),
+        Keysym::KP_6 => return Some('6'),
+        Keysym::KP_7 => return Some('7'),
+        Keysym::KP_8 => return Some('8'),
+        Keysym::KP_9 => return Some('9'),
+        Keysym::KP_Add => return Some('+'),
+        Keysym::KP_Subtract => return Some('-'),
+        Keysym::KP_Multiply => return Some('*'),
+        Keysym::KP_Divide => return Some('/'),
+        Keysym::KP_Decimal => return Some('.'),
+        Keysym::KP_Separator => return Some(','),
+        Keysym::KP_Equal => return Some('='),
+        Keysym::KP_Space => return Some(' '),
+        _ => {}
+    }
     let raw = keyval.raw();
     if raw >= 0x01000000 {
         char::from_u32(raw & 0xffffff)
@@ -1308,6 +1386,36 @@ mod tests {
         assert!(!force_translit_allowed("--force"));
         assert!(!force_translit_allowed("два слова"));
         assert!(!force_translit_allowed("v0.1"));
+    }
+
+    #[test]
+    fn numpad_keys_are_text_or_navigation_not_ignore() {
+        // KP_Add/KP_Subtract etc. produce text; classifying them Ignore forwarded the char
+        // ahead of the held preedit word ("+ctrl", "-порт"). They must be Separators.
+        for (k, c) in [
+            (Keysym::KP_Add, '+'),
+            (Keysym::KP_Subtract, '-'),
+            (Keysym::KP_Multiply, '*'),
+            (Keysym::KP_Divide, '/'),
+            (Keysym::KP_5, '5'),
+            (Keysym::KP_0, '0'),
+            (Keysym::KP_Decimal, '.'),
+        ] {
+            assert_eq!(keysym_to_char(k), Some(c), "{k:?}");
+            assert_eq!(
+                classify_keysym(k, Mods::default(), Lang::En),
+                KeyEvent::Separator,
+                "{k:?} must classify as Separator"
+            );
+        }
+        // NumLock-off numpad = navigation → must invalidate, same as the main-row keys.
+        for k in [Keysym::KP_Home, Keysym::KP_Left, Keysym::KP_Page_Down, Keysym::KP_Delete] {
+            assert_eq!(
+                classify_keysym(k, Mods::default(), Lang::En),
+                KeyEvent::Invalidate,
+                "{k:?} must classify as Invalidate"
+            );
+        }
     }
 
     #[test]
