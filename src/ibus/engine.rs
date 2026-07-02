@@ -458,25 +458,27 @@ impl PuntuEngine {
             };
             // Fallback: the detector saw nothing to fix → the user wants a FORCE flip of text
             // that reads as valid (e.g. they typed real English but meant the Russian keys).
-            // ONLY for a single non-command-shaped word: force-flipping a whole command line
+            // Command-shaped selections are refused — force-flipping a command line
             // (`code --ozone-platform=wayland …` still in PRIMARY while pasting into a
             // terminal with Ctrl+Shift+V, where the app swallows the V) appended garbage.
             let converted = match converted {
                 Some(c) => c,
-                None if force_translit_allowed(&selection) => force_translit(&selection),
-                None => {
-                    tracing::info!(
-                        "[puntu-engine {id}] convert-selection: nothing to fix and selection \
-                         is multi-word/command-shaped — skipping {selection:?}"
-                    );
-                    Self::show_hint_shared(
-                        &se,
-                        &hint_shown,
-                        "Puntu: выделение не похоже на слово — не переведено",
-                    )
-                    .await;
-                    return;
-                }
+                None => match force_flip_fallback(&selection) {
+                    Some(f) => f,
+                    None => {
+                        tracing::info!(
+                            "[puntu-engine {id}] convert-selection: nothing to fix and \
+                             selection is command-shaped — skipping {selection:?}"
+                        );
+                        Self::show_hint_shared(
+                            &se,
+                            &hint_shown,
+                            "Puntu: выделение похоже на команду — не переведено",
+                        )
+                        .await;
+                        return;
+                    }
+                },
             };
             if converted == selection {
                 tracing::info!(
@@ -1080,13 +1082,24 @@ fn read_primary_selection(engine_id: u64) -> Option<String> {
     Some(selection)
 }
 
-/// The force-flip fallback is allowed only for a single word (no whitespace) that doesn't
-/// look like a command/path/flag — that's the deliberate "я выделил слово, переведи" case.
-/// Anything longer or command-shaped only converts via the per-word detector, so a stale
-/// PRIMARY selection can never be mangled wholesale by an accidental Ctrl+Shift.
-fn force_translit_allowed(selection: &str) -> bool {
-    !selection.chars().any(char::is_whitespace)
-        && !crate::detect::userdict::is_command_context(selection)
+/// The force-flip fallback: the deliberate "я выделил, переведи" case when the detector saw
+/// nothing wrong. Selections arrive with edge whitespace (double-click grabs the trailing
+/// space — `"работал "`), so the core is trimmed for the check and the edges are kept
+/// verbatim in the result. Any command-shaped token (flag/path/version — `--force`, `v0.1`)
+/// refuses the flip, so a stale PRIMARY with a command line can never be mangled wholesale
+/// by an accidental Ctrl+Shift. Returns `None` when the flip is not allowed.
+fn force_flip_fallback(selection: &str) -> Option<String> {
+    let core = selection.trim();
+    if core.is_empty()
+        || core
+            .split_whitespace()
+            .any(crate::detect::userdict::is_command_context)
+    {
+        return None;
+    }
+    let lead = &selection[..selection.len() - selection.trim_start().len()];
+    let trail = &selection[selection.trim_end().len()..];
+    Some(format!("{lead}{}{trail}", force_translit(core)))
 }
 
 /// Force-transliterate `s` key-for-key to the other layout, picking the direction by which
@@ -1409,16 +1422,20 @@ mod tests {
     }
 
     #[test]
-    fn force_translit_fallback_is_gated() {
-        // Deliberate case: a single selected word flips even when it reads as valid.
-        assert!(force_translit_allowed("hello"));
-        assert!(force_translit_allowed("привет"));
-        // Command lines / multi-word selections never force-flip — this is what appended
-        // `сщву --щящту…` after a Ctrl+Shift+V paste in a terminal.
-        assert!(!force_translit_allowed("code --ozone-platform=wayland"));
-        assert!(!force_translit_allowed("--force"));
-        assert!(!force_translit_allowed("два слова"));
-        assert!(!force_translit_allowed("v0.1"));
+    fn force_flip_fallback_is_gated() {
+        // Deliberate case: selected words flip even when they read as valid.
+        assert_eq!(force_flip_fallback("hello").as_deref(), Some("руддщ"));
+        // Double-click selections carry the trailing space — trimmed for the check, kept in
+        // the output (this exact case showed «выделение не похоже на слово» to the user).
+        assert_eq!(force_flip_fallback("работал ").as_deref(), Some("hf,jnfk "));
+        // Multi-word phrases of plain words are allowed.
+        assert!(force_flip_fallback("два слова").is_some());
+        // Command lines never force-flip — this is what appended `сщву --щящту…` after a
+        // Ctrl+Shift+V paste in a terminal.
+        assert_eq!(force_flip_fallback("code --ozone-platform=wayland"), None);
+        assert_eq!(force_flip_fallback("--force"), None);
+        assert_eq!(force_flip_fallback("v0.1"), None);
+        assert_eq!(force_flip_fallback("   "), None);
     }
 
     #[test]
