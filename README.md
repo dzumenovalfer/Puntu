@@ -63,12 +63,13 @@ When **Puntu** is the active source you keep typing on a US keyboard. Two modes:
 Tap **Ctrl** again to toggle back. A small hint (`EN auto-correct` / `RU direct`) shows the
 current mode.
 
-### Terminals and password fields are untouched
+### Terminals: manual only; password fields: untouched
 
 When the focused field reports itself as a **terminal** (GNOME Terminal/Console and other
-VTE-based apps do) or a **password/PIN** field, Puntu goes fully transparent: no buffering, no
-preedit, no auto-correction, no hotkeys. A command line can never be mangled by a correction,
-and passwords never sit in a preedit.
+VTE-based apps do), automatic conversions are off — a command line can never be mangled by a
+correction. Manual use still works: tap **Ctrl** for RU-direct typing, `Ctrl+` `` ` `` to flip
+the last word. Selection conversion is disabled there (terminals don't replace a selection).
+**Password/PIN** fields make Puntu fully transparent — passwords never sit in a preedit.
 
 ### Hotkeys (defaults; configurable in `~/.config/puntu/config.toml`)
 

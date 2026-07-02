@@ -269,11 +269,26 @@ impl PuntuEngine {
         }
     }
 
-    /// Terminal / password / PIN fields: every keystroke passes through untouched — no
-    /// buffering, no preedit, no auto-correction, no taps or hotkeys. Auto-converting a
-    /// command line (or holding a password in preedit) is never acceptable there.
+    /// Password / PIN fields: every keystroke passes through untouched — no buffering, no
+    /// preedit, no hotkeys. A password must never sit in a preedit or be transliterated.
+    ///
+    /// Terminals are NOT in this list: there the rule is "no *automatic* conversions" (see
+    /// [`Self::in_terminal`]) — manual use (Ctrl tap → RU-direct, `Ctrl+` `` ` `` flip) must
+    /// keep working, and going fully transparent killed exactly that. Worse, it stuck: the
+    /// daemon doesn't send a fresh `SetContentType` for clients that never set one, so after
+    /// one terminal visit the engine stayed transparent in every app (hence the purpose
+    /// reset in `focus_in`/`enable`).
     fn is_passthrough(&self) -> bool {
-        matches!(self.purpose, PURPOSE_PASSWORD | PURPOSE_PIN | PURPOSE_TERMINAL)
+        matches!(self.purpose, PURPOSE_PASSWORD | PURPOSE_PIN)
+    }
+
+    /// Terminal field (VTE sets `InputPurpose::TERMINAL`): automatic conversions are off —
+    /// the detector never rewrites a command line — but everything manual stays: mode
+    /// toggle (RU-direct typing), the flip hotkey, preedit hold. Selection conversion is
+    /// also blocked because terminals don't delete a selection on Backspace, so replacing
+    /// it would append text instead.
+    fn in_terminal(&self) -> bool {
+        self.purpose == PURPOSE_TERMINAL
     }
 
     /// Show a short auxiliary-text hint near the caret (hidden again on the next letter).
@@ -401,6 +416,15 @@ impl PuntuEngine {
     /// `convert-selection: wl-paste failed (timeout/no owner)` on each attempt while the same
     /// command finished in ~100 ms from a shell.
     fn handle_convert_last(&mut self, se: &SignalEmitter<'_>) {
+        if self.in_terminal() {
+            // A terminal doesn't delete its selection on Backspace, so "replace" would
+            // APPEND the converted text after the original (the pasted-command corruption).
+            tracing::info!(
+                "[puntu-engine {}] convert-selection: skipped (terminal field)",
+                self.id
+            );
+            return;
+        }
         // Do NOT flush the held word here: `commit_text` REPLACES an active selection in most
         // apps, so flushing would destroy the very selection we're about to convert. In
         // practice the mouse click that made the selection already triggered `reset()`, which
@@ -544,8 +568,10 @@ impl PuntuEngine {
     async fn decide_renderings(&self, word: &CompletedWord) -> (String, String, bool) {
         match self.mode {
             EngineMode::Correcting => {
-                if !self.autocorrect {
-                    // dry_run: hold the word exactly as typed; conversion only on manual flip.
+                if !self.autocorrect || self.in_terminal() {
+                    // dry_run or a terminal: hold the word exactly as typed; conversion only
+                    // on the manual flip. In a terminal an auto-rewrite of what turns out to
+                    // be a command/flag is never acceptable — «в терминале только вручную».
                     return (word.cur.clone(), word.alt.clone(), false);
                 }
                 let dict = self.dict.lock().await;
@@ -817,6 +843,11 @@ impl IBusEngine for PuntuEngine {
         self.buffer.invalidate();
         self.held = None;
         self.tap.cancel();
+        // A new context: forget the previous one's purpose. Clients that care (terminals,
+        // password fields) set it again right after; clients that don't would otherwise
+        // inherit the stale value — one terminal visit left the engine transparent
+        // EVERYWHERE until the next explicit SetContentType.
+        self.purpose = 0;
         Ok(())
     }
 
@@ -838,6 +869,8 @@ impl IBusEngine for PuntuEngine {
         _server: &ObjectServer,
     ) -> fdo::Result<()> {
         debug!("[puntu-engine {}] focus_in", self.id);
+        // Same reset as `enable`: purpose describes the field being left otherwise.
+        self.purpose = 0;
         Ok(())
     }
 
@@ -1419,12 +1452,35 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_purposes() {
-        for (purpose, expect) in [(0u32, false), (8, true), (9, true), (10, true), (5, false)] {
-            let transparent =
-                matches!(purpose, PURPOSE_PASSWORD | PURPOSE_PIN | PURPOSE_TERMINAL);
-            assert_eq!(transparent, expect, "purpose {purpose}");
+    fn purpose_policy() {
+        let hk = HotkeyBindings::from_config(&crate::config::Config::default());
+        let dict = UserDict::empty(std::env::temp_dir().join("puntu-test-purpose"));
+        let det = Detector::new(
+            crate::detect::Models::default(),
+            crate::config::DetectConfig::default(),
+        );
+        let mut e = PuntuEngine::new(
+            1,
+            Arc::new(det),
+            Arc::new(AsyncMutex::new(dict)),
+            hk,
+            true,
+        );
+        // Passwords/PINs: fully transparent.
+        for p in [PURPOSE_PASSWORD, PURPOSE_PIN] {
+            e.purpose = p;
+            assert!(e.is_passthrough(), "purpose {p} must be passthrough");
+            assert!(!e.in_terminal());
         }
+        // Terminals: NOT transparent — manual mode (RU-direct, flip) must keep working;
+        // only automatic conversions are suppressed (checked in decide_renderings).
+        e.purpose = PURPOSE_TERMINAL;
+        assert!(!e.is_passthrough());
+        assert!(e.in_terminal());
+        // Ordinary fields.
+        e.purpose = 0;
+        assert!(!e.is_passthrough());
+        assert!(!e.in_terminal());
     }
 
     #[test]
