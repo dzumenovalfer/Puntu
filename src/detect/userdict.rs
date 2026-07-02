@@ -313,15 +313,18 @@ fn append_line(path: &Path, word: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn tmp() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("puntu-test-{}", std::process::id()));
+    /// Per-test directory: tests in one binary share a pid and run in parallel, so the dir
+    /// must be tagged per test or one test's `remove_dir_all` races another's file writes
+    /// (flaked on CI).
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("puntu-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
     }
 
     #[test]
     fn exception_suppresses_and_forget_restores() {
-        let mut d = UserDict::empty(tmp());
+        let mut d = UserDict::empty(tmp("exception"));
         assert!(!d.is_exception("превед", Lang::Ru));
         d.add("превед", Lang::Ru, ListKind::Manual).unwrap();
         assert!(d.is_exception("превед", Lang::Ru));
@@ -331,7 +334,7 @@ mod tests {
 
     #[test]
     fn learned_forget_is_targeted() {
-        let mut d = UserDict::empty(tmp());
+        let mut d = UserDict::empty(tmp("learned"));
         d.add("ghbdtn", Lang::En, ListKind::Learned).unwrap();
         d.add("ghbdtycr", Lang::En, ListKind::Learned).unwrap();
         d.forget("ghbdtn", Lang::En).unwrap();
@@ -341,14 +344,14 @@ mod tests {
 
     #[test]
     fn builtin_commands_are_exceptions() {
-        let d = UserDict::empty(tmp());
+        let d = UserDict::empty(tmp("builtin"));
         assert!(d.is_exception("git", Lang::En));
         assert!(d.is_exception("ls", Lang::En));
     }
 
     #[test]
     fn remove_does_not_dump_builtin_recognized_into_user_file() {
-        let dir = tmp();
+        let dir = tmp("remove");
         let mut d = UserDict::empty(dir.clone());
         d.add("tiktok", Lang::En, ListKind::Recognized).unwrap();
         d.add("zoom", Lang::En, ListKind::Recognized).unwrap();

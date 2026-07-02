@@ -13,12 +13,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # The IBus engine build — what release artifacts and install.sh use.
+      # The IBus engine build — what release artifacts and install.sh use. On failure the
+      # relevant lines are emitted as ::error:: annotations, which are publicly readable via
+      # the checks API (the raw job log is not).
       - name: Test (ibus engine)
-        run: cargo test --no-default-features --features ibus
+        run: |
+          set -o pipefail
+          cargo test --no-default-features --features ibus 2>&1 | tee /tmp/test.log || {
+            grep -E "error(\[|:)|FAILED|panicked" /tmp/test.log | head -10 \
+              | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          }
       # The legacy uinput daemon build still has to compile and pass its tests.
       - name: Test (default / uinput daemon)
-        run: cargo test
+        run: |
+          set -o pipefail
+          cargo test 2>&1 | tee /tmp/test.log || {
+            grep -E "error(\[|:)|FAILED|panicked" /tmp/test.log | head -10 \
+              | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          }
       # Lint report only — not a gate (yet).
       - name: Clippy
         run: cargo clippy --no-default-features --features ibus
