@@ -32,7 +32,7 @@ Targets Ubuntu/Debian GNOME (Wayland or X11). Because Puntu is an IBus engine, t
 ibus-daemon launches the engine on demand.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/puntu/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dzumenovalfer/Puntu/main/install.sh | bash
 ```
 
 This downloads the **latest prebuilt release** (binaries + the big Russian dictionary — no

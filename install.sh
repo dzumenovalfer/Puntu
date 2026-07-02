@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Puntu installer — one command, two modes.
 #
-#   Remote (recommended):   curl -fsSL https://raw.githubusercontent.com/OWNER/puntu/main/install.sh | bash
+#   Remote (recommended):   curl -fsSL https://raw.githubusercontent.com/dzumenovalfer/Puntu/main/install.sh | bash
 #     Downloads the latest GitHub release (prebuilt x86_64 binaries + the big Russian
 #     dictionary) — no Rust toolchain needed. Falls back to a source build when there is no
 #     matching release for your architecture.
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 # The GitHub repository releases are fetched from (override with PUNTU_REPO=owner/name).
-PUNTU_REPO="${PUNTU_REPO:-OWNER/puntu}"
+PUNTU_REPO="${PUNTU_REPO:-dzumenovalfer/Puntu}"
 
 say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
