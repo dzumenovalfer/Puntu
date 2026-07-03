@@ -166,6 +166,42 @@ if command -v gsettings >/dev/null 2>&1 \
 fi
 ibus engine puntu >/dev/null 2>&1 || true
 
+# 7. Electron/Chromium apps: enable the system input method -------------------
+# An IBus engine only sees keys from apps connected to the input-method framework. Electron
+# apps must run in native Wayland with IME enabled, or NO system input method works in them
+# (Puntu, Chinese, Japanese — alike). One-time and harmless when already set.
+say "Configuring Electron apps for the system input method…"
+ENV_CONF="$HOME/.config/environment.d/90-puntu-electron.conf"
+if ! grep -qs "ELECTRON_OZONE_PLATFORM_HINT" "$ENV_CONF" 2>/dev/null; then
+  mkdir -p "$(dirname "$ENV_CONF")"
+  printf 'ELECTRON_OZONE_PLATFORM_HINT=auto\n' > "$ENV_CONF"
+  say "  ELECTRON_OZONE_PLATFORM_HINT=auto set (applies after the next login)"
+fi
+
+# VS Code (.deb / non-snap): persist the Wayland-IME flags in argv.json.
+if command -v code >/dev/null 2>&1 && ! readlink -f "$(command -v code)" | grep -q "^/snap/"; then
+  ARGV="$HOME/.vscode/argv.json"
+  mkdir -p "$HOME/.vscode"
+  if [[ ! -f "$ARGV" ]]; then
+    printf '{\n\t"ozone-platform-hint": "auto",\n\t"enable-wayland-ime": true,\n\t"wayland-text-input-version": 3\n}\n' > "$ARGV"
+    say "  VS Code: created $ARGV with Wayland-IME flags (restart VS Code)"
+  elif ! grep -q "enable-wayland-ime" "$ARGV"; then
+    sed -i '0,/{/s//{\n\t"ozone-platform-hint": "auto",\n\t"enable-wayland-ime": true,\n\t"wayland-text-input-version": 3,/' "$ARGV"
+    say "  VS Code: added Wayland-IME flags to $ARGV (restart VS Code)"
+  fi
+fi
+
+# Snap VS Code is a dead end: its launcher hard-codes `--ozone-platform=x11` as the LAST
+# argument (last flag wins in Chromium), and its core20 runtime can't start under the host
+# Wayland stack when bypassing the wrapper. Nothing we can configure — tell the user.
+if command -v snap >/dev/null 2>&1 && snap list code >/dev/null 2>&1; then
+  warn "Snap VS Code cannot use system input methods (its launcher hard-codes X11)."
+  warn "For Puntu (or any IME) in VS Code, install the official .deb instead:"
+  warn "  sudo snap remove code"
+  warn "  wget -qO /tmp/code.deb 'https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-x64'"
+  warn "  sudo apt install -y /tmp/code.deb    # settings and extensions are preserved"
+fi
+
 say "Done."
 cat <<EOF
 

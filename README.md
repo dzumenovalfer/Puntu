@@ -63,6 +63,28 @@ When **Puntu** is the active source you keep typing on a US keyboard. Two modes:
 Tap **Ctrl** again to toggle back. A small hint (`EN auto-correct` / `RU direct`) shows the
 current mode.
 
+### Electron/Chromium apps (VS Code, Claude, Chrome, Slack…)
+
+An IBus engine only sees keystrokes from apps connected to the input-method framework.
+Electron/Chromium apps must run in **native Wayland with IME enabled** — otherwise *no*
+system input method works in them (Puntu, Chinese or Japanese input alike; it's a
+platform-wide limitation, not a Puntu one).
+
+`install.sh` handles this automatically: it sets `ELECTRON_OZONE_PLATFORM_HINT=auto`
+(takes effect after the next login) and writes the flags into VS Code's
+`~/.vscode/argv.json`. For other Electron apps add these flags to their launcher
+(`.desktop` file):
+
+```
+--ozone-platform-hint=auto --enable-wayland-ime --wayland-text-input-version=3
+```
+
+> ⚠️ **Snap VS Code cannot work with any input method**: its launcher hard-codes
+> `--ozone-platform=x11`, and its bundled runtime can't start under the host Wayland stack
+> when bypassed. Install the official .deb from
+> [code.visualstudio.com](https://code.visualstudio.com/download) instead — settings and
+> extensions are preserved.
+
 ### Terminals: manual only; password fields: untouched
 
 When the focused field reports itself as a **terminal** (GNOME Terminal/Console and other
