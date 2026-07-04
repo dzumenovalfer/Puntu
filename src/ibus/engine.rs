@@ -159,11 +159,15 @@ impl TapDetector {
             .started
             .take()
             .is_some_and(|t| t.elapsed() <= self.max_hold);
-        let fire = if !self.armed || !quick {
+        let fire = if !self.armed {
             None
         } else if self.peak_ctrl && self.peak_shift {
+            // Ctrl+Shift together is already a deliberate two-modifier gesture — fire
+            // regardless of how long it was held (users pause to look at the selection).
+            // The max-hold guard is for the bare-Ctrl tap, where a long hold usually means
+            // an aborted shortcut, not a mode-toggle request.
             Some(TapKind::CtrlShift)
-        } else if self.peak_ctrl {
+        } else if self.peak_ctrl && quick {
             Some(TapKind::Ctrl)
         } else {
             None // Shift-only tap isn't a recognised gesture
@@ -1723,12 +1727,14 @@ mod tests {
         tap.ctrl_press(false);
         assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
 
+        // Ctrl+Shift is a deliberate two-modifier gesture — it fires even after a long
+        // hold (the user paused to look at the selection before releasing).
         let mut tap = TapDetector::new(500);
         tap.ctrl_press(false);
         tap.shift_press(false);
         tap.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
         assert_eq!(tap.shift_release(), None);
-        assert_eq!(tap.ctrl_release(), None);
+        assert_eq!(tap.ctrl_release(), Some(TapKind::CtrlShift));
     }
 
     #[test]

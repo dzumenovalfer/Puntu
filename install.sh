@@ -69,7 +69,7 @@ if [[ "$LOCAL" -eq 1 ]]; then
   # `--no-default-features --features ibus` builds only the engine and the pure-core CLI
   # (dict / config / build-dict). It skips evdev/uinput entirely — no device dependencies.
   say "Building and installing puntu-ibus + puntu (release)…"
-  cargo install --path "$REPO_DIR" --no-default-features --features ibus --force
+  cargo install --path "$REPO_DIR" --no-default-features --features ibus,app --force
   BIN_DIR="$HOME/.cargo/bin"
 
   if [[ -f "$REPO_DIR/dictionaries/russian.utf-8" ]]; then
@@ -96,6 +96,8 @@ else
     BIN_DIR="$HOME/.local/bin"
     mkdir -p "$BIN_DIR"
     install -m 0755 "$TMP/puntu/puntu" "$TMP/puntu/puntu-ibus" "$BIN_DIR/"
+    # The unified settings+dictionary window (absent from pre-0.4 releases).
+    [[ -f "$TMP/puntu/puntu-app" ]] && install -m 0755 "$TMP/puntu/puntu-app" "$BIN_DIR/"
     if [[ -f "$TMP/puntu/russian.fst" ]]; then
       say "Installing the big Russian dictionary → $CONFIG_DIR/russian.fst"
       install -m 0644 "$TMP/puntu/russian.fst" "$CONFIG_DIR/russian.fst"
@@ -166,38 +168,23 @@ if command -v gsettings >/dev/null 2>&1 \
 fi
 ibus engine puntu >/dev/null 2>&1 || true
 
-# 7. App-menu entries: the settings and dictionary windows --------------------
-# Makes Puntu discoverable as an application (GNOME overview search: «Puntu»), not only as
-# a CLI: «Puntu — настройки» opens the zenity settings window, «Puntu — словарь» the
-# dictionary editor.
-say "Installing application menu entries…"
+# 7. App-menu entry: the Puntu application (settings + dictionary in one window) ----------
+say "Installing the application menu entry…"
 APPS_DIR="$HOME/.local/share/applications"
 mkdir -p "$APPS_DIR"
-cat > "$APPS_DIR/puntu-settings.desktop" <<DESK
+# Drop the two split entries earlier versions installed.
+rm -f "$APPS_DIR/puntu-settings.desktop" "$APPS_DIR/puntu-dictionary.desktop"
+cat > "$APPS_DIR/puntu.desktop" <<DESK
 [Desktop Entry]
-Name=Puntu — настройки
-Name[en]=Puntu Settings
-Comment=Настройки автопереключения раскладки
-Comment[en]=Keyboard layout auto-corrector settings
-Exec=$BIN_DIR/puntu settings
+Name=Puntu
+Comment=Настройки и словарь автопереключения раскладки
+Comment[en]=Keyboard layout auto-corrector: settings and dictionary
+Exec=$BIN_DIR/puntu-app
 Icon=input-keyboard
 Type=Application
 Terminal=false
 Categories=Utility;Settings;
-Keywords=puntu;keyboard;layout;раскладка;настройки;
-DESK
-cat > "$APPS_DIR/puntu-dictionary.desktop" <<DESK
-[Desktop Entry]
-Name=Puntu — словарь
-Name[en]=Puntu Dictionary
-Comment=Словарь автопереключения раскладки
-Comment[en]=Keyboard layout auto-corrector dictionary
-Exec=$BIN_DIR/puntu dict ui
-Icon=input-keyboard
-Type=Application
-Terminal=false
-Categories=Utility;
-Keywords=puntu;dictionary;словарь;
+Keywords=puntu;keyboard;layout;раскладка;настройки;словарь;dictionary;
 DESK
 update-desktop-database "$APPS_DIR" 2>/dev/null || true
 

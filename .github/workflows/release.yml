@@ -16,14 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build (release, IBus engine)
-        run: cargo build --release --no-default-features --features ibus
+      - name: Build (release, IBus engine + app window)
+        run: cargo build --release --no-default-features --features ibus,app
       - name: Build the big Russian dictionary FST (~2 MB from ~1.5M word forms)
         run: ./target/release/puntu build-dict dictionaries/russian.utf-8 russian.fst
       - name: Package
         run: |
           mkdir -p dist/puntu
-          cp target/release/puntu target/release/puntu-ibus russian.fst install.sh dist/puntu/
+          cp target/release/puntu target/release/puntu-ibus target/release/puntu-app \
+             russian.fst install.sh dist/puntu/
           tar -C dist -czf puntu-x86_64-linux.tar.gz puntu
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

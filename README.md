@@ -127,13 +127,14 @@ Rejecting an auto-conversion (flip it back with `Ctrl+` `` ` ``) still teaches t
 the word is added to the never-correct list. Every dictionary change fires a desktop
 notification and reaches the running engine within a second — no restart.
 
-### Settings window and app-menu entries
+### The Puntu app (settings + dictionary)
 
-`install.sh` adds two launchers to the applications menu (search «Puntu» in the GNOME
-overview): **Puntu — настройки** (`puntu settings`) — toggles for auto-correction, taps and
-each learning mechanism, hotkey bindings, thresholds; and **Puntu — словарь**
-(`puntu dict ui`). Both are plain zenity windows; changing a setting offers an engine
-restart to apply it.
+`install.sh` adds a **Puntu** application to the menu (`puntu-app`): one window with two
+tabs. *Настройки* — on/off switches for auto-correction, taps and each learning mechanism,
+hotkey bindings assigned by **pressing the keys**, thresholds. *Словарь* — your word pairs
+(«привет / ghbdtn») with search, add and remove. Dictionary edits reach the running engine
+within a second; settings changes offer an engine restart button. (`puntu settings` and
+`puntu dict ui` remain as zenity-based CLI fallbacks.)
 
 ### Dictionaries (via the `puntu` CLI)
 

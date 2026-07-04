@@ -24,6 +24,9 @@ jobs:
               | while IFS= read -r l; do echo "::error::$l"; done
             exit 1
           }
+      # The unified settings/dictionary window must keep compiling.
+      - name: Check (app window)
+        run: cargo check --no-default-features --features ibus,app
       # The legacy uinput daemon build still has to compile and pass its tests.
       - name: Test (default / uinput daemon)
         run: |

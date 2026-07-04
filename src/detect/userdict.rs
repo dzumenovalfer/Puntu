@@ -146,8 +146,27 @@ impl UserDict {
     }
 
     /// Add `word` to a list (both in memory and on disk).
+    ///
+    /// Conflicting entries are resolved so the **latest user action wins**:
+    /// * learning a Recognized word (`увы`) removes its wrong-layout form (`eds`) from the
+    ///   exception lists — a stale exception silently blocked the freshly-taught conversion
+    ///   (exceptions are checked before recognized words in `Detector::decide`);
+    /// * adding an exception (flip-back auto-learning) removes the counterpart from the
+    ///   recognized list, so the dictionary doesn't show both «переводить» and
+    ///   «не исправлять» rows for one pair.
     pub fn add(&mut self, word: &str, lang: Lang, kind: ListKind) -> Result<()> {
         let w = word.to_lowercase();
+        match kind {
+            ListKind::Recognized => {
+                let wrong = crate::detect::translit::convert(&w, lang, lang.other());
+                self.drop_from(&wrong, lang.other(), &[ListKind::Manual, ListKind::Learned])?;
+            }
+            ListKind::Manual | ListKind::Learned => {
+                let counterpart = crate::detect::translit::convert(&w, lang, lang.other());
+                self.drop_from(&counterpart, lang.other(), &[ListKind::Recognized])?;
+            }
+            _ => {}
+        }
         match (kind, lang) {
             (ListKind::Command, _) => {
                 self.commands.insert(w.clone());
@@ -178,6 +197,19 @@ impl UserDict {
             }
         }
         append_line(&self.dir.join(kind.file_name(lang)), &w)
+    }
+
+    /// Remove `word` from the given lists of one language, rewriting only files that
+    /// actually changed. Used for conflict resolution in [`Self::add`].
+    fn drop_from(&mut self, word: &str, lang: Lang, kinds: &[ListKind]) -> Result<()> {
+        for &kind in kinds {
+            let set = self.set_mut(lang, kind);
+            if set.remove(word) {
+                let snapshot = persistable(set, lang, kind);
+                write_list(&self.dir.join(kind.file_name(lang)), &snapshot)?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove `word` from every list of every language and rewrite affected files.
@@ -369,6 +401,23 @@ mod tests {
         let file = std::fs::read_to_string(dir.join("words.en.txt")).unwrap();
         let words: Vec<&str> = file.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(words, vec!["zoom"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_resolves_conflicts_latest_wins() {
+        let dir = tmp("conflict");
+        let mut d = UserDict::empty(dir.clone());
+        // A stale exception («eds» flipped back once) silently blocked a freshly-taught
+        // word — teaching «увы» must clear it, or the user sees learning "not working".
+        d.add("eds", Lang::En, ListKind::Learned).unwrap();
+        assert!(d.is_exception("eds", Lang::En));
+        d.add("увы", Lang::Ru, ListKind::Recognized).unwrap();
+        assert!(!d.is_exception("eds", Lang::En), "teaching must clear the blocking exception");
+        assert!(d.is_recognized("увы", Lang::Ru));
+        // The reverse: a later flip-back exception clears the recognized entry.
+        d.add("eds", Lang::En, ListKind::Learned).unwrap();
+        assert!(!d.is_recognized("увы", Lang::Ru), "flip-back must clear the taught word");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

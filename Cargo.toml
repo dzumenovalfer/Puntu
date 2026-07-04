@@ -1,6 +1,6 @@
 [package]
 name = "puntu"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 description = "Punto Switcher analog for Ubuntu (Wayland/GNOME): automatic keyboard layout corrector"
 license = "MIT"
@@ -27,6 +27,12 @@ name = "puntu-gui"
 path = "src/bin/gui.rs"
 required-features = ["gui"]
 
+# Unified settings + dictionary window. Built only with `--features app`.
+[[bin]]
+name = "puntu-app"
+path = "src/bin/app.rs"
+required-features = ["app"]
+
 # IBus engine front-end. Built only with `--features ibus`. Receives the user's keystrokes
 # through IBus's input-method DBus protocol — no uinput, no clipboard hacks, no race
 # conditions with the user's concurrent typing (M5 in PLAN.md).
@@ -43,6 +49,8 @@ daemon = ["dep:evdev", "dep:signal-hook"]
 # `gui` pulls in the StatusNotifierItem tray (ksni, pure-Rust zbus) + a small async runtime.
 # It only needs the always-available socket client (`ipc::send_command`), not evdev/uinput.
 gui = ["dep:ksni", "dep:tokio"]
+# `app` builds the unified settings + dictionary window (`puntu-app`, eframe/egui).
+app = ["dep:eframe"]
 # `ibus` pulls in the IBus engine front-end (zbus DBus service over IBus's private bus).
 # An alternative to the uinput/clipboard correction path — the IBus engine receives the user's
 # keystrokes BEFORE they reach the app, so there are no race conditions to dodge. M5 in PLAN.md.
@@ -71,6 +79,10 @@ signal-hook = { version = "0.3", optional = true }
 # Tray front-end, optional (only with the `gui` feature):
 ksni = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal"], optional = true }
+
+# Unified settings + dictionary window (`puntu-app`), optional (`app` feature). Pure Rust
+# (winit + glow); needs only the system GL libraries every desktop already has.
+eframe = { version = "0.35", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
 
 # IBus engine front-end, optional (only with the `ibus` feature):
 zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
