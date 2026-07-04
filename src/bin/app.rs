@@ -1,14 +1,14 @@
 //! Puntu — единое окно настроек и словаря (`puntu-app`).
 //!
-//! Одно приложение с двумя вкладками:
-//! * **Настройки** — GNOME-подобные переключатели вкл/выкл для каждого механизма, назначение
-//!   клавиш «нажатием» (кнопка → нажмите сочетание), краткие описания.
-//! * **Словарь** — пары «слово / как набирается» по всем пользовательским спискам, поиск,
-//!   добавление и удаление.
+//! * **Настройки** — тумблеры вкл/выкл, назначение клавиш нажатием, выбор тап-жестов.
+//! * **Словарь** — пары «правильное слово / как набирается», поиск, добавление; действие
+//!   каждого слова (переводить / не исправлять / всегда переводить) меняется на месте.
 //!
-//! Изменения настроек пишутся в `config.toml` сразу; движок читает конфиг при старте, поэтому
-//! внизу появляется кнопка «Применить» (перезапуск движка). Правки словаря движок подхватывает
-//! сам через hot-reload — перезапуск не нужен.
+//! Правки словаря движок подхватывает сам (hot-reload, ~секунда). Настройки движок читает
+//! при старте — после изменений внизу появляется кнопка «Применить», и приложение честно
+//! сообщает, перезапустился движок или нет.
+
+use std::sync::mpsc;
 
 use eframe::egui;
 use puntu::config::{self, Config};
@@ -19,8 +19,8 @@ use puntu::keymap::Lang;
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([620.0, 560.0])
-            .with_min_inner_size([520.0, 420.0])
+            .with_inner_size([680.0, 600.0])
+            .with_min_inner_size([560.0, 440.0])
             .with_title("Puntu"),
         ..Default::default()
     };
@@ -48,6 +48,39 @@ enum Capture {
     Remember,
 }
 
+/// One dictionary row, with everything needed to move the word between lists.
+struct Row {
+    /// The form stored in its list (typed form for exceptions/force, correct for recognized).
+    stored: String,
+    /// Правильное написание.
+    correct: String,
+    /// Как оно набирается не в той раскладке.
+    typed: String,
+    /// Language of `correct`.
+    correct_lang: Lang,
+    /// Language of `typed`.
+    typed_lang: Lang,
+    action: Action,
+}
+
+/// What happens to the word — the third dictionary column.
+#[derive(PartialEq, Clone, Copy)]
+enum Action {
+    Convert,      // Recognized: кривая форма переводится в правильную
+    Leave,        // Manual/Learned: никогда не исправлять
+    ForceConvert, // Force: набранная форма всегда переводится
+}
+
+impl Action {
+    fn label(self) -> &'static str {
+        match self {
+            Action::Convert => "переводить",
+            Action::Leave => "не исправлять",
+            Action::ForceConvert => "всегда переводить",
+        }
+    }
+}
+
 struct App {
     cfg: Config,
     dict: UserDict,
@@ -60,6 +93,8 @@ struct App {
     status: String,
     /// remember_key value before it was switched off, to restore on re-enable.
     remember_prev: String,
+    /// Result channel of the engine-restart thread (None = no restart in flight).
+    restart_rx: Option<mpsc::Receiver<String>>,
 }
 
 impl App {
@@ -83,6 +118,7 @@ impl App {
             new_word: String::new(),
             status: String::new(),
             remember_prev,
+            restart_rx: None,
         }
     }
 
@@ -96,13 +132,93 @@ impl App {
         }
     }
 
+    /// Restart the engine in a background thread and report the actual outcome — «движок
+    /// перезапускается…» that never resolves was unreadable.
     fn restart_engine(&mut self) {
-        // Detached: `ibus restart` takes a couple of seconds — don't freeze the UI.
-        let _ = std::process::Command::new("sh")
-            .args(["-c", "ibus restart && sleep 2 && ibus engine puntu"])
-            .spawn();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let ok = std::process::Command::new("ibus")
+                .arg("restart")
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = std::process::Command::new("ibus").args(["engine", "puntu"]).status();
+            let active = std::process::Command::new("ibus")
+                .arg("engine")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "puntu")
+                .unwrap_or(false);
+            let _ = tx.send(if ok && active {
+                "Движок перезапущен, Puntu активен".to_string()
+            } else if ok {
+                "Движок перезапущен; выберите Puntu в переключателе раскладок".to_string()
+            } else {
+                "Не удалось перезапустить движок (ibus restart)".to_string()
+            });
+        });
+        self.restart_rx = Some(rx);
         self.dirty = false;
-        self.status = "Движок перезапускается…".to_string();
+        self.status = "Перезапускаю движок…".to_string();
+    }
+
+    /// Collect dictionary rows across the user lists (built-in seeds excluded).
+    fn rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for lang in [Lang::Ru, Lang::En] {
+            for w in self.dict.user_recognized(lang) {
+                rows.push(Row {
+                    stored: w.clone(),
+                    correct: w.clone(),
+                    typed: translit::convert(&w, lang, lang.other()),
+                    correct_lang: lang,
+                    typed_lang: lang.other(),
+                    action: Action::Convert,
+                });
+            }
+            for (kind, action) in
+                [(ListKind::Force, Action::ForceConvert), (ListKind::Learned, Action::Leave), (ListKind::Manual, Action::Leave)]
+            {
+                for w in self.dict.list(kind, lang) {
+                    // Exception/force lists store the form AS TYPED; its counterpart is the
+                    // "correct" reading.
+                    rows.push(Row {
+                        stored: w.clone(),
+                        correct: translit::convert(&w, lang, lang.other()),
+                        typed: w.clone(),
+                        correct_lang: lang.other(),
+                        typed_lang: lang,
+                        action,
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    /// Move a word to the list matching `action` («последнее действие побеждает»).
+    fn apply_action(&mut self, row: &Row, action: Action) {
+        let result = (|| -> anyhow::Result<String> {
+            self.dict.remove(&row.stored)?;
+            match action {
+                Action::Convert => {
+                    self.dict.add(&row.correct, row.correct_lang, ListKind::Recognized)?;
+                    Ok(format!("«{}» теперь переводится ({} -> {})", row.correct, row.typed, row.correct))
+                }
+                Action::Leave => {
+                    self.dict.add(&row.typed, row.typed_lang, ListKind::Manual)?;
+                    Ok(format!("«{}» больше не исправляется", row.typed))
+                }
+                Action::ForceConvert => {
+                    self.dict.add(&row.typed, row.typed_lang, ListKind::Force)?;
+                    Ok(format!("«{}» всегда переводится в «{}»", row.typed, row.correct))
+                }
+            }
+        })();
+        self.status = match result {
+            Ok(msg) => msg,
+            Err(e) => format!("Ошибка: {e}"),
+        };
     }
 }
 
@@ -146,6 +262,30 @@ fn row(ui: &mut egui::Ui, name: &str, desc: &str, control: impl FnOnce(&mut egui
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
     });
     ui.separator();
+}
+
+/// A combo box over the tap-gesture options (`Ctrl` / `Ctrl+Shift` / выкл ⇒ "none").
+fn tap_combo(ui: &mut egui::Ui, id: &str, value: &mut String) -> bool {
+    let display = |v: &str| match v.to_ascii_lowercase().as_str() {
+        "none" => "выкл".to_string(),
+        other => other.to_string(),
+    };
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(display(value))
+        .show_ui(ui, |ui| {
+            for opt in ["Ctrl", "Ctrl+Shift", "none"] {
+                if ui
+                    .selectable_label(value.eq_ignore_ascii_case(opt), display(opt))
+                    .clicked()
+                    && !value.eq_ignore_ascii_case(opt)
+                {
+                    *value = opt.to_string();
+                    changed = true;
+                }
+            }
+        });
+    changed
 }
 
 /// Map an egui key press to the config's hotkey syntax (`Ctrl+Alt+d`, `Ctrl+grave`, `F12`).
@@ -267,9 +407,53 @@ impl App {
                 }
             });
 
-            row(ui, "Тапы модификаторов", "тап Ctrl — режим EN↔RU; Ctrl+Shift — перевод выделения", |ui| {
+            row(ui, "Тапы модификаторов", "жесты из одних модификаторов, без других клавиш", |ui| {
                 if toggle(ui, &mut cfg.enable_modifier_taps).changed() {
                     save = true;
+                }
+            });
+
+            row(ui, "Смена режима EN↔RU", "тап — переключает авто-исправление и прямой русский", |ui| {
+                if tap_combo(ui, "mode_toggle", &mut cfg.ibus_hotkeys.mode_toggle) {
+                    save = true;
+                }
+            });
+
+            row(ui, "Перевод выделения (тап)", "перевести выделенное мышью", |ui| {
+                if tap_combo(ui, "convert_last", &mut cfg.ibus_hotkeys.convert_last) {
+                    save = true;
+                }
+            });
+
+            row(ui, "Флип последнего слова", "перевести последнее слово туда-обратно", |ui| {
+                if ui.button(binding_label(&cfg.ibus_hotkeys.undo_key)).clicked() {
+                    self.capture = Some(Capture::Undo);
+                }
+            });
+
+            row(ui, "Перевод выделения (клавиша)", "альтернатива тапу", |ui| {
+                if ui
+                    .button(binding_label(&cfg.ibus_hotkeys.convert_selection_key))
+                    .clicked()
+                {
+                    self.capture = Some(Capture::ConvertSelection);
+                }
+            });
+
+            let mut remember_on = !cfg.ibus_hotkeys.remember_key.eq_ignore_ascii_case("none");
+            row(ui, "Запомнить слово", "выделенное/последнее слово — в словарь", |ui| {
+                if toggle(ui, &mut remember_on).changed() {
+                    cfg.ibus_hotkeys.remember_key = if remember_on {
+                        self.remember_prev.clone()
+                    } else {
+                        "none".to_string()
+                    };
+                    save = true;
+                }
+                if remember_on
+                    && ui.button(binding_label(&cfg.ibus_hotkeys.remember_key)).clicked()
+                {
+                    self.capture = Some(Capture::Remember);
                 }
             });
 
@@ -288,38 +472,6 @@ impl App {
                         cfg.learning.suggest_after = n;
                         save = true;
                     }
-                }
-            });
-
-            let mut remember_on = !cfg.ibus_hotkeys.remember_key.eq_ignore_ascii_case("none");
-            row(ui, "Запомнить слово", "клавиша: выделенное/последнее слово — в словарь", |ui| {
-                if toggle(ui, &mut remember_on).changed() {
-                    cfg.ibus_hotkeys.remember_key = if remember_on {
-                        self.remember_prev.clone()
-                    } else {
-                        "none".to_string()
-                    };
-                    save = true;
-                }
-                if remember_on
-                    && ui.button(binding_label(&cfg.ibus_hotkeys.remember_key)).clicked()
-                {
-                    self.capture = Some(Capture::Remember);
-                }
-            });
-
-            row(ui, "Флип последнего слова", "перевести последнее слово туда-обратно", |ui| {
-                if ui.button(binding_label(&cfg.ibus_hotkeys.undo_key)).clicked() {
-                    self.capture = Some(Capture::Undo);
-                }
-            });
-
-            row(ui, "Перевод выделения (клавиша)", "альтернатива тапу Ctrl+Shift", |ui| {
-                if ui
-                    .button(binding_label(&cfg.ibus_hotkeys.convert_selection_key))
-                    .clicked()
-                {
-                    self.capture = Some(Capture::ConvertSelection);
                 }
             });
 
@@ -343,11 +495,15 @@ impl App {
     fn dictionary_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Поиск:");
-            ui.text_edit_singleline(&mut self.search);
-            ui.separator();
-            let add = ui.text_edit_singleline(&mut self.new_word);
-            let clicked = ui.button("Добавить").clicked();
-            if (clicked || (add.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
+            ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(220.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Новое слово (правильное написание):");
+            let add_field =
+                ui.add(egui::TextEdit::singleline(&mut self.new_word).desired_width(180.0));
+            let submitted =
+                add_field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Добавить").clicked() || submitted)
                 && !self.new_word.trim().is_empty()
             {
                 let word = self.new_word.trim().to_lowercase();
@@ -359,7 +515,7 @@ impl App {
                 match self.dict.add(&word, lang, ListKind::Recognized) {
                     Ok(()) => {
                         let wrong = translit::convert(&word, lang, lang.other());
-                        self.status = format!("Запомнено: {wrong} → {word}");
+                        self.status = format!("Запомнено: {wrong} -> {word}");
                         self.new_word.clear();
                     }
                     Err(e) => self.status = format!("Ошибка: {e}"),
@@ -368,45 +524,49 @@ impl App {
         });
         ui.separator();
 
-        // (word, wrong form, list label) across the user lists.
-        let mut rows: Vec<(String, String, &str)> = Vec::new();
-        for lang in [Lang::Ru, Lang::En] {
-            for w in self.dict.user_recognized(lang) {
-                rows.push((w.clone(), translit::convert(&w, lang, lang.other()), "переводить"));
-            }
-            for (kind, label) in [
-                (ListKind::Force, "всегда переводить"),
-                (ListKind::Learned, "не исправлять"),
-                (ListKind::Manual, "не исправлять"),
-            ] {
-                for w in self.dict.list(kind, lang) {
-                    rows.push((w.clone(), translit::convert(&w, lang, lang.other()), label));
-                }
-            }
-        }
+        let mut rows = self.rows();
         let filter = self.search.trim().to_lowercase();
         if !filter.is_empty() {
-            rows.retain(|(w, alt, _)| w.contains(&filter) || alt.contains(&filter));
+            rows.retain(|r| r.correct.contains(&filter) || r.typed.contains(&filter));
         }
 
+        let mut pending: Option<(usize, Action)> = None;
         let mut remove: Option<String> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("dict")
                 .num_columns(4)
                 .striped(true)
-                .min_col_width(110.0)
+                .min_col_width(120.0)
                 .show(ui, |ui| {
                     ui.label(egui::RichText::new("Слово").strong());
                     ui.label(egui::RichText::new("Набирается как").strong());
                     ui.label(egui::RichText::new("Действие").strong());
                     ui.label("");
                     ui.end_row();
-                    for (w, alt, label) in &rows {
-                        ui.label(w);
-                        ui.label(alt);
-                        ui.label(*label);
-                        if ui.small_button("✕").clicked() {
-                            remove = Some(w.clone());
+                    for (i, r) in rows.iter().enumerate() {
+                        ui.label(&r.correct);
+                        ui.label(&r.typed);
+                        let mut action = r.action;
+                        egui::ComboBox::from_id_salt(format!("act{i}"))
+                            .selected_text(action.label())
+                            .show_ui(ui, |ui| {
+                                for opt in
+                                    [Action::Convert, Action::Leave, Action::ForceConvert]
+                                {
+                                    if ui
+                                        .selectable_label(action == opt, opt.label())
+                                        .clicked()
+                                        && action != opt
+                                    {
+                                        action = opt;
+                                    }
+                                }
+                            });
+                        if action != r.action {
+                            pending = Some((i, action));
+                        }
+                        if ui.small_button("удалить").clicked() {
+                            remove = Some(r.stored.clone());
                         }
                         ui.end_row();
                     }
@@ -415,6 +575,18 @@ impl App {
                 ui.label(egui::RichText::new("Словарь пуст").weak());
             }
         });
+        if let Some((i, action)) = pending {
+            let row = &rows[i];
+            let row = Row {
+                stored: row.stored.clone(),
+                correct: row.correct.clone(),
+                typed: row.typed.clone(),
+                correct_lang: row.correct_lang,
+                typed_lang: row.typed_lang,
+                action: row.action,
+            };
+            self.apply_action(&row, action);
+        }
         if let Some(w) = remove {
             match self.dict.remove(&w) {
                 Ok(()) => self.status = format!("Удалено: {w}"),
@@ -426,6 +598,23 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Engine-restart progress: poll the background thread's answer.
+        if let Some(rx) = &self.restart_rx {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    self.status = msg;
+                    self.restart_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.status = "Не удалось перезапустить движок".to_string();
+                    self.restart_rx = None;
+                }
+            }
+        }
+
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Настройки");
@@ -438,7 +627,7 @@ impl eframe::App for App {
                     if ui.button("Применить (перезапустить движок)").clicked() {
                         self.restart_engine();
                     }
-                } else {
+                } else if self.restart_rx.is_none() {
                     ui.label(egui::RichText::new("Изменения словаря применяются сами").weak());
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -450,5 +639,10 @@ impl eframe::App for App {
             Tab::Settings => self.settings_tab(ui),
             Tab::Dictionary => self.dictionary_tab(ui),
         });
+
+        // Never enable the system IME for this window: the engine would otherwise
+        // auto-correct the very words being typed into the dictionary fields (the reported
+        // «дописывает часть» corruption). Plain winit key events bypass IBus entirely.
+        ui.ctx().output_mut(|o| o.ime = None);
     }
 }

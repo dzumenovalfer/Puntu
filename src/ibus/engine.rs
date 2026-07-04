@@ -742,9 +742,15 @@ impl PuntuEngine {
                 }
             }
             EngineMode::DirectRussian => {
-                let cur_is_real_en = self.detector.is_known_word(&word.cur, self.lang);
-                let alt_is_real_ru =
-                    self.detector.is_known_word(&word.alt, self.lang.other());
+                // Consult the USER dictionaries too, not only the built-in ones: a word
+                // taught via Ctrl+Alt+D / the app («devops») must keep its Latin reading in
+                // RU-direct mode right away — the built-in models load once at startup, so
+                // without this the teaching visibly "did nothing" until an engine restart.
+                let dict = self.dict.lock().await;
+                let cur_is_real_en = self.detector.is_known_word(&word.cur, self.lang)
+                    || dict.is_recognized(&word.cur, self.lang);
+                let alt_is_real_ru = self.detector.is_known_word(&word.alt, self.lang.other())
+                    || dict.is_recognized(&word.alt, self.lang.other());
                 if cur_is_real_en && !alt_is_real_ru {
                     (word.cur.clone(), word.alt.clone(), false)
                 } else {
