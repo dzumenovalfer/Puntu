@@ -139,6 +139,9 @@ struct App {
     remember_prev: String,
     /// Result channel of the engine-restart thread (None = no restart in flight).
     restart_rx: Option<mpsc::Receiver<String>>,
+    /// Peak modifiers seen during an active capture — releasing them all without a plain
+    /// key assigns a modifier TAP (`Ctrl`, `Alt+Shift`, …) instead of a hotkey.
+    capture_peak: egui::Modifiers,
 }
 
 impl App {
@@ -163,7 +166,13 @@ impl App {
             status: String::new(),
             remember_prev,
             restart_rx: None,
+            capture_peak: egui::Modifiers::NONE,
         }
+    }
+
+    fn start_capture(&mut self, target: Capture) {
+        self.capture = Some(target);
+        self.capture_peak = egui::Modifiers::NONE;
     }
 
     fn save_cfg(&mut self) {
@@ -308,6 +317,33 @@ fn row(ui: &mut egui::Ui, name: &str, desc: &str, control: impl FnOnce(&mut egui
     ui.separator();
 }
 
+
+/// A collapsible settings group rendered as an Adwaita-style card (rounded box with an
+/// expander arrow, like Ubuntu's «Дополнительные параметры раскладки» dialog).
+fn card_group(
+    ui: &mut egui::Ui,
+    title: &str,
+    desc: &str,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .corner_radius(10)
+        .inner_margin(10)
+        .outer_margin(egui::Margin { bottom: 6, ..Default::default() })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::CollapsingHeader::new(egui::RichText::new(title).strong())
+                .default_open(false)
+                .show(ui, |ui| {
+                    if !desc.is_empty() {
+                        ui.label(egui::RichText::new(desc).weak().size(11.0));
+                    }
+                    body(ui);
+                });
+        });
+}
+
 /// Is a tap-combo config value effectively "off"?
 fn parse_off(v: &str) -> bool {
     v.trim().is_empty() || v.eq_ignore_ascii_case("none")
@@ -383,14 +419,27 @@ impl App {
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
         let mut save = false;
 
-        // Hotkey capture overlay: while active, eat the next key press.
+        // Hotkey capture overlay: while active, eat the next key press. Two outcomes:
+        //   * a plain key (with or without modifiers) → a hotkey binding (`Ctrl+r`, `F9`);
+        //   * ONLY modifiers pressed and then all released → a modifier tap (`Ctrl`,
+        //     `Alt+Shift`) — this is how «переключение на Ctrl» is assigned, since bare
+        //     modifiers never arrive as key events.
         if let Some(target) = self.capture {
             ui.scope(|ui| {
                 ui.visuals_mut().override_text_color = Some(egui::Color32::LIGHT_BLUE);
-                ui.label("Нажмите сочетание клавиш…   (Esc — отмена)");
+                ui.label("Нажмите клавишу или сочетание (можно только модификаторы: Ctrl, Alt+Shift…)   Esc — отмена");
             });
             ui.separator();
-            let captured = ui.ctx().input(|i| {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            let mods_now = ui.ctx().input(|i| i.modifiers);
+            self.capture_peak = egui::Modifiers {
+                alt: self.capture_peak.alt | mods_now.alt,
+                ctrl: self.capture_peak.ctrl | mods_now.ctrl,
+                shift: self.capture_peak.shift | mods_now.shift,
+                mac_cmd: false,
+                command: self.capture_peak.command | (mods_now.command && !mods_now.ctrl),
+            };
+            let key_captured = ui.ctx().input(|i| {
                 for ev in &i.events {
                     if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
                         if *key == egui::Key::Escape {
@@ -403,7 +452,33 @@ impl App {
                 }
                 None
             });
-            if let Some(result) = captured {
+            // Modifier-tap outcome: something was held, now everything is released, and no
+            // plain key fired this frame.
+            let tap_combo = if key_captured.is_none()
+                && mods_now.is_none()
+                && !self.capture_peak.is_none()
+            {
+                let mut parts = Vec::new();
+                if self.capture_peak.ctrl {
+                    parts.push("Ctrl");
+                }
+                if self.capture_peak.alt {
+                    parts.push("Alt");
+                }
+                if self.capture_peak.shift {
+                    parts.push("Shift");
+                }
+                if self.capture_peak.command {
+                    parts.push("Super");
+                }
+                let combo = parts.join("+");
+                // Bare Shift is not a valid gesture (aborted capitals) — ignore it.
+                (combo != "Shift").then_some(combo)
+            } else {
+                None
+            };
+            let mut done = false;
+            if let Some(result) = key_captured {
                 if let Some(binding) = result {
                     match target {
                         Capture::Undo => self.cfg.ibus_hotkeys.undo_key = binding,
@@ -421,10 +496,32 @@ impl App {
                     }
                     save = true;
                 }
+                done = true;
+            } else if let Some(combo) = tap_combo {
+                match target {
+                    // For the mode/conversion gestures a modifier combo means a TAP binding.
+                    Capture::ModeToggleKey => {
+                        self.cfg.ibus_hotkeys.mode_toggle = combo;
+                        self.cfg.ibus_hotkeys.mode_toggle_key = "none".to_string();
+                        self.cfg.enable_modifier_taps = true;
+                    }
+                    Capture::ConvertSelection => {
+                        self.cfg.ibus_hotkeys.convert_last = combo;
+                        self.cfg.enable_modifier_taps = true;
+                    }
+                    // Hotkey-only fields can't be a bare modifier — ignore.
+                    Capture::Undo | Capture::Remember => {}
+                }
+                save = true;
+                done = true;
+            }
+            if done {
                 self.capture = None;
+                self.capture_peak = egui::Modifiers::NONE;
             }
         }
 
+        let mut capture_request: Option<Capture> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             let cfg = &mut self.cfg;
 
@@ -472,26 +569,21 @@ impl App {
                                 .button(binding_label(&cfg.ibus_hotkeys.remember_key))
                                 .clicked()
                         {
-                            self.capture = Some(Capture::Remember);
+                            capture_request = Some(Capture::Remember);
                         }
                     });
 
                     row(ui, "Флип последнего слова", "перевести туда-обратно", |ui| {
                         if ui.button(binding_label(&cfg.ibus_hotkeys.undo_key)).clicked() {
-                            self.capture = Some(Capture::Undo);
+                            capture_request = Some(Capture::Undo);
                         }
                     });
                 });
             }
 
             // ---- Переключение режима EN↔RU: a GNOME-Tweaks-style option list ----
-            ui.label(egui::RichText::new("Переключение на другую раскладку").strong());
-            ui.label(
-                egui::RichText::new("режим EN-автокоррекции ↔ прямой русский ввод")
-                    .weak()
-                    .size(11.0),
-            );
-            ui.indent("switch_list", |ui| {
+            card_group(ui, "Переключение на другую раскладку",
+                "режим EN-автокоррекции ↔ прямой русский ввод", |ui| {
                 let key_mode = !cfg.ibus_hotkeys.mode_toggle_key.eq_ignore_ascii_case("none");
                 let current_tap = cfg.ibus_hotkeys.mode_toggle.to_ascii_lowercase();
                 for (combo, label) in SWITCH_OPTIONS {
@@ -505,14 +597,14 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     if ui.radio(key_mode, "своя клавиша:").clicked() && !key_mode {
-                        self.capture = Some(Capture::ModeToggleKey);
+                        capture_request = Some(Capture::ModeToggleKey);
                     }
                     if key_mode {
                         if ui
                             .button(binding_label(&cfg.ibus_hotkeys.mode_toggle_key))
                             .clicked()
                         {
-                            self.capture = Some(Capture::ModeToggleKey);
+                            capture_request = Some(Capture::ModeToggleKey);
                         }
                     } else {
                         ui.label(
@@ -527,11 +619,10 @@ impl App {
                     save = true;
                 }
             });
-            ui.separator();
 
             // ---- Перевод выделения ----
-            ui.label(egui::RichText::new("Перевод выделенного текста").strong());
-            ui.indent("convert_list", |ui| {
+            card_group(ui, "Перевод выделенного текста",
+                "выделите мышью и нажмите жест или клавишу", |ui| {
                 let current = cfg.ibus_hotkeys.convert_last.to_ascii_lowercase();
                 for (combo, label) in SWITCH_OPTIONS {
                     let selected = current == combo.to_ascii_lowercase();
@@ -551,7 +642,7 @@ impl App {
                         .button(binding_label(&cfg.ibus_hotkeys.convert_selection_key))
                         .clicked()
                     {
-                        self.capture = Some(Capture::ConvertSelection);
+                        capture_request = Some(Capture::ConvertSelection);
                     }
                 });
             });
@@ -569,6 +660,9 @@ impl App {
             });
         });
 
+        if let Some(target) = capture_request {
+            self.start_capture(target);
+        }
         if save {
             self.save_cfg();
         }
