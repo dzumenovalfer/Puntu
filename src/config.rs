@@ -75,8 +75,13 @@ pub struct IBusHotkeys {
     /// Flip the last (held) word between its two layout readings — undo/redo of the
     /// conversion. Default `"Ctrl+grave"` (works on every keyboard, unlike Pause).
     pub undo_key: String,
-    /// Modifier tap that toggles Correcting↔DirectRussian mode. Default `"Ctrl"`.
+    /// Modifier tap that toggles Correcting↔DirectRussian mode. Any `+`-joined combination
+    /// of `Ctrl`/`Shift`/`Alt`/`Super` (e.g. `"Alt+Shift"`, like the system layout switch);
+    /// `"none"` disables. Default `"Ctrl"`.
     pub mode_toggle: String,
+    /// Regular key (not a tap) that toggles the mode — e.g. `"Pause"`, `"CapsLock"`,
+    /// `"Super+space"`. `"none"` (default) disables. NB: CapsLock also flips the caps state.
+    pub mode_toggle_key: String,
     /// Modifier tap that re-converts the last commit (swap RU↔EN reading). Default
     /// `"Ctrl+Shift"`.
     pub convert_last: String,
@@ -95,6 +100,7 @@ impl Default for IBusHotkeys {
             // Ctrl+` (backtick) — works on every keyboard, including laptops without Pause.
             undo_key: "Ctrl+grave".to_string(),
             mode_toggle: "Ctrl".to_string(),
+            mode_toggle_key: "none".to_string(),
             convert_last: "Ctrl+Shift".to_string(),
             // Ctrl+Alt+S — `s` for "selection", and Ctrl+Alt combos are mostly free in
             // user space (GNOME reserves Super+*, Alt+F* for window mgmt; terminals use

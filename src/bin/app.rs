@@ -29,10 +29,53 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_zoom_factor(1.1);
+            apply_adwaita_theme(&cc.egui_ctx);
             Ok(Box::new(App::new()))
         }),
     )
 }
+
+/// Approximate the GNOME Adwaita-dark look: its background/accent palette, larger paddings
+/// and full-round toggles, so the window doesn't feel alien next to native dialogs.
+fn apply_adwaita_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+    let v = &mut style.visuals;
+    let bg = egui::Color32::from_rgb(0x24, 0x24, 0x24); // Adwaita dark window
+    let card = egui::Color32::from_rgb(0x30, 0x30, 0x30); // card / list row
+    let widget = egui::Color32::from_rgb(0x3a, 0x3a, 0x3a);
+    let accent = egui::Color32::from_rgb(0x35, 0x84, 0xe4); // GNOME blue
+    v.panel_fill = bg;
+    v.window_fill = bg;
+    v.extreme_bg_color = egui::Color32::from_rgb(0x1e, 0x1e, 0x1e);
+    v.faint_bg_color = card;
+    v.widgets.noninteractive.bg_fill = card;
+    v.widgets.inactive.bg_fill = widget;
+    v.widgets.inactive.weak_bg_fill = widget;
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x45, 0x45, 0x45);
+    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0x45, 0x45, 0x45);
+    v.widgets.active.bg_fill = accent;
+    v.selection.bg_fill = accent;
+    v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    let round = |w: &mut egui::style::WidgetVisuals| w.corner_radius = 8.into();
+    round(&mut v.widgets.noninteractive);
+    round(&mut v.widgets.inactive);
+    round(&mut v.widgets.hovered);
+    round(&mut v.widgets.active);
+    round(&mut v.widgets.open);
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    ctx.set_style_of(egui::Theme::Dark, style);
+}
+
+/// The layout-switch options offered in the settings list, GNOME-Tweaks style.
+const SWITCH_OPTIONS: &[(&str, &str)] = &[
+    ("Ctrl", "тап Ctrl"),
+    ("Ctrl+Shift", "тап Ctrl+Shift"),
+    ("Alt+Shift", "тап Alt+Shift (как системное переключение)"),
+    ("Ctrl+Alt", "тап Ctrl+Alt"),
+    ("Super", "тап Super (Win)"),
+];
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -46,6 +89,7 @@ enum Capture {
     Undo,
     ConvertSelection,
     Remember,
+    ModeToggleKey,
 }
 
 /// One dictionary row, with everything needed to move the word between lists.
@@ -264,28 +308,9 @@ fn row(ui: &mut egui::Ui, name: &str, desc: &str, control: impl FnOnce(&mut egui
     ui.separator();
 }
 
-/// A combo box over the tap-gesture options (`Ctrl` / `Ctrl+Shift` / выкл ⇒ "none").
-fn tap_combo(ui: &mut egui::Ui, id: &str, value: &mut String) -> bool {
-    let display = |v: &str| match v.to_ascii_lowercase().as_str() {
-        "none" => "выкл".to_string(),
-        other => other.to_string(),
-    };
-    let mut changed = false;
-    egui::ComboBox::from_id_salt(id)
-        .selected_text(display(value))
-        .show_ui(ui, |ui| {
-            for opt in ["Ctrl", "Ctrl+Shift", "none"] {
-                if ui
-                    .selectable_label(value.eq_ignore_ascii_case(opt), display(opt))
-                    .clicked()
-                    && !value.eq_ignore_ascii_case(opt)
-                {
-                    *value = opt.to_string();
-                    changed = true;
-                }
-            }
-        });
-    changed
+/// Is a tap-combo config value effectively "off"?
+fn parse_off(v: &str) -> bool {
+    v.trim().is_empty() || v.eq_ignore_ascii_case("none")
 }
 
 /// Map an egui key press to the config's hotkey syntax (`Ctrl+Alt+d`, `Ctrl+grave`, `F12`).
@@ -389,6 +414,10 @@ impl App {
                             self.cfg.ibus_hotkeys.remember_key = binding.clone();
                             self.remember_prev = binding;
                         }
+                        Capture::ModeToggleKey => {
+                            self.cfg.ibus_hotkeys.mode_toggle_key = binding;
+                            self.cfg.ibus_hotkeys.mode_toggle = "none".to_string();
+                        }
                     }
                     save = true;
                 }
@@ -399,6 +428,7 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let cfg = &mut self.cfg;
 
+            // ---- Автокоррекция: master switch + its sub-options underneath ----
             let mut autocorrect = !cfg.dry_run;
             row(ui, "Автокоррекция", "исправлять слова не в той раскладке", |ui| {
                 if toggle(ui, &mut autocorrect).changed() {
@@ -406,75 +436,127 @@ impl App {
                     save = true;
                 }
             });
+            if autocorrect {
+                ui.indent("auto_sub", |ui| {
+                    let mut suggest = cfg.learning.suggest_after > 0;
+                    row(ui, "Предлагать запоминание", "после N ручных переводов слова", |ui| {
+                        if toggle(ui, &mut suggest).changed() {
+                            cfg.learning.suggest_after = if suggest { 3 } else { 0 };
+                            save = true;
+                        }
+                        if cfg.learning.suggest_after > 0 {
+                            let mut n = cfg.learning.suggest_after;
+                            if ui
+                                .add(egui::DragValue::new(&mut n).range(1..=9).prefix("N = "))
+                                .changed()
+                            {
+                                cfg.learning.suggest_after = n;
+                                save = true;
+                            }
+                        }
+                    });
 
-            row(ui, "Тапы модификаторов", "жесты из одних модификаторов, без других клавиш", |ui| {
-                if toggle(ui, &mut cfg.enable_modifier_taps).changed() {
-                    save = true;
-                }
-            });
+                    let mut remember_on =
+                        !cfg.ibus_hotkeys.remember_key.eq_ignore_ascii_case("none");
+                    row(ui, "Запомнить слово", "выделенное/последнее слово — в словарь", |ui| {
+                        if toggle(ui, &mut remember_on).changed() {
+                            cfg.ibus_hotkeys.remember_key = if remember_on {
+                                self.remember_prev.clone()
+                            } else {
+                                "none".to_string()
+                            };
+                            save = true;
+                        }
+                        if remember_on
+                            && ui
+                                .button(binding_label(&cfg.ibus_hotkeys.remember_key))
+                                .clicked()
+                        {
+                            self.capture = Some(Capture::Remember);
+                        }
+                    });
 
-            row(ui, "Смена режима EN↔RU", "тап — переключает авто-исправление и прямой русский", |ui| {
-                if tap_combo(ui, "mode_toggle", &mut cfg.ibus_hotkeys.mode_toggle) {
-                    save = true;
-                }
-            });
+                    row(ui, "Флип последнего слова", "перевести туда-обратно", |ui| {
+                        if ui.button(binding_label(&cfg.ibus_hotkeys.undo_key)).clicked() {
+                            self.capture = Some(Capture::Undo);
+                        }
+                    });
+                });
+            }
 
-            row(ui, "Перевод выделения (тап)", "перевести выделенное мышью", |ui| {
-                if tap_combo(ui, "convert_last", &mut cfg.ibus_hotkeys.convert_last) {
-                    save = true;
-                }
-            });
-
-            row(ui, "Флип последнего слова", "перевести последнее слово туда-обратно", |ui| {
-                if ui.button(binding_label(&cfg.ibus_hotkeys.undo_key)).clicked() {
-                    self.capture = Some(Capture::Undo);
-                }
-            });
-
-            row(ui, "Перевод выделения (клавиша)", "альтернатива тапу", |ui| {
-                if ui
-                    .button(binding_label(&cfg.ibus_hotkeys.convert_selection_key))
-                    .clicked()
-                {
-                    self.capture = Some(Capture::ConvertSelection);
-                }
-            });
-
-            let mut remember_on = !cfg.ibus_hotkeys.remember_key.eq_ignore_ascii_case("none");
-            row(ui, "Запомнить слово", "выделенное/последнее слово — в словарь", |ui| {
-                if toggle(ui, &mut remember_on).changed() {
-                    cfg.ibus_hotkeys.remember_key = if remember_on {
-                        self.remember_prev.clone()
-                    } else {
-                        "none".to_string()
-                    };
-                    save = true;
-                }
-                if remember_on
-                    && ui.button(binding_label(&cfg.ibus_hotkeys.remember_key)).clicked()
-                {
-                    self.capture = Some(Capture::Remember);
-                }
-            });
-
-            let mut suggest = cfg.learning.suggest_after > 0;
-            row(ui, "Предлагать запоминание", "после N ручных переводов одного слова", |ui| {
-                if toggle(ui, &mut suggest).changed() {
-                    cfg.learning.suggest_after = if suggest { 3 } else { 0 };
-                    save = true;
-                }
-                if cfg.learning.suggest_after > 0 {
-                    let mut n = cfg.learning.suggest_after;
-                    if ui
-                        .add(egui::DragValue::new(&mut n).range(1..=9).prefix("N = "))
-                        .changed()
-                    {
-                        cfg.learning.suggest_after = n;
+            // ---- Переключение режима EN↔RU: a GNOME-Tweaks-style option list ----
+            ui.label(egui::RichText::new("Переключение на другую раскладку").strong());
+            ui.label(
+                egui::RichText::new("режим EN-автокоррекции ↔ прямой русский ввод")
+                    .weak()
+                    .size(11.0),
+            );
+            ui.indent("switch_list", |ui| {
+                let key_mode = !cfg.ibus_hotkeys.mode_toggle_key.eq_ignore_ascii_case("none");
+                let current_tap = cfg.ibus_hotkeys.mode_toggle.to_ascii_lowercase();
+                for (combo, label) in SWITCH_OPTIONS {
+                    let selected = !key_mode && current_tap == combo.to_ascii_lowercase();
+                    if ui.radio(selected, *label).clicked() && !selected {
+                        cfg.ibus_hotkeys.mode_toggle = combo.to_string();
+                        cfg.ibus_hotkeys.mode_toggle_key = "none".to_string();
+                        cfg.enable_modifier_taps = true;
                         save = true;
                     }
                 }
+                ui.horizontal(|ui| {
+                    if ui.radio(key_mode, "своя клавиша:").clicked() && !key_mode {
+                        self.capture = Some(Capture::ModeToggleKey);
+                    }
+                    if key_mode {
+                        if ui
+                            .button(binding_label(&cfg.ibus_hotkeys.mode_toggle_key))
+                            .clicked()
+                        {
+                            self.capture = Some(Capture::ModeToggleKey);
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Pause, F-клавиши и т.п.").weak().size(11.0),
+                        );
+                    }
+                });
+                let off = !key_mode && parse_off(&cfg.ibus_hotkeys.mode_toggle);
+                if ui.radio(off, "выключено").clicked() && !off {
+                    cfg.ibus_hotkeys.mode_toggle = "none".to_string();
+                    cfg.ibus_hotkeys.mode_toggle_key = "none".to_string();
+                    save = true;
+                }
+            });
+            ui.separator();
+
+            // ---- Перевод выделения ----
+            ui.label(egui::RichText::new("Перевод выделенного текста").strong());
+            ui.indent("convert_list", |ui| {
+                let current = cfg.ibus_hotkeys.convert_last.to_ascii_lowercase();
+                for (combo, label) in SWITCH_OPTIONS {
+                    let selected = current == combo.to_ascii_lowercase();
+                    if ui.radio(selected, *label).clicked() && !selected {
+                        cfg.ibus_hotkeys.convert_last = combo.to_string();
+                        cfg.enable_modifier_taps = true;
+                        save = true;
+                    }
+                }
+                let off = parse_off(&cfg.ibus_hotkeys.convert_last);
+                if ui.radio(off, "выключено (только клавиша)").clicked() && !off {
+                    cfg.ibus_hotkeys.convert_last = "none".to_string();
+                    save = true;
+                }
+                row(ui, "Клавиша", "работает всегда, независимо от тапа", |ui| {
+                    if ui
+                        .button(binding_label(&cfg.ibus_hotkeys.convert_selection_key))
+                        .clicked()
+                    {
+                        self.capture = Some(Capture::ConvertSelection);
+                    }
+                });
             });
 
+            // ---- Прочее ----
             row(ui, "Длительность тапа", "дольше — считается шорткатом, не тапом", |ui| {
                 let mut ms = cfg.tap_max_hold_ms;
                 if ui

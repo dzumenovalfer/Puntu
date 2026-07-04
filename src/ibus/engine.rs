@@ -50,38 +50,52 @@ use crate::detect::userdict::{ListKind, UserDict};
 use crate::detect::{Decision, Detector};
 use crate::keymap::{self, KeyEvent, Lang, Mods};
 
-/// What was tapped, if anything.
+/// A modifier-set gesture: press the set (any order), release it, with no other key in
+/// between. `Ctrl`, `Ctrl+Shift`, `Alt+Shift`, `Ctrl+Alt`, `Super` … — matched against the
+/// configured `mode_toggle` / `convert_last` bindings, like the system layout-switch options
+/// in GNOME Tweaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ModCombo {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub sup: bool,
+}
+
+impl ModCombo {
+    pub fn size(self) -> u32 {
+        self.ctrl as u32 + self.shift as u32 + self.alt as u32 + self.sup as u32
+    }
+}
+
+/// The four tracked modifiers (index into [`TapDetector`] arrays).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TapKind {
-    /// Just Ctrl pressed and released — toggle DirectRussian mode.
-    Ctrl,
-    /// Ctrl held + Shift pressed and released (or vice versa, in either order, with no
-    /// non-modifier between). Convert the last word.
-    CtrlShift,
+enum Mod {
+    Ctrl = 0,
+    Shift = 1,
+    Alt = 2,
+    Super = 3,
 }
 
 /// Tap-detection state for the modifier-tap triggers.
 ///
-/// IBus delivers modifier presses (Ctrl_L/Ctrl_R, Shift_L/Shift_R, etc.) as ordinary key
+/// IBus delivers modifier presses (Ctrl_L/Ctrl_R, Shift_L/Shift_R, …) as ordinary key
 /// events. We track which modifiers have been pressed during the current "chain" (since the
-/// last clean state) and fire on the matching final release — provided no non-modifier key
-/// was pressed in between.
+/// last clean state) and fire the peak combo on the final release — provided no
+/// non-modifier key was pressed in between.
 struct TapDetector {
     /// True while the chain hasn't been "spoiled" by a non-modifier key press.
     armed: bool,
-    /// Each member that's currently held; the *peak* across the chain is remembered so a
-    /// quick Ctrl+Shift tap (press both, then release both) fires `CtrlShift` regardless of
-    /// release order.
-    ctrl_down: u32,  // ref-count for L+R variants
-    shift_down: u32,
-    peak_ctrl: bool,
-    peak_shift: bool,
+    /// Held ref-count per modifier (L+R variants).
+    down: [u32; 4],
+    /// The *peak* across the chain, so a quick Ctrl+Shift tap (press both, release both)
+    /// fires `Ctrl+Shift` regardless of release order.
+    peak: [bool; 4],
     /// When the current chain started (first modifier press from a clean state).
     started: Option<std::time::Instant>,
-    /// A chain longer than this is a held shortcut (Ctrl+click, an app-consumed chord…),
-    /// not a deliberate tap — it must NOT fire. This is the main guard against accidental
-    /// mode toggles / conversions when the app swallows the letter of a Ctrl-shortcut and
-    /// we only ever see the modifier press + release.
+    /// A single-modifier chain longer than this is a held shortcut (Ctrl+click, an
+    /// app-consumed chord…), not a deliberate tap — it must NOT fire. Multi-modifier combos
+    /// are deliberate by construction and are exempt.
     max_hold: std::time::Duration,
 }
 
@@ -95,87 +109,74 @@ impl TapDetector {
     fn new(max_hold_ms: u64) -> Self {
         TapDetector {
             armed: false,
-            ctrl_down: 0,
-            shift_down: 0,
-            peak_ctrl: false,
-            peak_shift: false,
+            down: [0; 4],
+            peak: [false; 4],
             started: None,
             max_hold: std::time::Duration::from_millis(max_hold_ms),
         }
     }
     fn cancel(&mut self) {
         self.armed = false;
-        self.peak_ctrl = false;
-        self.peak_shift = false;
+        self.peak = [false; 4];
     }
     /// `was_down` = the modifier bit from the event's state, which reflects the state
     /// BEFORE this press. `false` with a non-zero ref-count means we missed a release
     /// (it happened while focus was elsewhere — Ctrl+click into another window). Resync,
     /// or the count never returns to zero and taps go PERMANENTLY dead until restart.
-    fn ctrl_press(&mut self, was_down: bool) {
+    fn press(&mut self, m: Mod, was_down: bool) {
+        let i = m as usize;
         if !was_down {
-            self.ctrl_down = 0;
+            self.down[i] = 0;
         }
-        if self.ctrl_down == 0 && self.shift_down == 0 {
+        if self.down.iter().all(|&d| d == 0) {
             self.armed = true;
             self.started = Some(std::time::Instant::now());
         }
-        self.ctrl_down += 1;
-        self.peak_ctrl = true;
-    }
-    fn shift_press(&mut self, was_down: bool) {
-        if !was_down {
-            self.shift_down = 0;
-        }
-        if self.ctrl_down == 0 && self.shift_down == 0 {
-            self.armed = true;
-            self.started = Some(std::time::Instant::now());
-        }
-        self.shift_down += 1;
-        self.peak_shift = true;
+        self.down[i] += 1;
+        self.peak[i] = true;
     }
     /// Forget everything, including the held ref-counts — for lifecycle events (focus
     /// change, enable/disable) after which pending releases may never arrive.
     fn hard_reset(&mut self) {
-        self.ctrl_down = 0;
-        self.shift_down = 0;
+        self.down = [0; 4];
         self.cancel();
     }
-    /// Called on a modifier release. Returns the tap kind once *all* modifiers are released
-    /// — that's the moment the gesture completes.
-    fn ctrl_release(&mut self) -> Option<TapKind> {
-        self.ctrl_down = self.ctrl_down.saturating_sub(1);
+    /// Called on a modifier release. Returns the peak combo once *all* modifiers are
+    /// released — that's the moment the gesture completes.
+    fn release(&mut self, m: Mod) -> Option<ModCombo> {
+        let i = m as usize;
+        self.down[i] = self.down[i].saturating_sub(1);
         self.maybe_fire()
     }
-    fn shift_release(&mut self) -> Option<TapKind> {
-        self.shift_down = self.shift_down.saturating_sub(1);
-        self.maybe_fire()
-    }
-    fn maybe_fire(&mut self) -> Option<TapKind> {
-        if self.ctrl_down > 0 || self.shift_down > 0 {
+    fn maybe_fire(&mut self) -> Option<ModCombo> {
+        if self.down.iter().any(|&d| d > 0) {
             return None; // still holding something
         }
         let quick = self
             .started
             .take()
             .is_some_and(|t| t.elapsed() <= self.max_hold);
-        let fire = if !self.armed {
+        let combo = ModCombo {
+            ctrl: self.peak[0],
+            shift: self.peak[1],
+            alt: self.peak[2],
+            sup: self.peak[3],
+        };
+        // Multi-modifier combos are deliberate gestures — no hold limit (users pause while
+        // looking at the selection). Single-modifier taps must be quick, or a held shortcut
+        // whose letter the app swallowed would toggle the mode. A bare-Shift tap is never a
+        // gesture (it's an aborted capital letter) — the config parser refuses it too.
+        let bare_shift = combo == (ModCombo { shift: true, ..Default::default() });
+        let fire = if !self.armed || combo.size() == 0 || bare_shift {
             None
-        } else if self.peak_ctrl && self.peak_shift {
-            // Ctrl+Shift together is already a deliberate two-modifier gesture — fire
-            // regardless of how long it was held (users pause to look at the selection).
-            // The max-hold guard is for the bare-Ctrl tap, where a long hold usually means
-            // an aborted shortcut, not a mode-toggle request.
-            Some(TapKind::CtrlShift)
-        } else if self.peak_ctrl && quick {
-            Some(TapKind::Ctrl)
+        } else if combo.size() >= 2 || quick {
+            Some(combo)
         } else {
-            None // Shift-only tap isn't a recognised gesture
+            None
         };
         // Reset for the next chain.
         self.armed = false;
-        self.peak_ctrl = false;
-        self.peak_shift = false;
+        self.peak = [false; 4];
         fire
     }
 }
@@ -210,8 +211,11 @@ impl EngineMode {
 pub struct HotkeyBindings {
     /// Full hotkey (keysym + modifiers). E.g. `Ctrl+grave` (default), `F12`, `Pause`.
     pub undo: Option<Hotkey>,
-    pub mode_toggle_tap: Option<TapKind>,
-    pub convert_last_tap: Option<TapKind>,
+    pub mode_toggle_tap: Option<ModCombo>,
+    pub convert_last_tap: Option<ModCombo>,
+    /// Regular key (not a tap) that toggles the EN↔RU mode — for users who want a
+    /// GNOME-Tweaks-style switch key (`Pause`, `CapsLock`, `Super+space`, …).
+    pub mode_toggle_key: Option<Hotkey>,
     /// Regular hotkey for selection conversion (not a tap). Use this if modifier-taps
     /// don't fire reliably — a normal keypress is unambiguous.
     pub convert_selection: Option<Hotkey>,
@@ -232,6 +236,7 @@ impl HotkeyBindings {
             undo: parse_hotkey(&hk.undo_key),
             mode_toggle_tap: if taps { parse_tap_combo(&hk.mode_toggle) } else { None },
             convert_last_tap: if taps { parse_tap_combo(&hk.convert_last) } else { None },
+            mode_toggle_key: parse_hotkey(&hk.mode_toggle_key),
             convert_selection: parse_hotkey(&hk.convert_selection_key),
             remember: parse_hotkey(&hk.remember_key),
             tap_max_hold_ms: cfg.tap_max_hold_ms,
@@ -370,46 +375,52 @@ impl PuntuEngine {
     /// `mode_toggle` and `convert_last` bindings, not hard-coded gestures — that way users
     /// can swap them (e.g. `mode_toggle = "Ctrl+Shift"` and `convert_last = "Ctrl"`) or
     /// disable one entirely with `"none"`.
-    async fn handle_tap(&mut self, kind: TapKind, se: &SignalEmitter<'_>) {
-        if self.hotkeys.mode_toggle_tap == Some(kind) {
-            // CRITICAL: commit whatever the user was typing BEFORE toggling — otherwise the
-            // preedit (the only place the in-progress word existed) is dropped on the floor
-            // and the user sees their typing vanish. First the held (finished) word, then any
-            // half-typed buffer; commit the buffer in the current mode's rendering.
-            self.flush_held(se).await;
-            if let Some(snap) = self.buffer.snapshot(self.lang) {
-                let text = match self.mode {
-                    EngineMode::Correcting => snap.cur,
-                    EngineMode::DirectRussian => snap.alt,
-                };
-                if !text.is_empty() {
-                    debug!(
-                        "[puntu-engine {}] tap toggle: flushing in-progress {:?}",
-                        self.id, text
-                    );
-                    self.commit_str(se, text).await;
-                }
-            }
-            self.buffer.invalidate();
-            // Explicitly clear preedit so the stale snapshot doesn't linger on screen.
-            self.clear_preedit(se).await;
-            self.mode = self.mode.toggle();
-            let hint = match self.mode {
-                EngineMode::Correcting => "EN auto-correct",
-                EngineMode::DirectRussian => "RU direct",
-            };
-            debug!("[puntu-engine {}] {kind:?} tap → mode = {:?}", self.id, self.mode);
-            self.show_hint(se, hint).await;
-        } else if self.hotkeys.convert_last_tap == Some(kind) {
+    async fn handle_tap(&mut self, combo: ModCombo, se: &SignalEmitter<'_>) {
+        if self.hotkeys.mode_toggle_tap == Some(combo) {
+            debug!("[puntu-engine {}] {combo:?} tap → mode toggle", self.id);
+            self.toggle_mode(se).await;
+        } else if self.hotkeys.convert_last_tap == Some(combo) {
             // info-level: the tap not showing up in the logs at all means IBus never
             // delivered the modifier release events (known on some setups — use the
             // regular `convert_selection_key` hotkey there instead).
-            tracing::info!("[puntu-engine {}] {kind:?} tap → convert selection", self.id);
+            tracing::info!("[puntu-engine {}] {combo:?} tap → convert selection", self.id);
             self.handle_convert_last(se);
         } else {
             // Recognised tap but no binding matches — silently ignore.
-            debug!("[puntu-engine {}] {kind:?} tap → no binding", self.id);
+            debug!("[puntu-engine {}] {combo:?} tap → no binding", self.id);
         }
+    }
+
+    /// Toggle Correcting ↔ DirectRussian — from the mode-toggle tap or the mode-toggle key.
+    async fn toggle_mode(&mut self, se: &SignalEmitter<'_>) {
+        // CRITICAL: commit whatever the user was typing BEFORE toggling — otherwise the
+        // preedit (the only place the in-progress word existed) is dropped on the floor
+        // and the user sees their typing vanish. First the held (finished) word, then any
+        // half-typed buffer; commit the buffer in the current mode's rendering.
+        self.flush_held(se).await;
+        if let Some(snap) = self.buffer.snapshot(self.lang) {
+            let text = match self.mode {
+                EngineMode::Correcting => snap.cur,
+                EngineMode::DirectRussian => snap.alt,
+            };
+            if !text.is_empty() {
+                debug!(
+                    "[puntu-engine {}] mode toggle: flushing in-progress {:?}",
+                    self.id, text
+                );
+                self.commit_str(se, text).await;
+            }
+        }
+        self.buffer.invalidate();
+        // Explicitly clear preedit so the stale snapshot doesn't linger on screen.
+        self.clear_preedit(se).await;
+        self.mode = self.mode.toggle();
+        let hint = match self.mode {
+            EngineMode::Correcting => "EN auto-correct",
+            EngineMode::DirectRussian => "RU direct",
+        };
+        debug!("[puntu-engine {}] mode = {:?}", self.id, self.mode);
+        self.show_hint(se, hint).await;
     }
 
     /// `Ctrl+` `` ` `` — flip the **held** word between its two layout readings. This is a pure
@@ -805,6 +816,16 @@ impl IBusEngine for PuntuEngine {
                 return Ok(true);
             }
         }
+        // Mode-toggle key (default "none"): a GNOME-Tweaks-style layout-switch key
+        // (`Pause`, `CapsLock`, …) as an alternative to the modifier tap.
+        if let Some(mt_hk) = self.hotkeys.mode_toggle_key {
+            if mt_hk.matches(keyval, &state) && !released {
+                debug!("[puntu-engine {}] mode-toggle key matched", self.id);
+                self.tap.cancel();
+                self.toggle_mode(&se).await;
+                return Ok(true);
+            }
+        }
         // Convert-selection hotkey (default `Ctrl+Alt+s`). Same selection-conversion
         // semantics as the Ctrl+Shift tap, but as a regular keypress — can't be confused
         // with a chord by accident (the chord-vs-tap ambiguity is what made the tap version
@@ -832,35 +853,47 @@ impl IBusEngine for PuntuEngine {
         match keyval {
             Keysym::Control_L | Keysym::Control_R => {
                 if released {
-                    if let Some(kind) = self.tap.ctrl_release() {
-                        self.handle_tap(kind, &se).await;
+                    if let Some(combo) = self.tap.release(Mod::Ctrl) {
+                        self.handle_tap(combo, &se).await;
                     }
                 } else {
-                    self.tap.ctrl_press(state.control());
+                    self.tap.press(Mod::Ctrl, state.control());
                 }
                 return Ok(false);
             }
             Keysym::Shift_L | Keysym::Shift_R => {
                 if released {
-                    if let Some(kind) = self.tap.shift_release() {
-                        self.handle_tap(kind, &se).await;
+                    if let Some(combo) = self.tap.release(Mod::Shift) {
+                        self.handle_tap(combo, &se).await;
                     }
                 } else {
-                    self.tap.shift_press(state.shift());
+                    self.tap.press(Mod::Shift, state.shift());
+                }
+                return Ok(false);
+            }
+            Keysym::Alt_L | Keysym::Alt_R => {
+                if released {
+                    if let Some(combo) = self.tap.release(Mod::Alt) {
+                        self.handle_tap(combo, &se).await;
+                    }
+                } else {
+                    self.tap.press(Mod::Alt, state.mod1());
+                }
+                return Ok(false);
+            }
+            Keysym::Super_L | Keysym::Super_R => {
+                if released {
+                    if let Some(combo) = self.tap.release(Mod::Super) {
+                        self.handle_tap(combo, &se).await;
+                    }
+                } else {
+                    self.tap.press(Mod::Super, state.mod4());
                 }
                 return Ok(false);
             }
             _ => {}
         }
-        if !matches!(
-            keyval,
-            Keysym::Alt_L
-                | Keysym::Alt_R
-                | Keysym::Super_L
-                | Keysym::Super_R
-                | Keysym::Caps_Lock
-        ) && !released
-        {
+        if keyval != Keysym::Caps_Lock && !released {
             // Any non-modifier press while a tap was armed turns it into a chord — cancel.
             self.tap.cancel();
         }
@@ -1554,6 +1587,7 @@ fn parse_keysym_universal(name: &str) -> Option<Keysym> {
     match name.to_ascii_lowercase().as_str() {
         // Function keys
         "pause" | "break" => return Some(Keysym::Pause),
+        "capslock" | "caps_lock" | "caps" => return Some(Keysym::Caps_Lock),
         "scrolllock" | "scroll_lock" => return Some(Keysym::Scroll_Lock),
         "insert" | "ins" => return Some(Keysym::Insert),
         "delete" | "del" => return Some(Keysym::Delete),
@@ -1615,26 +1649,25 @@ pub(crate) fn parse_keysym_name(name: &str) -> Option<Keysym> {
     parse_hotkey(name).map(|h| h.keysym)
 }
 
-/// Parse a tap-modifier combo from config (`"Ctrl"`, `"Shift"`, `"Ctrl+Shift"`, `"none"`)
-/// into a `TapKind` discriminator. Returns `None` for `"none"` (disabled).
-pub(crate) fn parse_tap_combo(s: &str) -> Option<TapKind> {
-    let parts: std::collections::BTreeSet<String> = s
-        .split('+')
-        .map(|p| p.trim().to_ascii_lowercase())
-        .collect();
-    if parts.contains("none") || parts.is_empty() {
+/// Parse a tap-modifier combo from config (`"Ctrl"`, `"Alt+Shift"`, `"Ctrl+Alt"`, `"Super"`,
+/// `"none"`) into a [`ModCombo`]. Returns `None` for `"none"`/empty/unparseable input, and
+/// for a bare `"Shift"` — that gesture is an aborted capital letter, never a deliberate tap.
+pub(crate) fn parse_tap_combo(s: &str) -> Option<ModCombo> {
+    let mut combo = ModCombo::default();
+    for p in s.split('+') {
+        match p.trim().to_ascii_lowercase().as_str() {
+            "" => {}
+            "ctrl" | "control" => combo.ctrl = true,
+            "shift" => combo.shift = true,
+            "alt" => combo.alt = true,
+            "super" | "meta" | "win" => combo.sup = true,
+            _ => return None, // includes "none"
+        }
+    }
+    if combo.size() == 0 || combo == (ModCombo { shift: true, ..Default::default() }) {
         return None;
     }
-    let only = |names: &[&str]| {
-        parts.len() == names.len() && names.iter().all(|n| parts.contains(*n))
-    };
-    if only(&["ctrl"]) {
-        Some(TapKind::Ctrl)
-    } else if only(&["ctrl", "shift"]) {
-        Some(TapKind::CtrlShift)
-    } else {
-        None
-    }
+    Some(combo)
 }
 
 /// Convert an IBus keysym to its Unicode character when one exists. For Latin-1 keysyms the
@@ -1682,30 +1715,37 @@ mod tests {
     use super::*;
     use crate::detect::translit::convert_char;
 
+    fn ctrl() -> ModCombo {
+        ModCombo { ctrl: true, ..Default::default() }
+    }
+    fn ctrl_shift() -> ModCombo {
+        ModCombo { ctrl: true, shift: true, ..Default::default() }
+    }
+
     #[test]
     fn ctrl_tap_fires_and_chord_cancels() {
         let mut tap = TapDetector::default();
-        tap.ctrl_press(false);
-        assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
+        tap.press(Mod::Ctrl, false);
+        assert_eq!(tap.release(Mod::Ctrl), Some(ctrl()));
         // A non-modifier press mid-chain (what process_key_event calls cancel() for)
         // must spoil the gesture.
-        tap.ctrl_press(false);
+        tap.press(Mod::Ctrl, false);
         tap.cancel();
-        assert_eq!(tap.ctrl_release(), None);
+        assert_eq!(tap.release(Mod::Ctrl), None);
     }
 
     #[test]
     fn ctrl_shift_tap_fires_regardless_of_release_order() {
         let mut tap = TapDetector::default();
-        tap.ctrl_press(false);
-        tap.shift_press(false);
-        assert_eq!(tap.ctrl_release(), None); // shift still held
-        assert_eq!(tap.shift_release(), Some(TapKind::CtrlShift));
+        tap.press(Mod::Ctrl, false);
+        tap.press(Mod::Shift, false);
+        assert_eq!(tap.release(Mod::Ctrl), None); // shift still held
+        assert_eq!(tap.release(Mod::Shift), Some(ctrl_shift()));
 
-        tap.ctrl_press(false);
-        tap.shift_press(false);
-        assert_eq!(tap.shift_release(), None);
-        assert_eq!(tap.ctrl_release(), Some(TapKind::CtrlShift));
+        tap.press(Mod::Ctrl, false);
+        tap.press(Mod::Shift, false);
+        assert_eq!(tap.release(Mod::Shift), None);
+        assert_eq!(tap.release(Mod::Ctrl), Some(ctrl_shift()));
     }
 
     #[test]
@@ -1713,12 +1753,12 @@ mod tests {
         // Focus change while Ctrl is held (Ctrl+click): cancel() must keep the eventual
         // release from firing the mode toggle.
         let mut tap = TapDetector::default();
-        tap.ctrl_press(false);
+        tap.press(Mod::Ctrl, false);
         tap.cancel();
-        assert_eq!(tap.ctrl_release(), None);
+        assert_eq!(tap.release(Mod::Ctrl), None);
         // The next clean tap works again.
-        tap.ctrl_press(false);
-        assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
+        tap.press(Mod::Ctrl, false);
+        assert_eq!(tap.release(Mod::Ctrl), Some(ctrl()));
     }
 
     #[test]
@@ -1726,21 +1766,21 @@ mod tests {
         // A Ctrl (or Ctrl+Shift) held longer than `max_hold` is a shortcut the app may have
         // swallowed the letter of (Ctrl+Shift+V in a terminal) — it must NOT fire on release.
         let mut tap = TapDetector::new(500);
-        tap.ctrl_press(false);
+        tap.press(Mod::Ctrl, false);
         tap.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
-        assert_eq!(tap.ctrl_release(), None);
+        assert_eq!(tap.release(Mod::Ctrl), None);
         // The next quick tap still works.
-        tap.ctrl_press(false);
-        assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
+        tap.press(Mod::Ctrl, false);
+        assert_eq!(tap.release(Mod::Ctrl), Some(ctrl()));
 
         // Ctrl+Shift is a deliberate two-modifier gesture — it fires even after a long
         // hold (the user paused to look at the selection before releasing).
         let mut tap = TapDetector::new(500);
-        tap.ctrl_press(false);
-        tap.shift_press(false);
+        tap.press(Mod::Ctrl, false);
+        tap.press(Mod::Shift, false);
         tap.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
-        assert_eq!(tap.shift_release(), None);
-        assert_eq!(tap.ctrl_release(), Some(TapKind::CtrlShift));
+        assert_eq!(tap.release(Mod::Shift), None);
+        assert_eq!(tap.release(Mod::Ctrl), Some(ctrl_shift()));
     }
 
     #[test]
@@ -1797,24 +1837,48 @@ mod tests {
         // is dead — `maybe_fire` waits forever for "all released". The state bits of the
         // NEXT press say Ctrl was NOT held, which must resync the count.
         let mut tap = TapDetector::default();
-        tap.ctrl_press(false); // press seen…
+        tap.press(Mod::Ctrl, false); // press seen…
         // …release lost. Later the user taps Ctrl again:
-        tap.ctrl_press(false); // state: Ctrl was not held → resync
-        assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
+        tap.press(Mod::Ctrl, false); // state: Ctrl was not held → resync
+        assert_eq!(tap.release(Mod::Ctrl), Some(ctrl()));
         // A legitimately held second Ctrl (state bit true) keeps its count.
-        tap.ctrl_press(false);
-        tap.ctrl_press(true);
-        assert_eq!(tap.ctrl_release(), None); // one Ctrl still down
-        assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
+        tap.press(Mod::Ctrl, false);
+        tap.press(Mod::Ctrl, true);
+        assert_eq!(tap.release(Mod::Ctrl), None); // one Ctrl still down
+        assert_eq!(tap.release(Mod::Ctrl), Some(ctrl()));
     }
 
     #[test]
     fn hard_reset_clears_stuck_counts() {
         let mut tap = TapDetector::default();
-        tap.ctrl_press(false);
+        tap.press(Mod::Ctrl, false);
         tap.hard_reset(); // focus change while held
-        tap.ctrl_press(false);
-        assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
+        tap.press(Mod::Ctrl, false);
+        assert_eq!(tap.release(Mod::Ctrl), Some(ctrl()));
+    }
+
+    #[test]
+    fn alt_shift_tap_fires_like_the_system_layout_switch() {
+        // The GNOME-Tweaks-style combos (Alt+Shift, Ctrl+Alt, …) are now valid gestures.
+        let mut tap = TapDetector::default();
+        tap.press(Mod::Alt, false);
+        tap.press(Mod::Shift, false);
+        assert_eq!(tap.release(Mod::Shift), None); // alt still held
+        assert_eq!(
+            tap.release(Mod::Alt),
+            Some(ModCombo { alt: true, shift: true, ..Default::default() })
+        );
+        // Config parsing round-trips the same combo; bare Shift is refused.
+        assert_eq!(
+            parse_tap_combo("Alt+Shift"),
+            Some(ModCombo { alt: true, shift: true, ..Default::default() })
+        );
+        assert_eq!(parse_tap_combo("Ctrl+Alt"), Some(ModCombo { ctrl: true, alt: true, ..Default::default() }));
+        assert_eq!(parse_tap_combo("Shift"), None);
+        assert_eq!(parse_tap_combo("none"), None);
+        // The mode-toggle key parses CapsLock and Pause.
+        assert_eq!(parse_hotkey("CapsLock").map(|h| h.keysym), Some(Keysym::Caps_Lock));
+        assert_eq!(parse_hotkey("Pause").map(|h| h.keysym), Some(Keysym::Pause));
     }
 
     #[test]
@@ -1893,8 +1957,8 @@ mod tests {
 
         cfg.enable_modifier_taps = true;
         let hk = HotkeyBindings::from_config(&cfg);
-        assert_eq!(hk.mode_toggle_tap, Some(TapKind::Ctrl));
-        assert_eq!(hk.convert_last_tap, Some(TapKind::CtrlShift));
+        assert_eq!(hk.mode_toggle_tap, Some(ctrl()));
+        assert_eq!(hk.convert_last_tap, Some(ctrl_shift()));
     }
 
     #[test]

@@ -684,6 +684,7 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
                     format!("{}", cfg.learning.suggest_after)
                 }
                 "remember_key" => { cfg.ibus_hotkeys.remember_key = value.clone(); value.clone() }
+                "mode_toggle_key" => { cfg.ibus_hotkeys.mode_toggle_key = value.clone(); value.clone() }
                 "undo_key" => { cfg.ibus_hotkeys.undo_key = value.clone(); value.clone() }
                 "mode_toggle" => { cfg.ibus_hotkeys.mode_toggle = value.clone(); value.clone() }
                 "convert_last" => { cfg.ibus_hotkeys.convert_last = value.clone(); value.clone() }
