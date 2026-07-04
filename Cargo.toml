@@ -1,6 +1,6 @@
 [package]
 name = "puntu"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Punto Switcher analog for Ubuntu (Wayland/GNOME): automatic keyboard layout corrector"
 license = "MIT"
@@ -82,7 +82,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 
 # Unified settings + dictionary window (`puntu-app`), optional (`app` feature). Pure Rust
 # (winit + glow); needs only the system GL libraries every desktop already has.
-eframe = { version = "0.35", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+# NB: `default_fonts` is mandatory — without it egui has no fonts at all and the whole UI
+# renders as blank controls.
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"], optional = true }
 
 # IBus engine front-end, optional (only with the `ibus` feature):
 zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
