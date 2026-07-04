@@ -152,6 +152,8 @@ enum DictOp {
         #[arg(long)]
         en: bool,
     },
+    /// Open a simple dictionary window (zenity): word pairs («привет / ghbdtn»), add, remove.
+    Ui,
     /// Remove a word from every list.
     Rm { word: String },
     /// Remove a single learned word.
@@ -673,6 +675,12 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
                     cfg.tap_max_hold_ms = value.trim().parse().context("expected milliseconds (e.g. 500)")?;
                     format!("{}", cfg.tap_max_hold_ms)
                 }
+                "suggest_after" => {
+                    cfg.learning.suggest_after =
+                        value.trim().parse().context("expected a count (e.g. 3; 0 disables)")?;
+                    format!("{}", cfg.learning.suggest_after)
+                }
+                "remember_key" => { cfg.ibus_hotkeys.remember_key = value.clone(); value.clone() }
                 "undo_key" => { cfg.ibus_hotkeys.undo_key = value.clone(); value.clone() }
                 "mode_toggle" => { cfg.ibus_hotkeys.mode_toggle = value.clone(); value.clone() }
                 "convert_last" => { cfg.ibus_hotkeys.convert_last = value.clone(); value.clone() }
@@ -767,6 +775,7 @@ fn run_dict(op: DictOp) -> Result<()> {
                  to {word:?} (picked up within a second — no restart)"
             );
         }
+        DictOp::Ui => run_dict_ui(&mut dict)?,
         DictOp::Rm { word } => {
             dict.remove(&word)?;
             println!("removed {word:?} from all lists");
@@ -779,6 +788,111 @@ fn run_dict(op: DictOp) -> Result<()> {
         DictOp::ClearLearned => {
             dict.clear_learned()?;
             println!("cleared all learned words");
+        }
+    }
+    Ok(())
+}
+
+/// The zenity-based dictionary window (`puntu dict ui`): a list of «word / typed-as» pairs
+/// across the user lists, with add and remove. Pure subprocess calls — no GUI toolkit
+/// dependency; the running engine picks every change up via hot-reload within a second.
+fn run_dict_ui(dict: &mut UserDict) -> Result<()> {
+    use std::process::Command;
+
+    if Command::new("zenity").arg("--version").output().is_err() {
+        anyhow::bail!("zenity не найден — установите его:  sudo apt install zenity");
+    }
+
+    let list_label = |kind: ListKind| match kind {
+        ListKind::Recognized => "словарь (переводить)",
+        ListKind::Force => "всегда переводить",
+        ListKind::Learned => "не исправлять (обучено)",
+        ListKind::Manual => "не исправлять",
+        ListKind::Command => "команда",
+    };
+
+    loop {
+        let mut args: Vec<String> = [
+            "--list",
+            "--title=Словарь Puntu",
+            "--text=Выберите слово и нажмите «Удалить», или «Добавить» новое.",
+            "--column=Слово",
+            "--column=Набирается как",
+            "--column=Список",
+            "--width=600",
+            "--height=640",
+            "--ok-label=Удалить",
+            "--cancel-label=Закрыть",
+            "--extra-button=Добавить",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let mut empty = true;
+        for lang in [Lang::Ru, Lang::En] {
+            for kind in [ListKind::Force, ListKind::Learned, ListKind::Manual] {
+                for w in dict.list(kind, lang) {
+                    args.push(w.clone());
+                    args.push(puntu::detect::translit::convert(&w, lang, lang.other()));
+                    args.push(list_label(kind).to_string());
+                    empty = false;
+                }
+            }
+            // Recognized separately: show only the user's own words, not the built-in seeds.
+            for w in dict.user_recognized(lang) {
+                args.push(w.clone());
+                args.push(puntu::detect::translit::convert(&w, lang, lang.other()));
+                args.push(list_label(ListKind::Recognized).to_string());
+                empty = false;
+            }
+        }
+        if empty {
+            // zenity --list refuses to open with zero rows — show a placeholder.
+            args.push("(словарь пуст)".into());
+            args.push("—".into());
+            args.push("—".into());
+        }
+
+        let out = Command::new("zenity").args(&args).output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        if out.status.success() {
+            // «Удалить» pressed with a row selected → stdout = the word (first column).
+            if stdout.is_empty() || stdout.starts_with('(') {
+                continue;
+            }
+            dict.remove(&stdout)?;
+            println!("removed {stdout:?} from all lists");
+        } else if stdout == "Добавить" {
+            let add = Command::new("zenity")
+                .args([
+                    "--entry",
+                    "--title=Puntu",
+                    "--text=Слово в правильной раскладке (например «привет» или «tiktok»):",
+                ])
+                .output()?;
+            if !add.status.success() {
+                continue;
+            }
+            let word = String::from_utf8_lossy(&add.stdout).trim().to_lowercase();
+            if word.is_empty() {
+                continue;
+            }
+            let lang = pick_lang(&word, false, false);
+            dict.add(&word, lang, ListKind::Recognized)?;
+            let wrong = puntu::detect::translit::convert(&word, lang, lang.other());
+            println!("learned {word:?} [{lang}]");
+            let _ = Command::new("zenity")
+                .args([
+                    "--info",
+                    "--title=Puntu",
+                    &format!("--text=Запомнено: {wrong} → {word}"),
+                    "--timeout=3",
+                ])
+                .status();
+        } else {
+            break; // «Закрыть» or the window was closed
         }
     }
     Ok(())

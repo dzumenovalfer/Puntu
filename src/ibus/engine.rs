@@ -34,8 +34,15 @@ struct Held {
     /// The word exactly as typed (no separator) — what gets added to the learned list when
     /// the user flips an auto-conversion back.
     typed: String,
+    /// The other-layout word (no separator) — the conversion target. Used by the manual-
+    /// conversion counter and the remember hotkey to name the pair without re-deriving it
+    /// from `shown`/`other` (those carry accumulated separators).
+    converted: String,
     /// Set once the rejection has been recorded, so repeated flips don't re-add it.
     learned: bool,
+    /// Set once a forward flip has been counted, so toggling back and forth on one word
+    /// doesn't inflate the manual-conversion counter.
+    counted: bool,
 }
 
 use crate::buffer::{CompletedWord, WordBuffer};
@@ -187,6 +194,8 @@ pub struct HotkeyBindings {
     /// Regular hotkey for selection conversion (not a tap). Use this if modifier-taps
     /// don't fire reliably — a normal keypress is unambiguous.
     pub convert_selection: Option<Hotkey>,
+    /// Remember a word in the dictionary (mouse selection, else the held word).
+    pub remember: Option<Hotkey>,
     /// Max press→release duration for a modifier tap to fire (see [`TapDetector::max_hold`]).
     pub tap_max_hold_ms: u64,
 }
@@ -203,6 +212,7 @@ impl HotkeyBindings {
             mode_toggle_tap: if taps { parse_tap_combo(&hk.mode_toggle) } else { None },
             convert_last_tap: if taps { parse_tap_combo(&hk.convert_last) } else { None },
             convert_selection: parse_hotkey(&hk.convert_selection_key),
+            remember: parse_hotkey(&hk.remember_key),
             tap_max_hold_ms: cfg.tap_max_hold_ms,
         }
     }
@@ -238,7 +248,16 @@ pub struct PuntuEngine {
     /// True while an auxiliary-text hint is on screen, so the next letter can hide it.
     /// Shared (`Arc`) because the async selection-conversion task also shows hints.
     hint_shown: Arc<std::sync::atomic::AtomicBool>,
+    /// Manual-conversion counter per converted word (shared across engines): after
+    /// `suggest_after` manual conversions of the same word, a zenity dialog offers to
+    /// remember it. Value = (count, last typed form — for the dialog text).
+    convert_counts: ConvertCounts,
+    /// The `[learning] suggest_after` config value; 0 disables the offer.
+    suggest_after: u32,
 }
+
+/// Shared manual-conversion counter: converted word → (count, last typed form).
+type ConvertCounts = Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, String)>>>;
 
 /// `IBusInputPurpose` values we care about (mirror `GtkInputPurpose`).
 const PURPOSE_PASSWORD: u32 = 8;
@@ -246,12 +265,15 @@ const PURPOSE_PIN: u32 = 9;
 const PURPOSE_TERMINAL: u32 = 10;
 
 impl PuntuEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
         detector: Arc<Detector>,
         dict: Arc<AsyncMutex<UserDict>>,
         hotkeys: HotkeyBindings,
         autocorrect: bool,
+        convert_counts: ConvertCounts,
+        suggest_after: u32,
     ) -> Self {
         Self {
             detector,
@@ -266,6 +288,8 @@ impl PuntuEngine {
             autocorrect,
             purpose: 0,
             hint_shown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            convert_counts,
+            suggest_after,
         }
     }
 
@@ -387,8 +411,29 @@ impl PuntuEngine {
         } else {
             None
         };
+        // A forward flip (detector left the word as typed, the user converted it by hand) is
+        // a manual conversion — feed the repeat counter, once per held word.
+        let manual = if !h.auto_converted && !h.counted && h.shown.starts_with(&h.converted) {
+            h.counted = true;
+            Some((h.typed.clone(), h.converted.clone()))
+        } else {
+            None
+        };
         debug!("[puntu-engine {}] flip: held → {:?}", self.id, shown);
         self.update_preedit(se, &shown).await;
+        if let Some((typed, converted)) = manual {
+            note_manual_conversion(
+                &self.convert_counts,
+                self.suggest_after,
+                &self.detector,
+                &self.dict,
+                &self.hint_shown,
+                se,
+                self.id,
+                &typed,
+                &converted,
+            );
+        }
         if let Some(typed) = learn {
             // Correcting mode only auto-converts EN-rendered words, so the rejected form is EN.
             let mut dict = self.dict.lock().await;
@@ -433,6 +478,8 @@ impl PuntuEngine {
         let detector = Arc::clone(&self.detector);
         let dict = Arc::clone(&self.dict);
         let hint_shown = Arc::clone(&self.hint_shown);
+        let counts = Arc::clone(&self.convert_counts);
+        let suggest_after = self.suggest_after;
         let se = se.to_owned();
         tokio::spawn(async move {
             let selection =
@@ -493,8 +540,84 @@ impl PuntuEngine {
             );
             forward_backspace(&se).await;
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            // A selection conversion is a manual conversion — feed the repeat counter
+            // (single clean words only; `learnable` inside filters the rest).
+            note_manual_conversion(
+                &counts,
+                suggest_after,
+                &detector,
+                &dict,
+                &hint_shown,
+                &se,
+                id,
+                selection.trim(),
+                converted.trim(),
+            );
             if let Err(e) = Self::commit_text(&se, converted).await {
                 tracing::warn!("[puntu-engine {id}] commit_text failed: {e}");
+            }
+        });
+    }
+
+    /// `Ctrl+Alt+D` — remember a word in the dictionary: the mouse selection when there is
+    /// one, else the held (last) word in its currently shown form. Detached task — reading
+    /// PRIMARY inline would deadlock the key event (same as convert-selection).
+    fn handle_remember(&mut self, se: &SignalEmitter<'_>) {
+        let id = self.id;
+        // Fallback when nothing is selected: whichever form of the held word is on screen.
+        let fallback = self.held.as_ref().map(|h| {
+            if h.shown.starts_with(&h.converted) {
+                h.converted.clone()
+            } else {
+                h.typed.clone()
+            }
+        });
+        let detector = Arc::clone(&self.detector);
+        let dict = Arc::clone(&self.dict);
+        let hint_shown = Arc::clone(&self.hint_shown);
+        let se = se.to_owned();
+        tokio::spawn(async move {
+            let selection = tokio::task::spawn_blocking(move || read_primary_selection(id))
+                .await
+                .ok()
+                .flatten();
+            let Some(candidate) = selection.or(fallback) else {
+                Self::show_hint_shared(
+                    &se,
+                    &hint_shown,
+                    "Puntu: нечего запоминать — выделите слово",
+                )
+                .await;
+                return;
+            };
+            let Some((word, lang)) = learnable(&candidate) else {
+                Self::show_hint_shared(
+                    &se,
+                    &hint_shown,
+                    &format!("Puntu: «{}» не похоже на слово — не запомнил", candidate.trim()),
+                )
+                .await;
+                return;
+            };
+            if detector.is_known_word(&word, lang)
+                || dict.lock().await.is_recognized(&word, lang)
+            {
+                Self::show_hint_shared(
+                    &se,
+                    &hint_shown,
+                    &format!("Puntu: «{word}» уже в словаре"),
+                )
+                .await;
+                return;
+            }
+            let wrong = crate::detect::translit::convert(&word, lang, lang.other());
+            if learn_recognized(&dict, &word, lang, id).await {
+                Self::show_hint_shared(
+                    &se,
+                    &hint_shown,
+                    &format!("Puntu: запомнил «{word}» ({wrong} → {word})"),
+                )
+                .await;
             }
         });
     }
@@ -658,6 +781,16 @@ impl IBusEngine for PuntuEngine {
                 return Ok(true);
             }
         }
+        // Remember-word hotkey (default `Ctrl+Alt+d`): add the selected (or held) word to
+        // the dictionary so its wrong-layout form converts from now on.
+        if let Some(rem_hk) = self.hotkeys.remember {
+            if rem_hk.matches(keyval, &state) && !released {
+                debug!("[puntu-engine {}] remember hotkey matched", self.id);
+                self.tap.cancel(); // same reason as the undo hotkey above
+                self.handle_remember(&se);
+                return Ok(true);
+            }
+        }
         // Track modifier-tap chains. Both Ctrl and Shift are tracked; a release that
         // empties the chain may fire `Ctrl` (toggle mode) or `CtrlShift` (convert last).
         match keyval {
@@ -788,12 +921,19 @@ impl IBusEngine for PuntuEngine {
                     } else {
                         // Space (soft): hold the word + separator in preedit, uncommitted, so
                         // the flip hotkey can still re-render it.
+                        let converted = if shown_word == word.cur {
+                            other_word.clone()
+                        } else {
+                            shown_word.clone()
+                        };
                         let held = Held {
                             shown: format!("{shown_word}{sep}"),
                             other: format!("{other_word}{sep}"),
                             auto_converted,
                             typed: word.cur.clone(),
+                            converted,
                             learned: false,
+                            counted: false,
                         };
                         self.update_preedit(&se, &held.shown).await;
                         self.held = Some(held);
@@ -931,6 +1071,9 @@ pub struct PuntuFactory {
     dict: Arc<AsyncMutex<UserDict>>,
     hotkeys: HotkeyBindings,
     autocorrect: bool,
+    /// Manual-conversion counter, shared by every engine this factory creates.
+    convert_counts: ConvertCounts,
+    suggest_after: u32,
     next_id: u64,
 }
 
@@ -942,12 +1085,15 @@ impl PuntuFactory {
         dict: Arc<AsyncMutex<UserDict>>,
         hotkeys: HotkeyBindings,
         autocorrect: bool,
+        suggest_after: u32,
     ) -> Self {
         Self {
             detector: Arc::new(detector),
             dict,
             hotkeys,
             autocorrect,
+            convert_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            suggest_after,
             next_id: 1,
         }
     }
@@ -970,6 +1116,8 @@ impl IBusFactory<PuntuEngine> for PuntuFactory {
             Arc::clone(&self.dict),
             self.hotkeys,
             self.autocorrect,
+            Arc::clone(&self.convert_counts),
+            self.suggest_after,
         ))
     }
 }
@@ -1080,6 +1228,132 @@ fn read_primary_selection(engine_id: u64) -> Option<String> {
         return None;
     }
     Some(selection)
+}
+
+/// Is `word` worth remembering in the dictionary, and in which language? Trims, lowercases,
+/// and refuses anything that isn't a single clean-script word: whitespace inside, digits or
+/// command punctuation (`--force`, `v0.1`), mixed Cyrillic/Latin, or a single letter.
+fn learnable(word: &str) -> Option<(String, Lang)> {
+    let w = word.trim().to_lowercase();
+    if w.chars().count() < 2
+        || w.chars().any(char::is_whitespace)
+        || crate::detect::userdict::is_command_context(&w)
+    {
+        return None;
+    }
+    let lang = if w.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c)) {
+        Lang::Ru
+    } else {
+        Lang::En
+    };
+    let clean = w.chars().all(|c| match lang {
+        Lang::Ru => ('\u{0400}'..='\u{04FF}').contains(&c),
+        Lang::En => c.is_ascii_alphabetic(),
+    });
+    clean.then_some((w, lang))
+}
+
+/// Persist `word` as a recognized dictionary word (its wrong-layout form will convert).
+/// Returns `false` when it was already there. The hot-reload watcher then propagates the
+/// file change to every running engine.
+async fn learn_recognized(
+    dict: &AsyncMutex<UserDict>,
+    word: &str,
+    lang: Lang,
+    id: u64,
+) -> bool {
+    let mut d = dict.lock().await;
+    if d.is_recognized(word, lang) {
+        return false;
+    }
+    match d.add(word, lang, ListKind::Recognized) {
+        Ok(()) => {
+            tracing::info!("[puntu-engine {id}] learned {word:?} as a recognized {lang} word");
+            true
+        }
+        Err(e) => {
+            tracing::warn!("[puntu-engine {id}] could not persist {word:?}: {e}");
+            false
+        }
+    }
+}
+
+/// Bump the manual-conversion counter for `word`. Returns `true` when the count reaches
+/// `suggest_after` — the entry is then reset, so declining the offer doesn't re-ask on the
+/// very next conversion.
+fn bump_conversion_count(
+    counts: &ConvertCounts,
+    suggest_after: u32,
+    word: &str,
+    typed: &str,
+) -> bool {
+    let mut m = counts.lock().unwrap();
+    let entry = m.entry(word.to_string()).or_insert((0, String::new()));
+    entry.0 += 1;
+    entry.1 = typed.trim().to_string();
+    if entry.0 >= suggest_after {
+        m.remove(word);
+        true
+    } else {
+        false
+    }
+}
+
+/// Count a manual conversion of `converted` (typed as `typed`) and, on reaching
+/// `suggest_after`, spawn a zenity question offering to remember the word. Words already in
+/// the dictionaries are not counted. No-op when `suggest_after` is 0.
+fn note_manual_conversion(
+    counts: &ConvertCounts,
+    suggest_after: u32,
+    detector: &Arc<Detector>,
+    dict: &Arc<AsyncMutex<UserDict>>,
+    hint_shown: &Arc<std::sync::atomic::AtomicBool>,
+    se: &SignalEmitter<'_>,
+    id: u64,
+    typed: &str,
+    converted: &str,
+) {
+    if suggest_after == 0 {
+        return;
+    }
+    let Some((word, lang)) = learnable(converted) else {
+        return;
+    };
+    if detector.is_known_word(&word, lang) {
+        return; // built-in dictionaries already know it — nothing to learn
+    }
+    if !bump_conversion_count(counts, suggest_after, &word, typed) {
+        return;
+    }
+    let dict = Arc::clone(dict);
+    let hint_shown = Arc::clone(hint_shown);
+    let se = se.to_owned();
+    let typed = typed.trim().to_string();
+    tokio::spawn(async move {
+        if dict.lock().await.is_recognized(&word, lang) {
+            return; // learned meanwhile (remember hotkey / CLI)
+        }
+        let text = format!("Запомнить слово «{word}»?\n({typed} → {word})");
+        let yes = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("zenity")
+                .args([
+                    "--question",
+                    "--title=Puntu",
+                    &format!("--text={text}"),
+                    "--ok-label=Запомнить",
+                    "--cancel-label=Нет",
+                ])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        if yes && learn_recognized(&dict, &word, lang, id).await {
+            PuntuEngine::show_hint_shared(&se, &hint_shown, &format!("Puntu: запомнил «{word}»"))
+                .await;
+        }
+    });
 }
 
 /// The force-flip fallback: the deliberate "я выделил, переведи" case when the detector saw
@@ -1469,6 +1743,35 @@ mod tests {
     }
 
     #[test]
+    fn learnable_accepts_words_and_filters_junk() {
+        assert_eq!(learnable("привет"), Some(("привет".into(), Lang::Ru)));
+        assert_eq!(learnable(" Увы "), Some(("увы".into(), Lang::Ru)));
+        assert_eq!(learnable("tiktok"), Some(("tiktok".into(), Lang::En)));
+        // Command-shaped, multi-word, digits, mixed script, single letters — never learned.
+        assert_eq!(learnable("--force"), None);
+        assert_eq!(learnable("v0.1"), None);
+        assert_eq!(learnable("два слова"), None);
+        assert_eq!(learnable("прив3т"), None);
+        assert_eq!(learnable("приvет"), None);
+        assert_eq!(learnable("я"), None);
+        assert_eq!(learnable("  "), None);
+    }
+
+    #[test]
+    fn conversion_counter_fires_on_threshold_and_resets() {
+        let counts: ConvertCounts = Arc::new(std::sync::Mutex::new(Default::default()));
+        assert!(!bump_conversion_count(&counts, 3, "привет", "ghbdtn"));
+        assert!(!bump_conversion_count(&counts, 3, "привет", "ghbdtn"));
+        // A different word doesn't interfere.
+        assert!(!bump_conversion_count(&counts, 3, "увы", "eds"));
+        assert!(bump_conversion_count(&counts, 3, "привет", "ghbdtn"));
+        // The entry was reset — declining the offer doesn't re-ask immediately.
+        assert!(!bump_conversion_count(&counts, 3, "привет", "ghbdtn"));
+        // Threshold 1 fires on the first conversion.
+        assert!(bump_conversion_count(&counts, 1, "тест", "ntcn"));
+    }
+
+    #[test]
     fn purpose_policy() {
         let hk = HotkeyBindings::from_config(&crate::config::Config::default());
         let dict = UserDict::empty(std::env::temp_dir().join("puntu-test-purpose"));
@@ -1482,6 +1785,8 @@ mod tests {
             Arc::new(AsyncMutex::new(dict)),
             hk,
             true,
+            Arc::new(std::sync::Mutex::new(Default::default())),
+            3,
         );
         // Passwords/PINs: fully transparent.
         for p in [PURPOSE_PASSWORD, PURPOSE_PIN] {

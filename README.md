@@ -101,6 +101,7 @@ the last word. Selection conversion is disabled there (terminals don't replace a
 | `Ctrl+` `` ` ``    | Undo the last commit (restore exactly what you typed)        |
 | **tap Ctrl+Shift** | Convert the current mouse selection to the other layout      |
 | `Ctrl+Alt+S`       | Convert the current mouse selection (regular key, if taps are unreliable on your setup) |
+| `Ctrl+Alt+D`       | Remember the selected (or last typed) word in the dictionary |
 
 > Modifier **taps** (press-and-release with no other key between) fire on release; IBus doesn't
 > deliver release events on every setup, so the regular `Ctrl+Alt+S` hotkey is provided as a
@@ -108,6 +109,23 @@ the last word. Selection conversion is disabled there (terminals don't replace a
 > A tap only counts when the whole press→release fits in `tap_max_hold_ms` (default 500 ms), so
 > held shortcuts like Ctrl+click can't accidentally toggle the mode. When a selection conversion
 > does nothing, a hint near the caret says why (no selection / nothing to fix).
+
+### Teaching the dictionary
+
+Three ways to add words, each can be turned off:
+
+1. **Repeat-conversion offer** — when you manually convert the *same* word for the third
+   time (forward flip via `Ctrl+` `` ` `` or a single-word selection conversion), a dialog
+   offers to remember it; from then on its wrong-layout form converts automatically.
+   Configure with `puntu config set suggest_after <n>` (`0` disables).
+2. **`Ctrl+Alt+D`** — remember the selected word (or the last typed one) right away. A hint
+   near the caret confirms it. Rebind via `puntu config set remember_key '...'`.
+3. **Dictionary window** — `puntu dict ui`: a list of «привет / ghbdtn» pairs across all
+   your lists, with add and remove buttons (zenity).
+
+Rejecting an auto-conversion (flip it back with `Ctrl+` `` ` ``) still teaches the opposite:
+the word is added to the never-correct list. Every change reaches the running engine within
+a second — no restart.
 
 ### Dictionaries (via the `puntu` CLI)
 

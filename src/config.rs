@@ -52,6 +52,8 @@ pub struct Config {
     /// chord like Ctrl+Shift+V in a terminal) and are ignored. Default 500.
     pub tap_max_hold_ms: u64,
     pub detect: DetectConfig,
+    /// Dictionary-learning behaviour (the repeat-conversion suggestion dialog etc.).
+    pub learning: LearningConfig,
     pub hotkeys: Hotkeys,
     /// Hotkeys for the IBus engine front-end. The IBus engine deals in xkb **keysyms**
     /// (string names like `"Pause"`, `"F12"`, `"Insert"`), not evdev keycodes, so it gets a
@@ -82,6 +84,9 @@ pub struct IBusHotkeys {
     /// PRIMARY selection clipboard. Use this if modifier-tap is unreliable on your setup —
     /// it's a normal keypress so it can't be confused with a chord. Default `"Ctrl+Alt+s"`.
     pub convert_selection_key: String,
+    /// Remember a word in the dictionary: the mouse selection if there is one, else the
+    /// last (held) word. Default `"Ctrl+Alt+d"` (d = dictionary); `"none"` disables.
+    pub remember_key: String,
 }
 
 impl Default for IBusHotkeys {
@@ -96,7 +101,24 @@ impl Default for IBusHotkeys {
             // Ctrl+Shift+*; Electron apps grab Ctrl+Shift+`/I/J for devtools). Override
             // freely via `puntu config set convert_selection_key '...'`.
             convert_selection_key: "Ctrl+Alt+s".to_string(),
+            remember_key: "Ctrl+Alt+d".to_string(),
         }
+    }
+}
+
+/// Dictionary-learning behaviour.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LearningConfig {
+    /// After this many *manual* conversions of the same word (forward flip via the undo key,
+    /// or a single-word selection conversion) the engine offers — in a zenity question
+    /// dialog — to remember the word in the dictionary. `0` disables the offer.
+    pub suggest_after: u32,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        LearningConfig { suggest_after: 3 }
     }
 }
 
@@ -172,6 +194,7 @@ impl Default for Config {
             enable_modifier_taps: true,
             tap_max_hold_ms: DEFAULT_TAP_MAX_HOLD_MS,
             detect: DetectConfig::default(),
+            learning: LearningConfig::default(),
             hotkeys: Hotkeys::default(),
             ibus_hotkeys: IBusHotkeys::default(),
         }

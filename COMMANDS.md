@@ -58,7 +58,7 @@ puntu [--config <ПУТЬ>] <команда>
 | `puntu stdin` | подать слова со stdin и напечатать решение детектора (без устройств/прав — для проверки) |
 | `puntu build-dict <вход> [<выход>]` | собрать большой словарь RU в FST (по умолчанию `~/.config/puntu/russian.fst`) |
 | `puntu config show` | показать текущий конфиг (TOML) |
-| `puntu config set <ключ> <on\|off>` | переключить флаг (`dry_run`, `paste_convert`) и записать в `config.toml` |
+| `puntu config set <ключ> <значение>` | изменить настройку и записать в `config.toml`: флаги (`dry_run`, `paste_convert`, `enable_modifier_taps`), числа (`tap_max_hold_ms`, `suggest_after` — 0 отключает предложение запомнить), хоткеи (`undo_key`, `convert_selection_key`, `remember_key`, `mode_toggle`, `convert_last`) |
 | `puntu --version` / `puntu --help` | версия / помощь (работает и для подкоманд: `puntu dict --help`) |
 
 ### Словарь (`puntu dict …`)
@@ -70,6 +70,7 @@ puntu [--config <ПУТЬ>] <команда>
 | `puntu dict add <слово> --force [--ru\|--en]` | **всегда** конвертировать это слово |
 | `puntu dict add <слово> --command` | добавить в список команд (защита ввода в терминале) |
 | `puntu dict learn <слово> [--ru\|--en]` | **распознаваемое слово** (напр. название сервиса) — теперь его кривая раскладка переведётся: `ешлещл → tiktok` |
+| `puntu dict ui` | **окно словаря** (zenity): пары «слово / как набирается», добавление и удаление |
 | `puntu dict rm <слово>` | удалить слово из всех списков |
 | `puntu dict forget <слово> [--ru\|--en]` | убрать **одно** авто‑обученное слово |
 | `puntu dict clear-learned` | очистить все авто‑обученные слова |

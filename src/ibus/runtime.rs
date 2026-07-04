@@ -59,7 +59,8 @@ pub async fn run() -> Result<()> {
     let dict = Arc::new(AsyncMutex::new(dict));
     spawn_dict_reload_watcher(Arc::clone(&dict));
 
-    let factory = PuntuFactory::new(detector, dict, hotkeys, autocorrect);
+    let factory =
+        PuntuFactory::new(detector, dict, hotkeys, autocorrect, cfg.learning.suggest_after);
 
     let _ibus = librush::ibus::IBus::<PuntuEngine, PuntuFactory>::new(
         addr,

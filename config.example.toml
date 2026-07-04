@@ -18,6 +18,12 @@ switch_delta = 0.7
 # The other-layout candidate must itself score at least this high (look like a real word).
 alt_valid_min = -3.3
 
+[learning]
+# After this many MANUAL conversions of the same word (forward flip via Ctrl+`, or a
+# single-word selection conversion) Puntu shows a dialog offering to remember the word
+# in the dictionary. 0 disables the offer.
+suggest_after = 3
+
 # IBus engine hotkeys (the current, default front-end). Values are xkb keysym names
 # (case-insensitive); modifier taps are "Ctrl", "Shift", "Ctrl+Shift", …; "none" disables.
 [ibus_hotkeys]
@@ -29,6 +35,8 @@ mode_toggle = "Ctrl"
 convert_last = "Ctrl+Shift"
 # Regular hotkey (not a tap) for converting the selection — dependable if taps don't fire.
 convert_selection_key = "Ctrl+Alt+s"
+# Remember a word in the dictionary: the mouse selection if any, else the last (held) word.
+remember_key = "Ctrl+Alt+d"
 
 # ---- Legacy uinput daemon only (ignored by the IBus engine) ----
 # Hotkeys. code = Linux key code (119 = Pause/Break). Modifiers default to false.

@@ -224,6 +224,14 @@ impl UserDict {
         Ok(())
     }
 
+    /// Recognized words the **user** added — built-in seeds (api, css, …) filtered out.
+    /// What a dictionary UI shows and lets the user delete.
+    pub fn user_recognized(&self, lang: Lang) -> Vec<String> {
+        let mut v = persistable(&self.lists(lang).recognized, lang, ListKind::Recognized);
+        v.sort();
+        v
+    }
+
     /// Snapshot a list for display (the `dict list` command).
     pub fn list(&self, kind: ListKind, lang: Lang) -> Vec<String> {
         let mut v: Vec<String> = match kind {
