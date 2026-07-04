@@ -438,10 +438,18 @@ impl PuntuEngine {
             // Correcting mode only auto-converts EN-rendered words, so the rejected form is EN.
             let mut dict = self.dict.lock().await;
             match dict.add(&typed, Lang::En, ListKind::Learned) {
-                Ok(()) => tracing::info!(
-                    "[puntu-engine {}] learned {typed:?} (undone auto-conversion)",
-                    self.id
-                ),
+                Ok(()) => {
+                    tracing::info!(
+                        "[puntu-engine {}] learned {typed:?} (undone auto-conversion)",
+                        self.id
+                    );
+                    // The silent version of this is how the user ended up with words on the
+                    // never-correct list without knowing (the «eds» case) — say it out loud.
+                    notify(&format!(
+                        "Больше не исправляю «{typed}» (вы откатили автозамену).\n\
+                         Вернуть: puntu dict rm {typed} или окно «puntu dict ui»"
+                    ));
+                }
                 Err(e) => tracing::warn!(
                     "[puntu-engine {}] could not persist learned word {typed:?}: {e}",
                     self.id
@@ -612,6 +620,7 @@ impl PuntuEngine {
             }
             let wrong = crate::detect::translit::convert(&word, lang, lang.other());
             if learn_recognized(&dict, &word, lang, id).await {
+                notify(&format!("Запомнил «{word}» ({wrong} → {word})"));
                 Self::show_hint_shared(
                     &se,
                     &hint_shown,
@@ -1253,6 +1262,15 @@ fn learnable(word: &str) -> Option<(String, Lang)> {
     clean.then_some((w, lang))
 }
 
+/// Fire a GNOME desktop notification (best effort — a missing `notify-send` is ignored).
+/// The aux-text hint near the caret is easy to miss or absent in some apps; a saved word
+/// must be *visibly* confirmed, or the user can't tell learning worked at all.
+fn notify(body: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=Puntu", "--icon=input-keyboard-symbolic", "Puntu", body])
+        .spawn();
+}
+
 /// Persist `word` as a recognized dictionary word (its wrong-layout form will convert).
 /// Returns `false` when it was already there. The hot-reload watcher then propagates the
 /// file change to every running engine.
@@ -1350,6 +1368,7 @@ fn note_manual_conversion(
         .await
         .unwrap_or(false);
         if yes && learn_recognized(&dict, &word, lang, id).await {
+            notify(&format!("Запомнил «{word}» ({typed} → {word})"));
             PuntuEngine::show_hint_shared(&se, &hint_shown, &format!("Puntu: запомнил «{word}»"))
                 .await;
         }
