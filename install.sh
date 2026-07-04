@@ -166,7 +166,42 @@ if command -v gsettings >/dev/null 2>&1 \
 fi
 ibus engine puntu >/dev/null 2>&1 || true
 
-# 7. Electron/Chromium apps: enable the system input method -------------------
+# 7. App-menu entries: the settings and dictionary windows --------------------
+# Makes Puntu discoverable as an application (GNOME overview search: «Puntu»), not only as
+# a CLI: «Puntu — настройки» opens the zenity settings window, «Puntu — словарь» the
+# dictionary editor.
+say "Installing application menu entries…"
+APPS_DIR="$HOME/.local/share/applications"
+mkdir -p "$APPS_DIR"
+cat > "$APPS_DIR/puntu-settings.desktop" <<DESK
+[Desktop Entry]
+Name=Puntu — настройки
+Name[en]=Puntu Settings
+Comment=Настройки автопереключения раскладки
+Comment[en]=Keyboard layout auto-corrector settings
+Exec=$BIN_DIR/puntu settings
+Icon=input-keyboard
+Type=Application
+Terminal=false
+Categories=Utility;Settings;
+Keywords=puntu;keyboard;layout;раскладка;настройки;
+DESK
+cat > "$APPS_DIR/puntu-dictionary.desktop" <<DESK
+[Desktop Entry]
+Name=Puntu — словарь
+Name[en]=Puntu Dictionary
+Comment=Словарь автопереключения раскладки
+Comment[en]=Keyboard layout auto-corrector dictionary
+Exec=$BIN_DIR/puntu dict ui
+Icon=input-keyboard
+Type=Application
+Terminal=false
+Categories=Utility;
+Keywords=puntu;dictionary;словарь;
+DESK
+update-desktop-database "$APPS_DIR" 2>/dev/null || true
+
+# 8. Electron/Chromium apps: enable the system input method -------------------
 # An IBus engine only sees keys from apps connected to the input-method framework. Electron
 # apps must run in native Wayland with IME enabled, or NO system input method works in them
 # (Puntu, Chinese, Japanese — alike). One-time and harmless when already set.

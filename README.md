@@ -124,8 +124,16 @@ Three ways to add words, each can be turned off:
    your lists, with add and remove buttons (zenity).
 
 Rejecting an auto-conversion (flip it back with `Ctrl+` `` ` ``) still teaches the opposite:
-the word is added to the never-correct list. Every change reaches the running engine within
-a second — no restart.
+the word is added to the never-correct list. Every dictionary change fires a desktop
+notification and reaches the running engine within a second — no restart.
+
+### Settings window and app-menu entries
+
+`install.sh` adds two launchers to the applications menu (search «Puntu» in the GNOME
+overview): **Puntu — настройки** (`puntu settings`) — toggles for auto-correction, taps and
+each learning mechanism, hotkey bindings, thresholds; and **Puntu — словарь**
+(`puntu dict ui`). Both are plain zenity windows; changing a setting offers an engine
+restart to apply it.
 
 ### Dictionaries (via the `puntu` CLI)
 

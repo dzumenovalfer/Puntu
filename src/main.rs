@@ -50,6 +50,8 @@ enum Cmd {
         #[command(subcommand)]
         op: ConfigOp,
     },
+    /// Open the settings window (zenity): learning toggles, hotkeys, thresholds.
+    Settings,
     /// Pause autocorrection in the running daemon.
     Pause,
     /// Resume autocorrection in the running daemon.
@@ -177,6 +179,7 @@ fn main() -> Result<()> {
         Cmd::Stdin => run_stdin(cfg),
         Cmd::Dict { op } => run_dict(op),
         Cmd::Config { op } => run_config(op, cli.config.as_deref()),
+        Cmd::Settings => run_settings_ui(cli.config.as_deref()),
         Cmd::Pause => send("pause"),
         Cmd::Resume => send("resume"),
         Cmd::Status => send("status"),
@@ -788,6 +791,182 @@ fn run_dict(op: DictOp) -> Result<()> {
         DictOp::ClearLearned => {
             dict.clear_learned()?;
             println!("cleared all learned words");
+        }
+    }
+    Ok(())
+}
+
+/// The zenity-based settings window (`puntu settings`): parameters with their current
+/// values; pick one to toggle or edit it. Booleans flip in place, everything else opens an
+/// entry dialog pre-filled with the current value. Writes go through the same
+/// `Config::save_to` as the CLI; since the engine reads the config at startup, a restart is
+/// offered when anything changed.
+fn run_settings_ui(path: Option<&std::path::Path>) -> Result<()> {
+    use std::process::Command;
+
+    if Command::new("zenity").arg("--version").output().is_err() {
+        anyhow::bail!("zenity не найден — установите его:  sudo apt install zenity");
+    }
+    let cfg_path = path.map(|p| p.to_path_buf()).unwrap_or_else(Config::path);
+    let onoff = |b: bool| if b { "вкл".to_string() } else { "выкл".to_string() };
+    let mut changed = false;
+
+    loop {
+        let mut cfg = load_config(path)?;
+        // (key, name, current value, description). `key` is a hidden machine id — zenity
+        // prints it for the selected row (`--print-column=1 --hide-column=1`).
+        let rows: Vec<(&str, &str, String, &str)> = vec![
+            ("autocorrect", "Автокоррекция", onoff(!cfg.dry_run),
+             "исправлять слова, набранные не в той раскладке"),
+            ("enable_modifier_taps", "Тапы модификаторов", onoff(cfg.enable_modifier_taps),
+             "тап Ctrl = смена режима; тап Ctrl+Shift = перевод выделения"),
+            ("mode_toggle", "Тап смены режима EN↔RU", cfg.ibus_hotkeys.mode_toggle.clone(),
+             "Ctrl, Shift, Ctrl+Shift или none"),
+            ("convert_last", "Тап перевода выделения", cfg.ibus_hotkeys.convert_last.clone(),
+             "Ctrl+Shift, Ctrl или none"),
+            ("undo_key", "Флип последнего слова", cfg.ibus_hotkeys.undo_key.clone(),
+             "например Ctrl+grave, F12, Pause"),
+            ("convert_selection_key", "Перевод выделения (клавиша)",
+             cfg.ibus_hotkeys.convert_selection_key.clone(),
+             "надёжная альтернатива тапу"),
+            ("remember_key", "Запомнить слово (клавиша)", cfg.ibus_hotkeys.remember_key.clone(),
+             "запоминает выделенное/последнее слово; none = выключить"),
+            ("suggest_after", "Предлагать запомнить после N переводов",
+             cfg.learning.suggest_after.to_string(),
+             "окно-вопрос после N ручных переводов слова; 0 = не предлагать"),
+            ("tap_max_hold_ms", "Макс. длительность тапа, мс", cfg.tap_max_hold_ms.to_string(),
+             "удержание дольше — это шорткат, не тап"),
+            ("dict", "Словарь…", "открыть".into(), "пары слов, добавление и удаление"),
+        ];
+        let mut args: Vec<String> = [
+            "--list",
+            "--title=Настройки Puntu",
+            "--text=Выберите параметр и нажмите «Изменить».",
+            "--column=key",
+            "--column=Параметр",
+            "--column=Значение",
+            "--column=Описание",
+            "--hide-column=1",
+            "--print-column=1",
+            "--width=720",
+            "--height=560",
+            "--ok-label=Изменить",
+            "--cancel-label=Закрыть",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        for (key, name, value, desc) in &rows {
+            args.push(key.to_string());
+            args.push(name.to_string());
+            args.push(value.clone());
+            args.push(desc.to_string());
+        }
+
+        let out = Command::new("zenity").args(&args).output()?;
+        if !out.status.success() {
+            break; // «Закрыть»
+        }
+        let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        // A small prompt pre-filled with the current value; returns None on cancel.
+        let ask = |title: &str, current: &str| -> Option<String> {
+            let o = Command::new("zenity")
+                .args([
+                    "--entry",
+                    "--title=Настройки Puntu",
+                    &format!("--text={title}"),
+                    &format!("--entry-text={current}"),
+                ])
+                .output()
+                .ok()?;
+            o.status
+                .success()
+                .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let complain = |msg: &str| {
+            let _ = Command::new("zenity")
+                .args(["--error", "--title=Настройки Puntu", &format!("--text={msg}")])
+                .status();
+        };
+
+        match key.as_str() {
+            "autocorrect" => {
+                cfg.dry_run = !cfg.dry_run;
+            }
+            "enable_modifier_taps" => {
+                cfg.enable_modifier_taps = !cfg.enable_modifier_taps;
+            }
+            "mode_toggle" => {
+                let Some(v) = ask("Тап смены режима (Ctrl, Shift, Ctrl+Shift, none):", &cfg.ibus_hotkeys.mode_toggle) else { continue };
+                cfg.ibus_hotkeys.mode_toggle = v;
+            }
+            "convert_last" => {
+                let Some(v) = ask("Тап перевода выделения (Ctrl+Shift, Ctrl, none):", &cfg.ibus_hotkeys.convert_last) else { continue };
+                cfg.ibus_hotkeys.convert_last = v;
+            }
+            "undo_key" => {
+                let Some(v) = ask("Клавиша флипа последнего слова:", &cfg.ibus_hotkeys.undo_key) else { continue };
+                cfg.ibus_hotkeys.undo_key = v;
+            }
+            "convert_selection_key" => {
+                let Some(v) = ask("Клавиша перевода выделения:", &cfg.ibus_hotkeys.convert_selection_key) else { continue };
+                cfg.ibus_hotkeys.convert_selection_key = v;
+            }
+            "remember_key" => {
+                let Some(v) = ask("Клавиша «запомнить слово» (none = выключить):", &cfg.ibus_hotkeys.remember_key) else { continue };
+                cfg.ibus_hotkeys.remember_key = v;
+            }
+            "suggest_after" => {
+                let Some(v) = ask("Предлагать запомнить после скольких переводов (0 = никогда):", &cfg.learning.suggest_after.to_string()) else { continue };
+                match v.parse() {
+                    Ok(n) => cfg.learning.suggest_after = n,
+                    Err(_) => {
+                        complain("Нужно число, например 3");
+                        continue;
+                    }
+                }
+            }
+            "tap_max_hold_ms" => {
+                let Some(v) = ask("Максимальная длительность тапа в миллисекундах:", &cfg.tap_max_hold_ms.to_string()) else { continue };
+                match v.parse() {
+                    Ok(n) => cfg.tap_max_hold_ms = n,
+                    Err(_) => {
+                        complain("Нужно число, например 500");
+                        continue;
+                    }
+                }
+            }
+            "dict" => {
+                let dir = config::config_dir();
+                std::fs::create_dir_all(&dir).ok();
+                let mut dict = UserDict::load(dir)?;
+                run_dict_ui(&mut dict)?;
+                continue;
+            }
+            _ => continue,
+        }
+        cfg.save_to(&cfg_path)?;
+        changed = true;
+    }
+
+    if changed {
+        let apply = Command::new("zenity")
+            .args([
+                "--question",
+                "--title=Настройки Puntu",
+                "--text=Настройки сохранены. Перезапустить движок, чтобы применить?",
+                "--ok-label=Перезапустить",
+                "--cancel-label=Позже",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if apply {
+            let _ = Command::new("ibus").arg("restart").status();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = Command::new("ibus").args(["engine", "puntu"]).status();
         }
     }
     Ok(())

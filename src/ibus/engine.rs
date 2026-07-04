@@ -108,7 +108,14 @@ impl TapDetector {
         self.peak_ctrl = false;
         self.peak_shift = false;
     }
-    fn ctrl_press(&mut self) {
+    /// `was_down` = the modifier bit from the event's state, which reflects the state
+    /// BEFORE this press. `false` with a non-zero ref-count means we missed a release
+    /// (it happened while focus was elsewhere — Ctrl+click into another window). Resync,
+    /// or the count never returns to zero and taps go PERMANENTLY dead until restart.
+    fn ctrl_press(&mut self, was_down: bool) {
+        if !was_down {
+            self.ctrl_down = 0;
+        }
         if self.ctrl_down == 0 && self.shift_down == 0 {
             self.armed = true;
             self.started = Some(std::time::Instant::now());
@@ -116,13 +123,23 @@ impl TapDetector {
         self.ctrl_down += 1;
         self.peak_ctrl = true;
     }
-    fn shift_press(&mut self) {
+    fn shift_press(&mut self, was_down: bool) {
+        if !was_down {
+            self.shift_down = 0;
+        }
         if self.ctrl_down == 0 && self.shift_down == 0 {
             self.armed = true;
             self.started = Some(std::time::Instant::now());
         }
         self.shift_down += 1;
         self.peak_shift = true;
+    }
+    /// Forget everything, including the held ref-counts — for lifecycle events (focus
+    /// change, enable/disable) after which pending releases may never arrive.
+    fn hard_reset(&mut self) {
+        self.ctrl_down = 0;
+        self.shift_down = 0;
+        self.cancel();
     }
     /// Called on a modifier release. Returns the tap kind once *all* modifiers are released
     /// — that's the moment the gesture completes.
@@ -809,7 +826,7 @@ impl IBusEngine for PuntuEngine {
                         self.handle_tap(kind, &se).await;
                     }
                 } else {
-                    self.tap.ctrl_press();
+                    self.tap.ctrl_press(state.control());
                 }
                 return Ok(false);
             }
@@ -819,7 +836,7 @@ impl IBusEngine for PuntuEngine {
                         self.handle_tap(kind, &se).await;
                     }
                 } else {
-                    self.tap.shift_press();
+                    self.tap.shift_press(state.shift());
                 }
                 return Ok(false);
             }
@@ -993,7 +1010,7 @@ impl IBusEngine for PuntuEngine {
         debug!("[puntu-engine {}] enable", self.id);
         self.buffer.invalidate();
         self.held = None;
-        self.tap.cancel();
+        self.tap.hard_reset();
         // A new context: forget the previous one's purpose. Clients that care (terminals,
         // password fields) set it again right after; clients that don't would otherwise
         // inherit the stale value — one terminal visit left the engine transparent
@@ -1010,7 +1027,7 @@ impl IBusEngine for PuntuEngine {
         debug!("[puntu-engine {}] disable", self.id);
         // Switching away from the engine must not eat the word that only exists in preedit.
         self.flush_all(&se).await;
-        self.tap.cancel();
+        self.tap.hard_reset();
         Ok(())
     }
 
@@ -1036,7 +1053,7 @@ impl IBusEngine for PuntuEngine {
         self.flush_all(&se).await;
         // Drop any half-tracked modifier tap: a Ctrl held across a focus change (Ctrl+click,
         // window switch) must not fire the mode toggle when it's finally released.
-        self.tap.cancel();
+        self.tap.hard_reset();
         Ok(())
     }
 
@@ -1051,7 +1068,7 @@ impl IBusEngine for PuntuEngine {
         // is what made the last typed word visibly VANISH on a click ("слово пропало",
         // "стирается слово"). Commit them at the spot where the user already saw them instead.
         self.flush_all(&se).await;
-        self.tap.cancel();
+        self.tap.hard_reset();
         Ok(())
     }
 
@@ -1658,11 +1675,11 @@ mod tests {
     #[test]
     fn ctrl_tap_fires_and_chord_cancels() {
         let mut tap = TapDetector::default();
-        tap.ctrl_press();
+        tap.ctrl_press(false);
         assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
         // A non-modifier press mid-chain (what process_key_event calls cancel() for)
         // must spoil the gesture.
-        tap.ctrl_press();
+        tap.ctrl_press(false);
         tap.cancel();
         assert_eq!(tap.ctrl_release(), None);
     }
@@ -1670,13 +1687,13 @@ mod tests {
     #[test]
     fn ctrl_shift_tap_fires_regardless_of_release_order() {
         let mut tap = TapDetector::default();
-        tap.ctrl_press();
-        tap.shift_press();
+        tap.ctrl_press(false);
+        tap.shift_press(false);
         assert_eq!(tap.ctrl_release(), None); // shift still held
         assert_eq!(tap.shift_release(), Some(TapKind::CtrlShift));
 
-        tap.ctrl_press();
-        tap.shift_press();
+        tap.ctrl_press(false);
+        tap.shift_press(false);
         assert_eq!(tap.shift_release(), None);
         assert_eq!(tap.ctrl_release(), Some(TapKind::CtrlShift));
     }
@@ -1686,11 +1703,11 @@ mod tests {
         // Focus change while Ctrl is held (Ctrl+click): cancel() must keep the eventual
         // release from firing the mode toggle.
         let mut tap = TapDetector::default();
-        tap.ctrl_press();
+        tap.ctrl_press(false);
         tap.cancel();
         assert_eq!(tap.ctrl_release(), None);
         // The next clean tap works again.
-        tap.ctrl_press();
+        tap.ctrl_press(false);
         assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
     }
 
@@ -1699,16 +1716,16 @@ mod tests {
         // A Ctrl (or Ctrl+Shift) held longer than `max_hold` is a shortcut the app may have
         // swallowed the letter of (Ctrl+Shift+V in a terminal) — it must NOT fire on release.
         let mut tap = TapDetector::new(500);
-        tap.ctrl_press();
+        tap.ctrl_press(false);
         tap.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
         assert_eq!(tap.ctrl_release(), None);
         // The next quick tap still works.
-        tap.ctrl_press();
+        tap.ctrl_press(false);
         assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
 
         let mut tap = TapDetector::new(500);
-        tap.ctrl_press();
-        tap.shift_press();
+        tap.ctrl_press(false);
+        tap.shift_press(false);
         tap.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
         assert_eq!(tap.shift_release(), None);
         assert_eq!(tap.ctrl_release(), None);
@@ -1759,6 +1776,33 @@ mod tests {
                 "{k:?} must classify as Invalidate"
             );
         }
+    }
+
+    #[test]
+    fn lost_release_resyncs_on_next_press() {
+        // A Ctrl release that happened while focus was elsewhere (Ctrl+click into another
+        // window) never reaches the engine: the ref-count sticks at 1 and every later tap
+        // is dead — `maybe_fire` waits forever for "all released". The state bits of the
+        // NEXT press say Ctrl was NOT held, which must resync the count.
+        let mut tap = TapDetector::default();
+        tap.ctrl_press(false); // press seen…
+        // …release lost. Later the user taps Ctrl again:
+        tap.ctrl_press(false); // state: Ctrl was not held → resync
+        assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
+        // A legitimately held second Ctrl (state bit true) keeps its count.
+        tap.ctrl_press(false);
+        tap.ctrl_press(true);
+        assert_eq!(tap.ctrl_release(), None); // one Ctrl still down
+        assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
+    }
+
+    #[test]
+    fn hard_reset_clears_stuck_counts() {
+        let mut tap = TapDetector::default();
+        tap.ctrl_press(false);
+        tap.hard_reset(); // focus change while held
+        tap.ctrl_press(false);
+        assert_eq!(tap.ctrl_release(), Some(TapKind::Ctrl));
     }
 
     #[test]

@@ -57,6 +57,7 @@ puntu [--config <ПУТЬ>] <команда>
 |---|---|
 | `puntu stdin` | подать слова со stdin и напечатать решение детектора (без устройств/прав — для проверки) |
 | `puntu build-dict <вход> [<выход>]` | собрать большой словарь RU в FST (по умолчанию `~/.config/puntu/russian.fst`) |
+| `puntu settings` | **окно настроек** (zenity): автокоррекция, тапы, хоткеи, пороги обучения |
 | `puntu config show` | показать текущий конфиг (TOML) |
 | `puntu config set <ключ> <значение>` | изменить настройку и записать в `config.toml`: флаги (`dry_run`, `paste_convert`, `enable_modifier_taps`), числа (`tap_max_hold_ms`, `suggest_after` — 0 отключает предложение запомнить), хоткеи (`undo_key`, `convert_selection_key`, `remember_key`, `mode_toggle`, `convert_last`) |
 | `puntu --version` / `puntu --help` | версия / помощь (работает и для подкоманд: `puntu dict --help`) |
