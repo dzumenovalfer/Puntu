@@ -29,31 +29,69 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_zoom_factor(1.1);
-            apply_adwaita_theme(&cc.egui_ctx);
+            let (accent, dark) = read_system_theme();
+            apply_adwaita_theme(&cc.egui_ctx, accent, dark);
             Ok(Box::new(App::new()))
         }),
     )
 }
 
-/// Approximate the GNOME Adwaita-dark look: its background/accent palette, larger paddings
-/// and full-round toggles, so the window doesn't feel alien next to native dialogs.
-fn apply_adwaita_theme(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Dark);
-    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+/// Read the system look from GNOME: (accent colour, dark?). Follows the «Внешний вид»
+/// settings — accent-color ('blue', 'purple', …) and color-scheme ('prefer-dark').
+fn read_system_theme() -> (egui::Color32, bool) {
+    let get = |key: &str| {
+        std::process::Command::new("gsettings")
+            .args(["get", "org.gnome.desktop.interface", key])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().trim_matches('\'').to_string())
+            .unwrap_or_default()
+    };
+    let dark = get("color-scheme").contains("dark");
+    let c = |r: u8, g: u8, b: u8| egui::Color32::from_rgb(r, g, b);
+    // The GNOME 47+ accent palette.
+    let accent = match get("accent-color").as_str() {
+        "teal" => c(0x21, 0x90, 0xa4),
+        "green" => c(0x36, 0x88, 0x3c),
+        "yellow" => c(0xc8, 0x88, 0x00),
+        "orange" => c(0xed, 0x5b, 0x00),
+        "red" => c(0xe6, 0x2d, 0x42),
+        "pink" => c(0xd5, 0x61, 0x99),
+        "purple" => c(0x91, 0x41, 0xac),
+        "slate" => c(0x6f, 0x83, 0x96),
+        _ => c(0x35, 0x84, 0xe4), // blue / unknown
+    };
+    (accent, dark)
+}
+
+/// Approximate the GNOME Adwaita look with the SYSTEM accent colour and light/dark scheme —
+/// when the user changes the theme in «Внешний вид», the app follows (polled live).
+fn apply_adwaita_theme(ctx: &egui::Context, accent: egui::Color32, dark: bool) {
+    let theme = if dark { egui::Theme::Dark } else { egui::Theme::Light };
+    ctx.set_theme(theme);
+    let mut style = (*ctx.style_of(theme)).clone();
     let v = &mut style.visuals;
-    let bg = egui::Color32::from_rgb(0x24, 0x24, 0x24); // Adwaita dark window
-    let card = egui::Color32::from_rgb(0x30, 0x30, 0x30); // card / list row
-    let widget = egui::Color32::from_rgb(0x3a, 0x3a, 0x3a);
-    let accent = egui::Color32::from_rgb(0x35, 0x84, 0xe4); // GNOME blue
-    v.panel_fill = bg;
-    v.window_fill = bg;
-    v.extreme_bg_color = egui::Color32::from_rgb(0x1e, 0x1e, 0x1e);
-    v.faint_bg_color = card;
-    v.widgets.noninteractive.bg_fill = card;
-    v.widgets.inactive.bg_fill = widget;
-    v.widgets.inactive.weak_bg_fill = widget;
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x45, 0x45, 0x45);
-    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0x45, 0x45, 0x45);
+    if dark {
+        v.panel_fill = egui::Color32::from_rgb(0x24, 0x24, 0x24); // Adwaita dark window
+        v.window_fill = v.panel_fill;
+        v.extreme_bg_color = egui::Color32::from_rgb(0x1e, 0x1e, 0x1e);
+        v.faint_bg_color = egui::Color32::from_rgb(0x30, 0x30, 0x30); // card
+        v.widgets.noninteractive.bg_fill = v.faint_bg_color;
+        v.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x3a, 0x3a, 0x3a);
+        v.widgets.inactive.weak_bg_fill = v.widgets.inactive.bg_fill;
+        v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x45, 0x45, 0x45);
+        v.widgets.hovered.weak_bg_fill = v.widgets.hovered.bg_fill;
+    } else {
+        v.panel_fill = egui::Color32::from_rgb(0xfa, 0xfa, 0xfa); // Adwaita light window
+        v.window_fill = v.panel_fill;
+        v.extreme_bg_color = egui::Color32::WHITE;
+        v.faint_bg_color = egui::Color32::WHITE; // card
+        v.widgets.noninteractive.bg_fill = v.faint_bg_color;
+        v.widgets.inactive.bg_fill = egui::Color32::from_rgb(0xeb, 0xeb, 0xeb);
+        v.widgets.inactive.weak_bg_fill = v.widgets.inactive.bg_fill;
+        v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0xdd, 0xdd, 0xdd);
+        v.widgets.hovered.weak_bg_fill = v.widgets.hovered.bg_fill;
+    }
     v.widgets.active.bg_fill = accent;
     v.selection.bg_fill = accent;
     v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
@@ -65,7 +103,7 @@ fn apply_adwaita_theme(ctx: &egui::Context) {
     round(&mut v.widgets.open);
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    ctx.set_style_of(egui::Theme::Dark, style);
+    ctx.set_style_of(theme, style);
 }
 
 /// The layout-switch options offered in the settings list, GNOME-Tweaks style.
@@ -142,6 +180,12 @@ struct App {
     /// Peak modifiers seen during an active capture — releasing them all without a plain
     /// key assigns a modifier TAP (`Ctrl`, `Alt+Shift`, …) instead of a hotkey.
     capture_peak: egui::Modifiers,
+    /// Live system-theme updates (accent colour, dark?) from the gsettings poller thread.
+    theme_rx: mpsc::Receiver<(egui::Color32, bool)>,
+    /// Previous bindings, so a switch turned back on restores what the user had.
+    mode_prev: (String, String),    // (tap combo, key)
+    convert_prev: (String, String), // (tap combo, key)
+    undo_prev: String,
 }
 
 impl App {
@@ -150,11 +194,38 @@ impl App {
         std::fs::create_dir_all(&dir).ok();
         let dict = UserDict::load(dir.clone()).unwrap_or_else(|_| UserDict::empty(dir));
         let cfg = Config::load().unwrap_or_default();
-        let remember_prev = if cfg.ibus_hotkeys.remember_key.eq_ignore_ascii_case("none") {
-            "Ctrl+Alt+d".to_string()
-        } else {
-            cfg.ibus_hotkeys.remember_key.clone()
+        let or_default = |v: &str, def: &str| {
+            if v.trim().is_empty() || v.eq_ignore_ascii_case("none") {
+                def.to_string()
+            } else {
+                v.to_string()
+            }
         };
+        let remember_prev = or_default(&cfg.ibus_hotkeys.remember_key, "Ctrl+Alt+d");
+        let mode_prev = (
+            or_default(&cfg.ibus_hotkeys.mode_toggle, "Ctrl"),
+            cfg.ibus_hotkeys.mode_toggle_key.clone(),
+        );
+        let convert_prev = (
+            or_default(&cfg.ibus_hotkeys.convert_last, "Ctrl+Shift"),
+            or_default(&cfg.ibus_hotkeys.convert_selection_key, "Ctrl+Alt+s"),
+        );
+        let undo_prev = or_default(&cfg.ibus_hotkeys.undo_key, "Ctrl+grave");
+        // Follow the system theme live: poll gsettings in the background, apply on change.
+        let (theme_tx, theme_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut last = None;
+            loop {
+                let cur = read_system_theme();
+                if last != Some(cur) {
+                    last = Some(cur);
+                    if theme_tx.send(cur).is_err() {
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+        });
         App {
             cfg,
             dict,
@@ -167,6 +238,10 @@ impl App {
             remember_prev,
             restart_rx: None,
             capture_peak: egui::Modifiers::NONE,
+            theme_rx,
+            mode_prev,
+            convert_prev,
+            undo_prev,
         }
     }
 
@@ -318,14 +393,18 @@ fn row(ui: &mut egui::Ui, name: &str, desc: &str, control: impl FnOnce(&mut egui
 }
 
 
-/// A collapsible settings group rendered as an Adwaita-style card (rounded box with an
-/// expander arrow, like Ubuntu's «Дополнительные параметры раскладки» dialog).
-fn card_group(
+/// An Adwaita-style card (rounded box) with an expander arrow, a title and an optional
+/// master switch in the header — the GNOME Settings row look. Returns `true` when the
+/// switch changed. The body renders only while the switch is on.
+fn card_switch(
     ui: &mut egui::Ui,
+    id: &str,
     title: &str,
     desc: &str,
+    on: &mut bool,
     body: impl FnOnce(&mut egui::Ui),
-) {
+) -> bool {
+    let mut changed = false;
     egui::Frame::new()
         .fill(ui.visuals().faint_bg_color)
         .corner_radius(10)
@@ -333,15 +412,34 @@ fn card_group(
         .outer_margin(egui::Margin { bottom: 6, ..Default::default() })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            egui::CollapsingHeader::new(egui::RichText::new(title).strong())
-                .default_open(false)
-                .show(ui, |ui| {
-                    if !desc.is_empty() {
-                        ui.label(egui::RichText::new(desc).weak().size(11.0));
+            let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                egui::Id::new(id),
+                false,
+            );
+            state
+                .show_header(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(title).strong());
+                        if !desc.is_empty() {
+                            ui.label(egui::RichText::new(desc).weak().size(11.0));
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if toggle(ui, on).changed() {
+                            changed = true;
+                        }
+                    });
+                })
+                .body(|ui| {
+                    if *on {
+                        body(ui);
+                    } else {
+                        ui.label(egui::RichText::new("выключено").weak());
                     }
-                    body(ui);
                 });
         });
+    changed
 }
 
 /// Is a tap-combo config value effectively "off"?
@@ -419,17 +517,11 @@ impl App {
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
         let mut save = false;
 
-        // Hotkey capture overlay: while active, eat the next key press. Two outcomes:
+        // Hotkey capture: a modal window on top of everything. Two outcomes:
         //   * a plain key (with or without modifiers) → a hotkey binding (`Ctrl+r`, `F9`);
         //   * ONLY modifiers pressed and then all released → a modifier tap (`Ctrl`,
-        //     `Alt+Shift`) — this is how «переключение на Ctrl» is assigned, since bare
-        //     modifiers never arrive as key events.
+        //     `Alt+Shift`) — bare modifiers never arrive as key events.
         if let Some(target) = self.capture {
-            ui.scope(|ui| {
-                ui.visuals_mut().override_text_color = Some(egui::Color32::LIGHT_BLUE);
-                ui.label("Нажмите клавишу или сочетание (можно только модификаторы: Ctrl, Alt+Shift…)   Esc — отмена");
-            });
-            ui.separator();
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             let mods_now = ui.ctx().input(|i| i.modifiers);
             self.capture_peak = egui::Modifiers {
@@ -439,6 +531,21 @@ impl App {
                 mac_cmd: false,
                 command: self.capture_peak.command | (mods_now.command && !mods_now.ctrl),
             };
+            egui::Modal::new(egui::Id::new("capture_modal")).show(ui.ctx(), |ui| {
+                ui.set_width(340.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("Назначение").strong().size(15.0));
+                    ui.add_space(6.0);
+                    ui.label("Нажмите клавишу или сочетание.");
+                    ui.label(
+                        egui::RichText::new(
+                            "Можно только модификаторы: Ctrl, Alt+Shift…\nEsc — отмена",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
+                });
+            });
             let key_captured = ui.ctx().input(|i| {
                 for ev in &i.events {
                     if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
@@ -452,8 +559,6 @@ impl App {
                 }
                 None
             });
-            // Modifier-tap outcome: something was held, now everything is released, and no
-            // plain key fired this frame.
             let tap_combo = if key_captured.is_none()
                 && mods_now.is_none()
                 && !self.capture_peak.is_none()
@@ -472,7 +577,6 @@ impl App {
                     parts.push("Super");
                 }
                 let combo = parts.join("+");
-                // Bare Shift is not a valid gesture (aborted capitals) — ignore it.
                 (combo != "Shift").then_some(combo)
             } else {
                 None
@@ -481,17 +585,22 @@ impl App {
             if let Some(result) = key_captured {
                 if let Some(binding) = result {
                     match target {
-                        Capture::Undo => self.cfg.ibus_hotkeys.undo_key = binding,
+                        Capture::Undo => {
+                            self.cfg.ibus_hotkeys.undo_key = binding.clone();
+                            self.undo_prev = binding;
+                        }
                         Capture::ConvertSelection => {
-                            self.cfg.ibus_hotkeys.convert_selection_key = binding
+                            self.cfg.ibus_hotkeys.convert_selection_key = binding.clone();
+                            self.convert_prev.1 = binding;
                         }
                         Capture::Remember => {
                             self.cfg.ibus_hotkeys.remember_key = binding.clone();
                             self.remember_prev = binding;
                         }
                         Capture::ModeToggleKey => {
-                            self.cfg.ibus_hotkeys.mode_toggle_key = binding;
+                            self.cfg.ibus_hotkeys.mode_toggle_key = binding.clone();
                             self.cfg.ibus_hotkeys.mode_toggle = "none".to_string();
+                            self.mode_prev = ("none".to_string(), binding);
                         }
                     }
                     save = true;
@@ -499,17 +608,17 @@ impl App {
                 done = true;
             } else if let Some(combo) = tap_combo {
                 match target {
-                    // For the mode/conversion gestures a modifier combo means a TAP binding.
                     Capture::ModeToggleKey => {
-                        self.cfg.ibus_hotkeys.mode_toggle = combo;
+                        self.cfg.ibus_hotkeys.mode_toggle = combo.clone();
                         self.cfg.ibus_hotkeys.mode_toggle_key = "none".to_string();
                         self.cfg.enable_modifier_taps = true;
+                        self.mode_prev = (combo, "none".to_string());
                     }
                     Capture::ConvertSelection => {
-                        self.cfg.ibus_hotkeys.convert_last = combo;
+                        self.cfg.ibus_hotkeys.convert_last = combo.clone();
                         self.cfg.enable_modifier_taps = true;
+                        self.convert_prev.0 = combo;
                     }
-                    // Hotkey-only fields can't be a bare modifier — ignore.
                     Capture::Undo | Capture::Remember => {}
                 }
                 save = true;
@@ -524,17 +633,21 @@ impl App {
         let mut capture_request: Option<Capture> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             let cfg = &mut self.cfg;
+            let remember_prev = &self.remember_prev;
+            let mode_prev = &mut self.mode_prev;
+            let convert_prev = &mut self.convert_prev;
+            let undo_prev = &mut self.undo_prev;
 
-            // ---- Автокоррекция: master switch + its sub-options underneath ----
-            let mut autocorrect = !cfg.dry_run;
-            row(ui, "Автокоррекция", "исправлять слова не в той раскладке", |ui| {
-                if toggle(ui, &mut autocorrect).changed() {
-                    cfg.dry_run = !autocorrect;
-                    save = true;
-                }
-            });
-            if autocorrect {
-                ui.indent("auto_sub", |ui| {
+            // ============== Автопереключение (главный раздел) ==============
+            let mut master_on = !cfg.dry_run;
+            if card_switch(
+                ui,
+                "master",
+                "Автопереключение",
+                "исправление слов, набранных не в той раскладке",
+                &mut master_on,
+                |ui| {
+                    // ---- внутренние настройки автокоррекции ----
                     let mut suggest = cfg.learning.suggest_after > 0;
                     row(ui, "Предлагать запоминание", "после N ручных переводов слова", |ui| {
                         if toggle(ui, &mut suggest).changed() {
@@ -554,11 +667,11 @@ impl App {
                     });
 
                     let mut remember_on =
-                        !cfg.ibus_hotkeys.remember_key.eq_ignore_ascii_case("none");
+                        !parse_off(&cfg.ibus_hotkeys.remember_key);
                     row(ui, "Запомнить слово", "выделенное/последнее слово — в словарь", |ui| {
                         if toggle(ui, &mut remember_on).changed() {
                             cfg.ibus_hotkeys.remember_key = if remember_on {
-                                self.remember_prev.clone()
+                                remember_prev.clone()
                             } else {
                                 "none".to_string()
                             };
@@ -573,91 +686,143 @@ impl App {
                         }
                     });
 
+                    let mut undo_on = !parse_off(&cfg.ibus_hotkeys.undo_key);
                     row(ui, "Флип последнего слова", "перевести туда-обратно", |ui| {
-                        if ui.button(binding_label(&cfg.ibus_hotkeys.undo_key)).clicked() {
+                        if toggle(ui, &mut undo_on).changed() {
+                            cfg.ibus_hotkeys.undo_key = if undo_on {
+                                undo_prev.clone()
+                            } else {
+                                "none".to_string()
+                            };
+                            save = true;
+                        }
+                        if undo_on
+                            && ui.button(binding_label(&cfg.ibus_hotkeys.undo_key)).clicked()
+                        {
                             capture_request = Some(Capture::Undo);
                         }
                     });
-                });
-            }
 
-            // ---- Переключение режима EN↔RU: a GNOME-Tweaks-style option list ----
-            card_group(ui, "Переключение на другую раскладку",
-                "режим EN-автокоррекции ↔ прямой русский ввод", |ui| {
-                let key_mode = !cfg.ibus_hotkeys.mode_toggle_key.eq_ignore_ascii_case("none");
-                let current_tap = cfg.ibus_hotkeys.mode_toggle.to_ascii_lowercase();
-                for (combo, label) in SWITCH_OPTIONS {
-                    let selected = !key_mode && current_tap == combo.to_ascii_lowercase();
-                    if ui.radio(selected, *label).clicked() && !selected {
-                        cfg.ibus_hotkeys.mode_toggle = combo.to_string();
-                        cfg.ibus_hotkeys.mode_toggle_key = "none".to_string();
-                        cfg.enable_modifier_taps = true;
-                        save = true;
-                    }
-                }
-                ui.horizontal(|ui| {
-                    if ui.radio(key_mode, "своя клавиша:").clicked() && !key_mode {
-                        capture_request = Some(Capture::ModeToggleKey);
-                    }
-                    if key_mode {
-                        if ui
-                            .button(binding_label(&cfg.ibus_hotkeys.mode_toggle_key))
-                            .clicked()
-                        {
-                            capture_request = Some(Capture::ModeToggleKey);
+                    // ---- Переключение на другую раскладку ----
+                    let mut switch_on = !(parse_off(&cfg.ibus_hotkeys.mode_toggle)
+                        && parse_off(&cfg.ibus_hotkeys.mode_toggle_key));
+                    if card_switch(
+                        ui,
+                        "mode_switch",
+                        "Переключение на другую раскладку",
+                        "режим EN-автокоррекции ↔ прямой русский ввод",
+                        &mut switch_on,
+                        |ui| {
+                            let key_mode = !parse_off(&cfg.ibus_hotkeys.mode_toggle_key);
+                            let current_tap = cfg.ibus_hotkeys.mode_toggle.to_ascii_lowercase();
+                            for (combo, label) in SWITCH_OPTIONS {
+                                let selected =
+                                    !key_mode && current_tap == combo.to_ascii_lowercase();
+                                if ui.radio(selected, *label).clicked() && !selected {
+                                    cfg.ibus_hotkeys.mode_toggle = combo.to_string();
+                                    cfg.ibus_hotkeys.mode_toggle_key = "none".to_string();
+                                    cfg.enable_modifier_taps = true;
+                                    *mode_prev = (combo.to_string(), "none".to_string());
+                                    save = true;
+                                }
+                            }
+                            row(ui, "Своя клавиша", "клавиша или сочетание — нажатием", |ui| {
+                                let lbl = if key_mode {
+                                    binding_label(&cfg.ibus_hotkeys.mode_toggle_key)
+                                } else {
+                                    "назначить…".to_string()
+                                };
+                                if ui.button(lbl).clicked() {
+                                    capture_request = Some(Capture::ModeToggleKey);
+                                }
+                            });
+                        },
+                    ) {
+                        if switch_on {
+                            cfg.ibus_hotkeys.mode_toggle = mode_prev.0.clone();
+                            cfg.ibus_hotkeys.mode_toggle_key = mode_prev.1.clone();
+                            if parse_off(&cfg.ibus_hotkeys.mode_toggle)
+                                && parse_off(&cfg.ibus_hotkeys.mode_toggle_key)
+                            {
+                                cfg.ibus_hotkeys.mode_toggle = "Ctrl".to_string();
+                            }
+                            cfg.enable_modifier_taps = true;
+                        } else {
+                            *mode_prev = (
+                                cfg.ibus_hotkeys.mode_toggle.clone(),
+                                cfg.ibus_hotkeys.mode_toggle_key.clone(),
+                            );
+                            cfg.ibus_hotkeys.mode_toggle = "none".to_string();
+                            cfg.ibus_hotkeys.mode_toggle_key = "none".to_string();
                         }
-                    } else {
-                        ui.label(
-                            egui::RichText::new("Pause, F-клавиши и т.п.").weak().size(11.0),
-                        );
-                    }
-                });
-                let off = !key_mode && parse_off(&cfg.ibus_hotkeys.mode_toggle);
-                if ui.radio(off, "выключено").clicked() && !off {
-                    cfg.ibus_hotkeys.mode_toggle = "none".to_string();
-                    cfg.ibus_hotkeys.mode_toggle_key = "none".to_string();
-                    save = true;
-                }
-            });
-
-            // ---- Перевод выделения ----
-            card_group(ui, "Перевод выделенного текста",
-                "выделите мышью и нажмите жест или клавишу", |ui| {
-                let current = cfg.ibus_hotkeys.convert_last.to_ascii_lowercase();
-                for (combo, label) in SWITCH_OPTIONS {
-                    let selected = current == combo.to_ascii_lowercase();
-                    if ui.radio(selected, *label).clicked() && !selected {
-                        cfg.ibus_hotkeys.convert_last = combo.to_string();
-                        cfg.enable_modifier_taps = true;
                         save = true;
                     }
-                }
-                let off = parse_off(&cfg.ibus_hotkeys.convert_last);
-                if ui.radio(off, "выключено (только клавиша)").clicked() && !off {
-                    cfg.ibus_hotkeys.convert_last = "none".to_string();
-                    save = true;
-                }
-                row(ui, "Клавиша", "работает всегда, независимо от тапа", |ui| {
-                    if ui
-                        .button(binding_label(&cfg.ibus_hotkeys.convert_selection_key))
-                        .clicked()
-                    {
-                        capture_request = Some(Capture::ConvertSelection);
-                    }
-                });
-            });
 
-            // ---- Прочее ----
-            row(ui, "Длительность тапа", "дольше — считается шорткатом, не тапом", |ui| {
-                let mut ms = cfg.tap_max_hold_ms;
-                if ui
-                    .add(egui::DragValue::new(&mut ms).range(100..=2000).suffix(" мс"))
-                    .changed()
-                {
-                    cfg.tap_max_hold_ms = ms;
-                    save = true;
-                }
-            });
+                    // ---- Перевод выделенного текста ----
+                    let mut conv_on = !(parse_off(&cfg.ibus_hotkeys.convert_last)
+                        && parse_off(&cfg.ibus_hotkeys.convert_selection_key));
+                    if card_switch(
+                        ui,
+                        "convert",
+                        "Перевод выделенного текста",
+                        "выделите мышью и нажмите жест или клавишу",
+                        &mut conv_on,
+                        |ui| {
+                            let current = cfg.ibus_hotkeys.convert_last.to_ascii_lowercase();
+                            for (combo, label) in SWITCH_OPTIONS {
+                                let selected = current == combo.to_ascii_lowercase();
+                                if ui.radio(selected, *label).clicked() && !selected {
+                                    cfg.ibus_hotkeys.convert_last = combo.to_string();
+                                    cfg.enable_modifier_taps = true;
+                                    convert_prev.0 = combo.to_string();
+                                    save = true;
+                                }
+                            }
+                            row(ui, "Своя клавиша", "работает независимо от жеста", |ui| {
+                                let lbl = if parse_off(&cfg.ibus_hotkeys.convert_selection_key)
+                                {
+                                    "назначить…".to_string()
+                                } else {
+                                    binding_label(&cfg.ibus_hotkeys.convert_selection_key)
+                                };
+                                if ui.button(lbl).clicked() {
+                                    capture_request = Some(Capture::ConvertSelection);
+                                }
+                            });
+                        },
+                    ) {
+                        if conv_on {
+                            cfg.ibus_hotkeys.convert_last = convert_prev.0.clone();
+                            cfg.ibus_hotkeys.convert_selection_key = convert_prev.1.clone();
+                            cfg.enable_modifier_taps = true;
+                        } else {
+                            // «Выключено — значит выключено полностью»: и жест, и клавиша.
+                            *convert_prev = (
+                                cfg.ibus_hotkeys.convert_last.clone(),
+                                cfg.ibus_hotkeys.convert_selection_key.clone(),
+                            );
+                            cfg.ibus_hotkeys.convert_last = "none".to_string();
+                            cfg.ibus_hotkeys.convert_selection_key = "none".to_string();
+                        }
+                        save = true;
+                    }
+
+                    // ---- Длительность тапа ----
+                    row(ui, "Длительность тапа", "дольше — считается шорткатом, не тапом", |ui| {
+                        let mut ms = cfg.tap_max_hold_ms;
+                        if ui
+                            .add(egui::DragValue::new(&mut ms).range(100..=2000).suffix(" мс"))
+                            .changed()
+                        {
+                            cfg.tap_max_hold_ms = ms;
+                            save = true;
+                        }
+                    });
+                },
+            ) {
+                cfg.dry_run = !master_on;
+                save = true;
+            }
         });
 
         if let Some(target) = capture_request {
@@ -774,6 +939,12 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Follow the system theme (accent colour / dark) live.
+        if let Ok((accent, dark)) = self.theme_rx.try_recv() {
+            apply_adwaita_theme(ui.ctx(), accent, dark);
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(3));
+
         // Engine-restart progress: poll the background thread's answer.
         if let Some(rx) = &self.restart_rx {
             match rx.try_recv() {
