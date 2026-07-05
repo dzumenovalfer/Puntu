@@ -21,7 +21,13 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([680.0, 600.0])
             .with_min_inner_size([560.0, 440.0])
-            .with_title("Puntu"),
+            .with_title("Puntu")
+            // Frameless + transparent: we draw our own GNOME-style rounded window with a
+            // headerbar (system decorations on Wayland are square and alien-looking).
+            .with_decorations(false)
+            .with_transparent(true)
+            // Matches puntu.desktop, so the dock/alt-tab show the proper icon and name.
+            .with_app_id("puntu"),
         ..Default::default()
     };
     eframe::run_native(
@@ -348,6 +354,44 @@ impl App {
             Err(e) => format!("Ошибка: {e}"),
         };
     }
+}
+
+
+/// GNOME-style round titlebar button with a painted glyph.
+#[derive(Clone, Copy)]
+enum WinGlyph {
+    Min,
+    Max,
+    Close,
+}
+
+fn window_button(ui: &mut egui::Ui, glyph: WinGlyph) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let vis = ui.style().interact(&resp);
+        ui.painter().circle_filled(rect.center(), 12.0, vis.bg_fill);
+        let c = rect.center();
+        let r = 4.0;
+        let s = egui::Stroke::new(1.5, vis.fg_stroke.color);
+        match glyph {
+            WinGlyph::Min => {
+                ui.painter().line_segment([c + egui::vec2(-r, 3.0), c + egui::vec2(r, 3.0)], s);
+            }
+            WinGlyph::Max => {
+                ui.painter().rect_stroke(
+                    egui::Rect::from_center_size(c, egui::vec2(2.0 * r, 2.0 * r)),
+                    1.0,
+                    s,
+                    egui::StrokeKind::Inside,
+                );
+            }
+            WinGlyph::Close => {
+                ui.painter().line_segment([c + egui::vec2(-r, -r), c + egui::vec2(r, r)], s);
+                ui.painter().line_segment([c + egui::vec2(-r, r), c + egui::vec2(r, -r)], s);
+            }
+        }
+    }
+    resp
 }
 
 /// GNOME-style toggle switch (from the egui demo gallery).
@@ -835,7 +879,7 @@ impl App {
 
     fn dictionary_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("Поиск:");
+            ui.label("🔍 Поиск:");
             ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(220.0));
         });
         ui.horizontal(|ui| {
@@ -844,7 +888,7 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut self.new_word).desired_width(180.0));
             let submitted =
                 add_field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.button("Добавить").clicked() || submitted)
+            if (ui.button("➕ Добавить").clicked() || submitted)
                 && !self.new_word.trim().is_empty()
             {
                 let word = self.new_word.trim().to_lowercase();
@@ -906,7 +950,7 @@ impl App {
                         if action != r.action {
                             pending = Some((i, action));
                         }
-                        if ui.small_button("удалить").clicked() {
+                        if ui.small_button("🗑").on_hover_text("Удалить").clicked() {
                             remove = Some(r.stored.clone());
                         }
                         ui.end_row();
@@ -938,6 +982,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4] // transparent — the rounded window is painted by us
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Follow the system theme (accent colour / dark) live.
         if let Ok((accent, dark)) = self.theme_rx.try_recv() {
@@ -962,30 +1010,109 @@ impl eframe::App for App {
             }
         }
 
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Settings, "Настройки");
-                ui.selectable_value(&mut self.tab, Tab::Dictionary, "Словарь");
-            });
-        });
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if self.dirty {
-                    if ui.button("Применить (перезапустить движок)").clicked() {
-                        self.restart_engine();
-                    }
-                } else if self.restart_rx.is_none() {
-                    ui.label(egui::RichText::new("Изменения словаря применяются сами").weak());
+        // The rounded window itself (GNOME look; square when maximized).
+        let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+        let radius: f32 = if maximized { 0.0 } else { 14.0 };
+        let rect = ui.max_rect();
+        let border = if ui.visuals().dark_mode {
+            egui::Color32::from_gray(0x50)
+        } else {
+            egui::Color32::from_gray(0xc8)
+        };
+        ui.painter().rect(
+            rect,
+            radius,
+            ui.visuals().panel_fill,
+            egui::Stroke::new(1.0, border),
+            egui::StrokeKind::Inside,
+        );
+
+        // Headerbar: tabs on the left (GNOME view switcher), window buttons on the right,
+        // empty space drags the window, double-click maximizes.
+        egui::Panel::top("titlebar")
+            .frame(egui::Frame::new().inner_margin(egui::Margin {
+                left: 10,
+                right: 8,
+                top: 8,
+                bottom: 4,
+            }))
+            .show(ui, |ui| {
+                let bar = ui.max_rect();
+                let drag =
+                    ui.interact(bar, egui::Id::new("title_drag"), egui::Sense::click_and_drag());
+                if drag.drag_started() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(&self.status);
+                if drag.double_clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.tab, Tab::Settings, "⚙ Настройки");
+                    ui.selectable_value(&mut self.tab, Tab::Dictionary, "📖 Словарь");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if window_button(ui, WinGlyph::Close).clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if window_button(ui, WinGlyph::Max).clicked() {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
+                        if window_button(ui, WinGlyph::Min).clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                    });
                 });
             });
-        });
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Settings => self.settings_tab(ui),
-            Tab::Dictionary => self.dictionary_tab(ui),
-        });
+
+        egui::Panel::bottom("status")
+            .frame(egui::Frame::new().inner_margin(egui::Margin {
+                left: 12,
+                right: 12,
+                top: 4,
+                bottom: 10,
+            }))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if self.dirty {
+                        if ui.button("Применить (перезапустить движок)").clicked() {
+                            self.restart_engine();
+                        }
+                    } else if self.restart_rx.is_none() {
+                        ui.label(
+                            egui::RichText::new("Изменения словаря применяются сами").weak(),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(&self.status);
+                    });
+                });
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().inner_margin(egui::Margin {
+                left: 12,
+                right: 12,
+                top: 4,
+                bottom: 4,
+            }))
+            .show(ui, |ui| match self.tab {
+                Tab::Settings => self.settings_tab(ui),
+                Tab::Dictionary => self.dictionary_tab(ui),
+            });
+
+        // Frameless windows lose the compositor resize edges — a drag handle in the
+        // bottom-right corner brings resizing back.
+        if !maximized {
+            let br = egui::Rect::from_min_max(rect.max - egui::vec2(18.0, 18.0), rect.max);
+            let resp = ui.interact(br, egui::Id::new("resize_br"), egui::Sense::drag());
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeSouthEast);
+            }
+            if resp.drag_started() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::BeginResize(
+                    egui::ResizeDirection::SouthEast,
+                ));
+            }
+        }
 
         // Never enable the system IME for this window: the engine would otherwise
         // auto-correct the very words being typed into the dictionary fields (the reported
