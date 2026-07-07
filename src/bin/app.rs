@@ -743,30 +743,6 @@ impl App {
                         }
                     });
 
-                    row(ui, "Исправление регистра", "пРИВЕТ → Привет; ПРивет → Привет (по словарю)", |ui| {
-                        if toggle(ui, &mut cfg.fix_case).changed() {
-                            save = true;
-                        }
-                    });
-
-                    let case_prev = &self.case_prev;
-                    let mut case_on = !parse_off(&cfg.ibus_hotkeys.case_key);
-                    row(ui, "Регистр слова", "слово → Слово → СЛОВО, как флип перевода", |ui| {
-                        if toggle(ui, &mut case_on).changed() {
-                            cfg.ibus_hotkeys.case_key = if case_on {
-                                case_prev.clone()
-                            } else {
-                                "none".to_string()
-                            };
-                            save = true;
-                        }
-                        if case_on
-                            && ui.button(binding_label(&cfg.ibus_hotkeys.case_key)).clicked()
-                        {
-                            capture_request = Some(Capture::CaseKey);
-                        }
-                    });
-
                     let mut undo_on = !parse_off(&cfg.ibus_hotkeys.undo_key);
                     row(ui, "Флип последнего слова", "перевести туда-обратно", |ui| {
                         if toggle(ui, &mut undo_on).changed() {
@@ -902,6 +878,50 @@ impl App {
                 },
             ) {
                 cfg.dry_run = !master_on;
+                save = true;
+            }
+
+            // ============== Исправление регистра (отдельный раздел) ==============
+            let case_prev = &self.case_prev;
+            let mut case_card_on = cfg.fix_case || !parse_off(&cfg.ibus_hotkeys.case_key);
+            if card_switch(
+                ui,
+                "case_fix",
+                "Исправление регистра",
+                "пРИВЕТ → Привет; ПРивет → Привет (по словарю)",
+                &mut case_card_on,
+                |ui| {
+                    row(ui, "Автоматически", "чинит случайный CapsLock и поздний Shift", |ui| {
+                        if toggle(ui, &mut cfg.fix_case).changed() {
+                            save = true;
+                        }
+                    });
+                    let mut key_on = !parse_off(&cfg.ibus_hotkeys.case_key);
+                    row(ui, "Регистр слова (клавиша)", "слово → Слово → СЛОВО, как флип перевода", |ui| {
+                        if toggle(ui, &mut key_on).changed() {
+                            cfg.ibus_hotkeys.case_key = if key_on {
+                                case_prev.clone()
+                            } else {
+                                "none".to_string()
+                            };
+                            save = true;
+                        }
+                        if key_on
+                            && ui.button(binding_label(&cfg.ibus_hotkeys.case_key)).clicked()
+                        {
+                            capture_request = Some(Capture::CaseKey);
+                        }
+                    });
+                },
+            ) {
+                if case_card_on {
+                    cfg.fix_case = true;
+                    cfg.ibus_hotkeys.case_key = case_prev.clone();
+                } else {
+                    // «Выключено — значит выключено полностью»: и авто, и клавиша.
+                    cfg.fix_case = false;
+                    cfg.ibus_hotkeys.case_key = "none".to_string();
+                }
                 save = true;
             }
         });
