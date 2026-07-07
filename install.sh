@@ -69,7 +69,7 @@ if [[ "$LOCAL" -eq 1 ]]; then
   # `--no-default-features --features ibus` builds only the engine and the pure-core CLI
   # (dict / config / build-dict). It skips evdev/uinput entirely — no device dependencies.
   say "Building and installing puntu-ibus + puntu (release)…"
-  cargo install --path "$REPO_DIR" --no-default-features --features ibus,app --force
+  cargo install --path "$REPO_DIR" --no-default-features --features ibus,app,gui --force
   BIN_DIR="$HOME/.cargo/bin"
 
   if [[ -f "$REPO_DIR/dictionaries/russian.utf-8" ]]; then
@@ -98,6 +98,8 @@ else
     install -m 0755 "$TMP/puntu/puntu" "$TMP/puntu/puntu-ibus" "$BIN_DIR/"
     # The unified settings+dictionary window (absent from pre-0.4 releases).
     [[ -f "$TMP/puntu/puntu-app" ]] && install -m 0755 "$TMP/puntu/puntu-app" "$BIN_DIR/"
+    # The tray indicator (absent from pre-0.7 releases).
+    [[ -f "$TMP/puntu/puntu-gui" ]] && install -m 0755 "$TMP/puntu/puntu-gui" "$BIN_DIR/"
     if [[ -f "$TMP/puntu/russian.fst" ]]; then
       say "Installing the big Russian dictionary → $CONFIG_DIR/russian.fst"
       install -m 0644 "$TMP/puntu/russian.fst" "$CONFIG_DIR/russian.fst"
@@ -187,6 +189,26 @@ Categories=Utility;Settings;
 Keywords=puntu;keyboard;layout;раскладка;настройки;словарь;dictionary;
 DESK
 update-desktop-database "$APPS_DIR" 2>/dev/null || true
+
+# 7b. Tray indicator: autostart + launch now ----------------------------------
+# Open the app / pause temporarily / disable the engine, with a status icon.
+if [[ -x "$BIN_DIR/puntu-gui" ]]; then
+  say "Setting up the tray indicator (autostart)…"
+  AUTOSTART_DIR="$HOME/.config/autostart"
+  mkdir -p "$AUTOSTART_DIR"
+  cat > "$AUTOSTART_DIR/puntu-tray.desktop" <<DESK
+[Desktop Entry]
+Name=Puntu Tray
+Comment=Индикатор и быстрые действия Puntu
+Exec=$BIN_DIR/puntu-gui
+Icon=input-keyboard
+Type=Application
+Terminal=false
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+DESK
+  pgrep -x puntu-gui >/dev/null 2>&1 || setsid "$BIN_DIR/puntu-gui" >/dev/null 2>&1 < /dev/null &
+fi
 
 # 8. Electron/Chromium apps: enable the system input method -------------------
 # An IBus engine only sees keys from apps connected to the input-method framework. Electron

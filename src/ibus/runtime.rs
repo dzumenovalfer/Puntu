@@ -57,10 +57,18 @@ pub async fn run() -> Result<()> {
     // The uinput daemon always had this; the IBus engine loading the dict once at startup is
     // why "puntu dict add … did nothing" until now.
     let dict = Arc::new(AsyncMutex::new(dict));
-    spawn_dict_reload_watcher(Arc::clone(&dict));
+    // Tray pause flag: initial state from the marker file, then live via the watcher.
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(paused_path().exists()));
+    spawn_dict_reload_watcher(Arc::clone(&dict), Arc::clone(&paused));
 
-    let factory =
-        PuntuFactory::new(detector, dict, hotkeys, autocorrect, cfg.learning.suggest_after);
+    let factory = PuntuFactory::new(
+        detector,
+        dict,
+        hotkeys,
+        autocorrect,
+        Arc::clone(&paused),
+        cfg.learning.suggest_after,
+    );
 
     let _ibus = librush::ibus::IBus::<PuntuEngine, PuntuFactory>::new(
         addr,
@@ -84,10 +92,17 @@ pub async fn run() -> Result<()> {
 /// Spawn the dictionary hot-reload watcher on its own OS thread. `notify` delivers events on
 /// a std channel and the reload takes the dict mutex with `blocking_lock`, so this must live
 /// outside the tokio runtime.
-fn spawn_dict_reload_watcher(dict: Arc<AsyncMutex<UserDict>>) {
+fn paused_path() -> std::path::PathBuf {
+    config::config_dir().join("paused")
+}
+
+fn spawn_dict_reload_watcher(
+    dict: Arc<AsyncMutex<UserDict>>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
+) {
     if let Err(e) = std::thread::Builder::new()
         .name("puntu-dict-reload".into())
-        .spawn(move || dict_reload_watcher(dict))
+        .spawn(move || dict_reload_watcher(dict, paused))
     {
         tracing::warn!("dictionary hot-reload disabled (thread spawn failed): {e}");
     }
@@ -98,7 +113,10 @@ fn spawn_dict_reload_watcher(dict: Arc<AsyncMutex<UserDict>>) {
 /// filtered to the dict files, so writes to `config.toml`, `russian.fst` or the control
 /// socket don't trigger pointless reloads. Same approach as the uinput daemon's
 /// `reload_watcher` (`input/mod.rs`), minus the config/models parts the engine reads at boot.
-fn dict_reload_watcher(dict: Arc<AsyncMutex<UserDict>>) {
+fn dict_reload_watcher(
+    dict: Arc<AsyncMutex<UserDict>>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
+) {
     use notify::{RecursiveMode, Watcher};
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
@@ -147,6 +165,14 @@ fn dict_reload_watcher(dict: Arc<AsyncMutex<UserDict>>) {
         };
         match rx.recv_timeout(timeout) {
             Ok(Ok(ev)) => {
+                // The tray's pause marker takes effect immediately — no debounce.
+                if ev.paths.iter().any(|p| {
+                    p.file_name().and_then(|n| n.to_str()) == Some("paused")
+                }) {
+                    let now = paused_path().exists();
+                    paused.store(now, std::sync::atomic::Ordering::Relaxed);
+                    info!("pause marker changed: paused = {now}");
+                }
                 if ev.paths.iter().any(|p| is_dict_file(p)) {
                     dirty = true;
                     deadline = Some(Instant::now() + DEBOUNCE);

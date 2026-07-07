@@ -26,7 +26,7 @@ jobs:
           }
       # The unified settings/dictionary window must keep compiling.
       - name: Check (app window)
-        run: cargo check --no-default-features --features ibus,app
+        run: cargo check --no-default-features --features ibus,app,gui
       # The legacy uinput daemon build still has to compile and pass its tests.
       - name: Test (default / uinput daemon)
         run: |

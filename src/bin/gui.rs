@@ -1,63 +1,71 @@
-//! Puntu tray front-end (`puntu-gui`).
+//! Puntu tray (`puntu-gui`) — индикатор и быстрые действия для IBus-движка.
 //!
-//! A StatusNotifierItem (system-tray) indicator: shows whether the daemon is active or paused,
-//! lets you toggle it, and quits. It is a thin client over the daemon's control socket — the
-//! same `pause`/`resume`/`status` commands the CLI uses — so anything the tray does is also
-//! doable from the terminal (`puntu pause|resume|status`) and vice versa.
+//! * левый клик / «Открыть настройки…» — запускает `puntu-app`;
+//! * «Приостановить» — переключает файл-маркер `paused` в каталоге конфига; watcher движка
+//!   поднимает общий флаг за доли секунды, и каждый keystroke проходит насквозь. Иконка
+//!   показывает состояние (пауза / выключен / работает);
+//! * «Выключить движок» — `puntu-ibus disable` (источник ввода возвращается на обычную
+//!   раскладку); пункт превращается в «Включить движок».
 //!
-//! Built only with `--features gui`. It deliberately avoids the evdev/uinput (`daemon`) deps:
-//! it talks to the already-running daemon, it does not capture input itself.
+//! Собирается только с `--features gui`. Никаких прав и демонов не требует: файл-маркер,
+//! `ibus engine` и запуск соседних бинарников.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
 use ksni::{Status, ToolTip, Tray, TrayMethods};
 
-/// What we last learned about the daemon over the control socket.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DaemonState {
-    Active,
-    Paused,
-    /// Socket missing/unreachable — the daemon isn't running.
-    Down,
+fn paused_path() -> PathBuf {
+    puntu::config::config_dir().join("paused")
 }
 
-/// Query the daemon's status over the control socket. Never panics: a missing socket or any
-/// error maps to `Down` so the tray degrades gracefully.
-fn query(socket: &Path) -> DaemonState {
-    match puntu::ipc::send_command(socket, "status") {
-        Ok(resp) if resp.contains("paused") => DaemonState::Paused,
-        Ok(resp) if resp.contains("active") => DaemonState::Active,
-        _ => DaemonState::Down,
+fn is_paused() -> bool {
+    paused_path().exists()
+}
+
+fn set_paused(p: bool) {
+    if p {
+        let _ = std::fs::write(paused_path(), b"paused by tray\n");
+    } else {
+        let _ = std::fs::remove_file(paused_path());
     }
+}
+
+/// A binary installed next to us, falling back to `$PATH`.
+fn sibling(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+fn open_app() {
+    let _ = std::process::Command::new(sibling("puntu-app")).spawn();
+}
+
+/// Is the Puntu engine the active IBus input source right now?
+fn engine_active() -> bool {
+    std::process::Command::new("ibus")
+        .arg("engine")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "puntu")
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct State {
+    paused: bool,
+    engine_on: bool,
+}
+
+fn read_state() -> State {
+    State { paused: is_paused(), engine_on: engine_active() }
 }
 
 struct PuntuTray {
-    socket: PathBuf,
-    state: DaemonState,
-}
-
-impl PuntuTray {
-    /// Flip pause/resume on the daemon, then optimistically reflect the new state (the poll loop
-    /// will reconcile if the command actually failed).
-    fn toggle(&mut self) {
-        let cmd = match self.state {
-            DaemonState::Active => "pause",
-            DaemonState::Paused => "resume",
-            DaemonState::Down => return,
-        };
-        match puntu::ipc::send_command(&self.socket, cmd) {
-            Ok(_) => {
-                self.state = match self.state {
-                    DaemonState::Active => DaemonState::Paused,
-                    DaemonState::Paused => DaemonState::Active,
-                    DaemonState::Down => DaemonState::Down,
-                }
-            }
-            Err(_) => self.state = DaemonState::Down,
-        }
-    }
+    state: State,
 }
 
 impl Tray for PuntuTray {
@@ -70,25 +78,26 @@ impl Tray for PuntuTray {
     }
 
     fn icon_name(&self) -> String {
-        match self.state {
-            DaemonState::Active => "input-keyboard-symbolic".into(),
-            DaemonState::Paused => "changes-prevent-symbolic".into(),
-            DaemonState::Down => "action-unavailable-symbolic".into(),
+        if !self.state.engine_on {
+            "action-unavailable-symbolic".into()
+        } else if self.state.paused {
+            "media-playback-pause-symbolic".into()
+        } else {
+            "input-keyboard-symbolic".into()
         }
     }
 
     fn status(&self) -> Status {
-        match self.state {
-            DaemonState::Active => Status::Active,
-            DaemonState::Paused | DaemonState::Down => Status::Passive,
-        }
+        Status::Active // always visible — this is the control point
     }
 
     fn tool_tip(&self) -> ToolTip {
-        let description = match self.state {
-            DaemonState::Active => "Автокоррекция раскладки включена",
-            DaemonState::Paused => "Автокоррекция на паузе",
-            DaemonState::Down => "Демон не запущен",
+        let description = if !self.state.engine_on {
+            "Движок выключен"
+        } else if self.state.paused {
+            "Приостановлен"
+        } else {
+            "Работает"
         };
         ToolTip {
             title: "Puntu".into(),
@@ -98,34 +107,52 @@ impl Tray for PuntuTray {
         }
     }
 
+    fn activate(&mut self, _x: i32, _y: i32) {
+        open_app();
+    }
+
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let running = self.state != DaemonState::Down;
-        let header = match self.state {
-            DaemonState::Active => "Статус: активна",
-            DaemonState::Paused => "Статус: пауза",
-            DaemonState::Down => "Статус: демон не запущен",
+        let header = if !self.state.engine_on {
+            "Статус: движок выключен"
+        } else if self.state.paused {
+            "Статус: приостановлен"
+        } else {
+            "Статус: работает"
         };
+        let engine_on = self.state.engine_on;
         vec![
-            StandardItem {
-                label: header.into(),
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
+            StandardItem { label: header.into(), enabled: false, ..Default::default() }.into(),
             MenuItem::Separator,
-            CheckmarkItem {
-                label: "Активна".into(),
-                checked: self.state == DaemonState::Active,
-                enabled: running,
-                activate: Box::new(|this: &mut Self| this.toggle()),
-                ..Default::default()
-            }
-            .into(),
-            // Окно настроек — следующий этап; пункт зарезервирован и пока выключен.
             StandardItem {
                 label: "Открыть настройки…".into(),
                 icon_name: "preferences-system-symbolic".into(),
-                enabled: false,
+                activate: Box::new(|_| open_app()),
+                ..Default::default()
+            }
+            .into(),
+            CheckmarkItem {
+                label: "Приостановить".into(),
+                checked: self.state.paused,
+                enabled: engine_on,
+                activate: Box::new(|t: &mut Self| {
+                    t.state.paused = !t.state.paused;
+                    set_paused(t.state.paused);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: if engine_on {
+                    "Выключить движок".into()
+                } else {
+                    "Включить движок".into()
+                },
+                icon_name: "system-shutdown-symbolic".into(),
+                activate: Box::new(move |t: &mut Self| {
+                    let cmd = if engine_on { "disable" } else { "enable" };
+                    let _ = std::process::Command::new(sibling("puntu-ibus")).arg(cmd).status();
+                    t.state.engine_on = !engine_on;
+                }),
                 ..Default::default()
             }
             .into(),
@@ -143,30 +170,24 @@ impl Tray for PuntuTray {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let socket = puntu::config::socket_path();
-    let tray = PuntuTray {
-        state: query(&socket),
-        socket: socket.clone(),
-    };
+    let tray = PuntuTray { state: read_state() };
+    let handle = tray.spawn().await.map_err(|e| {
+        anyhow::anyhow!(
+            "не удалось зарегистрировать значок в трее (нужно расширение AppIndicator): {e}"
+        )
+    })?;
 
-    let handle = tray
-        .spawn()
-        .await
-        .map_err(|e| anyhow::anyhow!("could not register the tray icon (is a StatusNotifier host running?): {e}"))?;
-
-    // Poll so the icon reflects changes made elsewhere (CLI `puntu pause`, a hotkey, the daemon
-    // stopping). Cheap: one local socket round-trip every couple of seconds.
+    // Отражаем изменения, сделанные не из трея: пауза из приложения/CLI, смена источника
+    // ввода через Super+Space. Дёшево: файл + один subprocess раз в 2 секунды.
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let next = query(&socket);
+        let next = read_state();
         let updated = handle
             .update(move |t: &mut PuntuTray| {
-                if t.state != next {
-                    t.state = next;
-                }
+                t.state = next;
             })
             .await;
-        // `update` returns None once the tray service has shut down — then so should we.
+        // `update` возвращает None, когда сервис трея остановлен — тогда выходим и мы.
         if updated.is_none() {
             break;
         }

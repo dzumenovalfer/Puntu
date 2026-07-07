@@ -274,6 +274,9 @@ pub struct PuntuEngine {
     /// True while an auxiliary-text hint is on screen, so the next letter can hide it.
     /// Shared (`Arc`) because the async selection-conversion task also shows hints.
     hint_shown: Arc<std::sync::atomic::AtomicBool>,
+    /// Tray pause: while set, every keystroke passes through untouched. Flipped by the
+    /// config-dir watcher when the `paused` marker file appears/disappears.
+    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Manual-conversion counter per converted word (shared across engines): after
     /// `suggest_after` manual conversions of the same word, a zenity dialog offers to
     /// remember it. Value = (count, last typed form — for the dialog text).
@@ -298,6 +301,7 @@ impl PuntuEngine {
         dict: Arc<AsyncMutex<UserDict>>,
         hotkeys: HotkeyBindings,
         autocorrect: bool,
+        paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
         convert_counts: ConvertCounts,
         suggest_after: u32,
     ) -> Self {
@@ -314,6 +318,7 @@ impl PuntuEngine {
             autocorrect,
             purpose: 0,
             hint_shown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            paused,
             convert_counts,
             suggest_after,
         }
@@ -803,6 +808,10 @@ impl IBusEngine for PuntuEngine {
         if self.is_passthrough() {
             return Ok(false);
         }
+        // Tray pause («выключить временно»): full transparency until the marker is removed.
+        if self.paused.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(false);
+        }
         // Undo hotkey (default `Ctrl+grave`, configurable via `ibus_hotkeys.undo_key`).
         // Matches on press with exact modifier state.
         if let Some(undo_hk) = self.hotkeys.undo {
@@ -1140,6 +1149,7 @@ pub struct PuntuFactory {
     dict: Arc<AsyncMutex<UserDict>>,
     hotkeys: HotkeyBindings,
     autocorrect: bool,
+    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Manual-conversion counter, shared by every engine this factory creates.
     convert_counts: ConvertCounts,
     suggest_after: u32,
@@ -1154,6 +1164,7 @@ impl PuntuFactory {
         dict: Arc<AsyncMutex<UserDict>>,
         hotkeys: HotkeyBindings,
         autocorrect: bool,
+        paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
         suggest_after: u32,
     ) -> Self {
         Self {
@@ -1161,6 +1172,7 @@ impl PuntuFactory {
             dict,
             hotkeys,
             autocorrect,
+            paused,
             convert_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             suggest_after,
             next_id: 1,
@@ -1185,6 +1197,7 @@ impl IBusFactory<PuntuEngine> for PuntuFactory {
             Arc::clone(&self.dict),
             self.hotkeys,
             self.autocorrect,
+            std::sync::Arc::clone(&self.paused),
             Arc::clone(&self.convert_counts),
             self.suggest_after,
         ))
@@ -1924,6 +1937,7 @@ mod tests {
             Arc::new(AsyncMutex::new(dict)),
             hk,
             true,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(Default::default())),
             3,
         );

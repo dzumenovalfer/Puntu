@@ -186,6 +186,9 @@ struct App {
     /// Peak modifiers seen during an active capture — releasing them all without a plain
     /// key assigns a modifier TAP (`Ctrl`, `Alt+Shift`, …) instead of a hotkey.
     capture_peak: egui::Modifiers,
+    /// Last dictionary re-read — the window refreshes every couple of seconds, so words
+    /// added from gestures (Ctrl+Alt+D) or the CLI show up while it is open.
+    dict_refreshed: std::time::Instant,
     /// Live system-theme updates (accent colour, dark?) from the gsettings poller thread.
     theme_rx: mpsc::Receiver<(egui::Color32, bool)>,
     /// Previous bindings, so a switch turned back on restores what the user had.
@@ -244,6 +247,7 @@ impl App {
             remember_prev,
             restart_rx: None,
             capture_peak: egui::Modifiers::NONE,
+            dict_refreshed: std::time::Instant::now(),
             theme_rx,
             mode_prev,
             convert_prev,
@@ -991,7 +995,14 @@ impl eframe::App for App {
         if let Ok((accent, dark)) = self.theme_rx.try_recv() {
             apply_adwaita_theme(ui.ctx(), accent, dark);
         }
-        ui.ctx().request_repaint_after(std::time::Duration::from_secs(3));
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(2));
+
+        // Live dictionary: pick up words added outside this window (Ctrl+Alt+D, the offer
+        // dialog, the CLI) within a couple of seconds.
+        if self.dict_refreshed.elapsed() >= std::time::Duration::from_secs(2) {
+            let _ = self.dict.reload();
+            self.dict_refreshed = std::time::Instant::now();
+        }
 
         // Engine-restart progress: poll the background thread's answer.
         if let Some(rx) = &self.restart_rx {
@@ -1113,10 +1124,5 @@ impl eframe::App for App {
                 ));
             }
         }
-
-        // Never enable the system IME for this window: the engine would otherwise
-        // auto-correct the very words being typed into the dictionary fields (the reported
-        // «дописывает часть» corruption). Plain winit key events bypass IBus entirely.
-        ui.ctx().output_mut(|o| o.ime = None);
     }
 }
