@@ -211,18 +211,10 @@ async fn sigterm() {
 /// `~/.local/share/ibus/component/puntu.xml` (or system-wide) at startup. This is what makes
 /// our engine discoverable in GNOME's input switcher.
 ///
-/// The `<setup>` element hooks our settings app into **GNOME Settings itself**: the
-/// Клавиатура → Источники ввода row for Puntu gets the standard preferences button, which
-/// launches `puntu-app` (the same mechanism ibus-pinyin & co. use). Included only when the
-/// app binary is actually installed next to the engine.
+/// (A `<setup>` element briefly hooked `puntu-app` into GNOME Settings → Клавиатура in
+/// v0.6.2; removed at the user's request — the tray and the app-menu entry cover it.)
 pub fn component_xml(exec_path: &str) -> String {
     let version = env!("CARGO_PKG_VERSION");
-    let setup_line = std::path::Path::new(exec_path)
-        .parent()
-        .map(|dir| dir.join("puntu-app"))
-        .filter(|p| p.exists())
-        .map(|p| format!("            <setup>{}</setup>\n", p.display()))
-        .unwrap_or_default();
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <!-- Puntu IBus engine. Reinstall by re-running `install.sh`. -->
@@ -246,7 +238,7 @@ pub fn component_xml(exec_path: &str) -> String {
             <icon>input-keyboard-symbolic</icon>
             <rank>99</rank>
             <symbol>P</symbol>
-{setup_line}        </engine>
+        </engine>
     </engines>
 </component>
 "#
