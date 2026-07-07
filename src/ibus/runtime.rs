@@ -66,6 +66,7 @@ pub async fn run() -> Result<()> {
         dict,
         hotkeys,
         autocorrect,
+        cfg.fix_case,
         Arc::clone(&paused),
         cfg.learning.suggest_after,
     );

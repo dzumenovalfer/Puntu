@@ -47,6 +47,10 @@ pub struct Config {
     /// bare Ctrl gesture) to your system layout switcher: in that setup every manual switch
     /// would be instantly undone by our injected Super+Space.
     pub enable_modifier_taps: bool,
+    /// Fix accidental-caps signatures: `пРИВЕТ` → `Привет` (CapsLock + Shift on the first
+    /// letter) and `ПРивет` → `Привет` (Shift released late; dictionary-checked). ALL-CAPS
+    /// words and mixed-case names (iPhone, КамАЗ) are never touched.
+    pub fix_case: bool,
     /// Max duration (ms) between the first modifier press and the last release for a
     /// modifier tap to fire. Longer chains are held shortcuts (Ctrl+click, an app-consumed
     /// chord like Ctrl+Shift+V in a terminal) and are ignored. Default 500.
@@ -92,6 +96,10 @@ pub struct IBusHotkeys {
     /// Remember a word in the dictionary: the mouse selection if there is one, else the
     /// last (held) word. Default `"Ctrl+Alt+d"` (d = dictionary); `"none"` disables.
     pub remember_key: String,
+    /// Cycle the case of the last (held) word: `слово` → `Слово` → `СЛОВО` → `слово` —
+    /// the case counterpart of the layout flip. Default `"Ctrl+Alt+u"` (u = uppercase);
+    /// `"none"` disables.
+    pub case_key: String,
 }
 
 impl Default for IBusHotkeys {
@@ -108,6 +116,7 @@ impl Default for IBusHotkeys {
             // freely via `puntu config set convert_selection_key '...'`.
             convert_selection_key: "Ctrl+Alt+s".to_string(),
             remember_key: "Ctrl+Alt+d".to_string(),
+            case_key: "Ctrl+Alt+u".to_string(),
         }
     }
 }
@@ -198,6 +207,7 @@ impl Default for Config {
             dry_run: false,
             paste_convert: false,
             enable_modifier_taps: true,
+            fix_case: true,
             tap_max_hold_ms: DEFAULT_TAP_MAX_HOLD_MS,
             detect: DetectConfig::default(),
             learning: LearningConfig::default(),

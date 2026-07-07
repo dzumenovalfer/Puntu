@@ -134,6 +134,7 @@ enum Capture {
     ConvertSelection,
     Remember,
     ModeToggleKey,
+    CaseKey,
 }
 
 /// One dictionary row, with everything needed to move the word between lists.
@@ -195,6 +196,7 @@ struct App {
     mode_prev: (String, String),    // (tap combo, key)
     convert_prev: (String, String), // (tap combo, key)
     undo_prev: String,
+    case_prev: String,
 }
 
 impl App {
@@ -220,6 +222,7 @@ impl App {
             or_default(&cfg.ibus_hotkeys.convert_selection_key, "Ctrl+Alt+s"),
         );
         let undo_prev = or_default(&cfg.ibus_hotkeys.undo_key, "Ctrl+grave");
+        let case_prev = or_default(&cfg.ibus_hotkeys.case_key, "Ctrl+Alt+u");
         // Follow the system theme live: poll gsettings in the background, apply on change.
         let (theme_tx, theme_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -252,6 +255,7 @@ impl App {
             mode_prev,
             convert_prev,
             undo_prev,
+            case_prev,
         }
     }
 
@@ -650,6 +654,10 @@ impl App {
                             self.cfg.ibus_hotkeys.mode_toggle = "none".to_string();
                             self.mode_prev = ("none".to_string(), binding);
                         }
+                        Capture::CaseKey => {
+                            self.cfg.ibus_hotkeys.case_key = binding.clone();
+                            self.case_prev = binding;
+                        }
                     }
                     save = true;
                 }
@@ -667,7 +675,8 @@ impl App {
                         self.cfg.enable_modifier_taps = true;
                         self.convert_prev.0 = combo;
                     }
-                    Capture::Undo | Capture::Remember => {}
+                    // Hotkey-only fields can't be a bare modifier — ignore.
+                    Capture::Undo | Capture::Remember | Capture::CaseKey => {}
                 }
                 save = true;
                 done = true;
@@ -731,6 +740,30 @@ impl App {
                                 .clicked()
                         {
                             capture_request = Some(Capture::Remember);
+                        }
+                    });
+
+                    row(ui, "Исправление регистра", "пРИВЕТ → Привет; ПРивет → Привет (по словарю)", |ui| {
+                        if toggle(ui, &mut cfg.fix_case).changed() {
+                            save = true;
+                        }
+                    });
+
+                    let case_prev = &self.case_prev;
+                    let mut case_on = !parse_off(&cfg.ibus_hotkeys.case_key);
+                    row(ui, "Регистр слова", "слово → Слово → СЛОВО, как флип перевода", |ui| {
+                        if toggle(ui, &mut case_on).changed() {
+                            cfg.ibus_hotkeys.case_key = if case_on {
+                                case_prev.clone()
+                            } else {
+                                "none".to_string()
+                            };
+                            save = true;
+                        }
+                        if case_on
+                            && ui.button(binding_label(&cfg.ibus_hotkeys.case_key)).clicked()
+                        {
+                            capture_request = Some(Capture::CaseKey);
                         }
                     });
 

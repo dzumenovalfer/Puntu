@@ -10,6 +10,10 @@ dry_run = false
 # Toggle from the CLI with: `puntu config set paste_convert on`  (a future GUI uses the same file).
 paste_convert = false
 
+# Исправление регистра: пРИВЕТ → Привет (CapsLock+Shift), ПРивет → Привет (поздний Shift,
+# по словарю). ВЕСЬ КАПС и iPhone/КамАЗ не трогаются. Откат — Ctrl+` как обычно.
+fix_case = true
+
 [detect]
 # Minimum word length considered for autocorrection.
 min_word_len = 2
@@ -37,6 +41,8 @@ convert_last = "Ctrl+Shift"
 convert_selection_key = "Ctrl+Alt+s"
 # Remember a word in the dictionary: the mouse selection if any, else the last (held) word.
 remember_key = "Ctrl+Alt+d"
+# Цикл регистра последнего слова: слово → Слово → СЛОВО. none = выключить.
+case_key = "Ctrl+Alt+u"
 
 # ---- Legacy uinput daemon only (ignored by the IBus engine) ----
 # Hotkeys. code = Linux key code (119 = Pause/Break). Modifiers default to false.

@@ -221,6 +221,8 @@ pub struct HotkeyBindings {
     pub convert_selection: Option<Hotkey>,
     /// Remember a word in the dictionary (mouse selection, else the held word).
     pub remember: Option<Hotkey>,
+    /// Cycle the case of the held word (`слово` → `Слово` → `СЛОВО`).
+    pub case: Option<Hotkey>,
     /// Max press→release duration for a modifier tap to fire (see [`TapDetector::max_hold`]).
     pub tap_max_hold_ms: u64,
 }
@@ -239,6 +241,7 @@ impl HotkeyBindings {
             mode_toggle_key: parse_hotkey(&hk.mode_toggle_key),
             convert_selection: parse_hotkey(&hk.convert_selection_key),
             remember: parse_hotkey(&hk.remember_key),
+            case: parse_hotkey(&hk.case_key),
             tap_max_hold_ms: cfg.tap_max_hold_ms,
         }
     }
@@ -274,6 +277,8 @@ pub struct PuntuEngine {
     /// True while an auxiliary-text hint is on screen, so the next letter can hide it.
     /// Shared (`Arc`) because the async selection-conversion task also shows hints.
     hint_shown: Arc<std::sync::atomic::AtomicBool>,
+    /// Fix accidental-caps signatures (`пРИВЕТ`, `ПРивет`) on finished words.
+    fix_case: bool,
     /// Tray pause: while set, every keystroke passes through untouched. Flipped by the
     /// config-dir watcher when the `paused` marker file appears/disappears.
     paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -301,6 +306,7 @@ impl PuntuEngine {
         dict: Arc<AsyncMutex<UserDict>>,
         hotkeys: HotkeyBindings,
         autocorrect: bool,
+        fix_case: bool,
         paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
         convert_counts: ConvertCounts,
         suggest_after: u32,
@@ -316,6 +322,7 @@ impl PuntuEngine {
             held: None,
             hotkeys,
             autocorrect,
+            fix_case,
             purpose: 0,
             hint_shown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             paused,
@@ -604,6 +611,20 @@ impl PuntuEngine {
         });
     }
 
+    /// `Ctrl+Alt+U` — cycle the case of the **held** word (`слово` → `Слово` → `СЛОВО`).
+    /// A pure preedit re-render, exactly like the layout flip: instant, no deletions of
+    /// committed text. No-op when nothing is held.
+    async fn handle_case_cycle(&mut self, se: &SignalEmitter<'_>) {
+        let Some(h) = self.held.as_mut() else {
+            debug!("[puntu-engine {}] case cycle: nothing held", self.id);
+            return;
+        };
+        h.shown = cycle_case(&h.shown);
+        let shown = h.shown.clone();
+        debug!("[puntu-engine {}] case cycle -> {:?}", self.id, shown);
+        self.update_preedit(se, &shown).await;
+    }
+
     /// `Ctrl+Alt+D` — remember a word in the dictionary: the mouse selection when there is
     /// one, else the held (last) word in its currently shown form. Detached task — reading
     /// PRIMARY inline would deadlock the key event (same as convert-selection).
@@ -737,7 +758,7 @@ impl PuntuEngine {
     /// the Russian rendering unless the Latin reading is a real word/abbreviation and the
     /// Russian one isn't.
     async fn decide_renderings(&self, word: &CompletedWord) -> (String, String, bool) {
-        match self.mode {
+        let (mut shown, other, auto_converted) = match self.mode {
             EngineMode::Correcting => {
                 if !self.autocorrect || self.in_terminal() {
                     // dry_run or a terminal: hold the word exactly as typed; conversion only
@@ -773,7 +794,26 @@ impl PuntuEngine {
                     (word.alt.clone(), word.cur.clone(), false)
                 }
             }
+        };
+        // Accidental-caps signatures — on the FINAL rendering, after the layout decision
+        // (gHBDTN with CapsLock becomes пРИВЕТ first, Привет second). `other` (the flip
+        // target) stays untouched, so the flip still restores exactly what was typed.
+        if self.fix_case {
+            let dict = self.dict.lock().await;
+            let known = |w: &str| {
+                let lang = if w.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c)) {
+                    Lang::Ru
+                } else {
+                    Lang::En
+                };
+                self.detector.is_known_word(w, lang) || dict.is_recognized(w, lang)
+            };
+            if let Some(fixed) = fix_case_word(&shown, known) {
+                debug!("[puntu-engine {}] case fix {:?} -> {:?}", self.id, shown, fixed);
+                shown = fixed;
+            }
         }
+        (shown, other, auto_converted)
     }
 }
 
@@ -844,6 +884,16 @@ impl IBusEngine for PuntuEngine {
                 debug!("[puntu-engine {}] convert-selection hotkey matched", self.id);
                 self.tap.cancel(); // same reason as the undo hotkey above
                 self.handle_convert_last(&se);
+                return Ok(true);
+            }
+        }
+        // Case-cycle hotkey (default `Ctrl+Alt+u`): слово → Слово → СЛОВО on the held word —
+        // the case counterpart of the layout flip.
+        if let Some(case_hk) = self.hotkeys.case {
+            if case_hk.matches(keyval, &state) && !released {
+                debug!("[puntu-engine {}] case-cycle hotkey matched", self.id);
+                self.tap.cancel(); // same reason as the undo hotkey above
+                self.handle_case_cycle(&se).await;
                 return Ok(true);
             }
         }
@@ -1149,6 +1199,7 @@ pub struct PuntuFactory {
     dict: Arc<AsyncMutex<UserDict>>,
     hotkeys: HotkeyBindings,
     autocorrect: bool,
+    fix_case: bool,
     paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Manual-conversion counter, shared by every engine this factory creates.
     convert_counts: ConvertCounts,
@@ -1164,6 +1215,7 @@ impl PuntuFactory {
         dict: Arc<AsyncMutex<UserDict>>,
         hotkeys: HotkeyBindings,
         autocorrect: bool,
+        fix_case: bool,
         paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
         suggest_after: u32,
     ) -> Self {
@@ -1172,6 +1224,7 @@ impl PuntuFactory {
             dict,
             hotkeys,
             autocorrect,
+            fix_case,
             paused,
             convert_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             suggest_after,
@@ -1197,6 +1250,7 @@ impl IBusFactory<PuntuEngine> for PuntuFactory {
             Arc::clone(&self.dict),
             self.hotkeys,
             self.autocorrect,
+            self.fix_case,
             std::sync::Arc::clone(&self.paused),
             Arc::clone(&self.convert_counts),
             self.suggest_after,
@@ -1446,6 +1500,68 @@ fn note_manual_conversion(
                 .await;
         }
     });
+}
+
+
+/// Capitalize: the first alphabetic char uppercase, everything after it lowercase.
+/// Non-alphabetic chars (a trailing separator in a held preedit) pass through.
+fn capitalize(w: &str) -> String {
+    let mut out = String::with_capacity(w.len());
+    let mut first = true;
+    for c in w.chars() {
+        if c.is_alphabetic() && first {
+            first = false;
+            out.extend(c.to_uppercase());
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
+/// The two accidental-caps signatures. Returns the corrected word, or `None` when the case
+/// looks intentional:
+///   * `пРИВЕТ` (first lower, ALL the rest upper) — CapsLock + Shift on the first letter;
+///     impossible in real orthography, fixed without a dictionary;
+///   * `ПРивет` (exactly two leading capitals, rest lower, ≥4 letters) — a late Shift
+///     release; fixed only when the lowercase form is a dictionary word.
+/// ALL-CAPS words (НАТО), mixed-case names (iPhone, КамАЗ) and anything with digits or
+/// punctuation never match.
+fn fix_case_word(word: &str, known: impl Fn(&str) -> bool) -> Option<String> {
+    if word.is_empty() || word.chars().any(|c| !c.is_alphabetic()) {
+        return None;
+    }
+    let chars: Vec<char> = word.chars().collect();
+    if chars.len() >= 3
+        && chars[0].is_lowercase()
+        && chars[1..].iter().all(|c| c.is_uppercase())
+    {
+        return Some(capitalize(word));
+    }
+    if chars.len() >= 4
+        && chars[0].is_uppercase()
+        && chars[1].is_uppercase()
+        && chars[2..].iter().all(|c| c.is_lowercase())
+        && known(&word.to_lowercase())
+    {
+        return Some(capitalize(word));
+    }
+    None
+}
+
+/// Cycle the case: `слово` → `Слово` → `СЛОВО` → `слово`. State is detected on the string
+/// as-is, so it works on a held preedit (word + trailing separator) too.
+fn cycle_case(w: &str) -> String {
+    let lower: String = w.chars().flat_map(|c| c.to_lowercase()).collect();
+    let upper: String = w.chars().flat_map(|c| c.to_uppercase()).collect();
+    let cap = capitalize(w);
+    if w == lower && cap != lower {
+        cap
+    } else if w == cap && upper != cap {
+        upper
+    } else {
+        lower
+    }
 }
 
 /// The force-flip fallback: the deliberate "я выделил, переведи" case when the detector saw
@@ -1895,6 +2011,40 @@ mod tests {
     }
 
     #[test]
+    fn case_signatures_fix_and_intentional_case_survives() {
+        let known = |w: &str| ["привет", "работа"].contains(&w);
+        // Паттерн 1: CapsLock-инверсия — чинится без словаря.
+        assert_eq!(fix_case_word("пРИВЕТ", known).as_deref(), Some("Привет"));
+        assert_eq!(fix_case_word("hELLO", known).as_deref(), Some("Hello"));
+        // Паттерн 2: поздний Shift — только словарные слова.
+        assert_eq!(fix_case_word("ПРивет", known).as_deref(), Some("Привет"));
+        assert_eq!(fix_case_word("РАбота", known).as_deref(), Some("Работа"));
+        assert_eq!(fix_case_word("КАмаз", known), None); // не в словаре
+        // Намеренный регистр не трогается.
+        assert_eq!(fix_case_word("ПРИВЕТ", known), None); // весь капс
+        assert_eq!(fix_case_word("Привет", known), None); // уже правильно
+        assert_eq!(fix_case_word("привет", known), None);
+        assert_eq!(fix_case_word("iPhone", known), None); // смешанный регистр
+        assert_eq!(fix_case_word("КамАЗ", known), None);
+        assert_eq!(fix_case_word("яК", known), None); // короткое для паттерна 1
+        assert_eq!(fix_case_word("v0.1", known), None); // не только буквы
+        assert_eq!(fix_case_word("", known), None);
+    }
+
+    #[test]
+    fn case_cycle_rotates_and_survives_separators() {
+        assert_eq!(cycle_case("слово"), "Слово");
+        assert_eq!(cycle_case("Слово"), "СЛОВО");
+        assert_eq!(cycle_case("СЛОВО"), "слово");
+        // Held-preedit со шлейфом-сепаратором.
+        assert_eq!(cycle_case("слово "), "Слово ");
+        assert_eq!(cycle_case("Слово "), "СЛОВО ");
+        assert_eq!(cycle_case("СЛОВО "), "слово ");
+        // Произвольный регистр нормализуется в нижний.
+        assert_eq!(cycle_case("сЛоВо"), "слово");
+    }
+
+    #[test]
     fn learnable_accepts_words_and_filters_junk() {
         assert_eq!(learnable("привет"), Some(("привет".into(), Lang::Ru)));
         assert_eq!(learnable(" Увы "), Some(("увы".into(), Lang::Ru)));
@@ -1936,6 +2086,7 @@ mod tests {
             Arc::new(det),
             Arc::new(AsyncMutex::new(dict)),
             hk,
+            true,
             true,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(Default::default())),

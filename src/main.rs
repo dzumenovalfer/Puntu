@@ -665,7 +665,7 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
         ConfigOp::Set { key, value } => {
             let mut cfg = load_config(path)?;
             // Boolean flags — value parsed as on/off/true/false/1/0.
-            let bool_keys = ["dry_run", "paste_convert", "enable_modifier_taps"];
+            let bool_keys = ["dry_run", "paste_convert", "enable_modifier_taps", "fix_case"];
             // String flags — IBus hotkey names. `undo_key`: keysym name (Pause, F12, Insert,
             // Menu, ScrollLock, F1..F12). `mode_toggle` / `convert_last`: modifier tap combo
             // (Ctrl, Shift, Ctrl+Shift, or "none" to disable).
@@ -674,6 +674,7 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
                 "dry_run" => { cfg.dry_run = parse_bool(&value)?; format!("{}", cfg.dry_run) }
                 "paste_convert" => { cfg.paste_convert = parse_bool(&value)?; format!("{}", cfg.paste_convert) }
                 "enable_modifier_taps" => { cfg.enable_modifier_taps = parse_bool(&value)?; format!("{}", cfg.enable_modifier_taps) }
+                "fix_case" => { cfg.fix_case = parse_bool(&value)?; format!("{}", cfg.fix_case) }
                 "tap_max_hold_ms" => {
                     cfg.tap_max_hold_ms = value.trim().parse().context("expected milliseconds (e.g. 500)")?;
                     format!("{}", cfg.tap_max_hold_ms)
@@ -685,6 +686,7 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
                 }
                 "remember_key" => { cfg.ibus_hotkeys.remember_key = value.clone(); value.clone() }
                 "mode_toggle_key" => { cfg.ibus_hotkeys.mode_toggle_key = value.clone(); value.clone() }
+                "case_key" => { cfg.ibus_hotkeys.case_key = value.clone(); value.clone() }
                 "undo_key" => { cfg.ibus_hotkeys.undo_key = value.clone(); value.clone() }
                 "mode_toggle" => { cfg.ibus_hotkeys.mode_toggle = value.clone(); value.clone() }
                 "convert_last" => { cfg.ibus_hotkeys.convert_last = value.clone(); value.clone() }
