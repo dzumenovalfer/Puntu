@@ -170,6 +170,81 @@ if command -v gsettings >/dev/null 2>&1 \
 fi
 ibus engine puntu >/dev/null 2>&1 || true
 
+# 6c. Icons: the app icon + the three tray-status icons ----------------------
+# Installed into the user's hicolor theme so `Icon=puntu` (desktop files) and the tray's
+# `puntu*-symbolic` names resolve. The status icons are symbolic (single-colour), so the
+# shell recolours them to the panel foreground on both light and dark top bars.
+say "Installing icons…"
+ICONS="$HOME/.local/share/icons/hicolor"
+mkdir -p "$ICONS/scalable/apps" "$ICONS/scalable/status"
+
+# In a source checkout the SVGs live in ./icons; remote installs use the copies embedded
+# below. `put_icon` prefers the checkout, so local edits to ./icons take effect at once.
+put_icon() {  # put_icon <repo-relative-src> <dest> ; returns non-zero if not in the checkout
+  [[ -f "$REPO_DIR/$1" ]] && install -m 0644 "$REPO_DIR/$1" "$2"
+}
+
+put_icon icons/puntu.svg "$ICONS/scalable/apps/puntu.svg" || cat > "$ICONS/scalable/apps/puntu.svg" <<'SVG'
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#62a0ea"/>
+      <stop offset="1" stop-color="#1a63c4"/>
+    </linearGradient>
+    <linearGradient id="key" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e9f0f9"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="27" fill="url(#tile)"/>
+  <path d="M35 8h58a27 27 0 0 1 27 27v9c0 8-64 14-112 0v-9A27 27 0 0 1 35 8Z" fill="#ffffff" opacity="0.10"/>
+  <rect x="28" y="32" width="72" height="68" rx="16" fill="#123a72" opacity="0.30"/>
+  <rect x="28" y="28" width="72" height="68" rx="16" fill="url(#key)" stroke="#d3deee" stroke-width="1"/>
+  <path transform="translate(38.8,36.8) scale(2.1)" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" fill="#1a63c4"/>
+</svg>
+SVG
+
+put_icon icons/puntu-symbolic.svg "$ICONS/scalable/status/puntu-symbolic.svg" || cat > "$ICONS/scalable/status/puntu-symbolic.svg" <<'SVG'
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <mask id="on">
+    <rect width="16" height="16" fill="#000"/>
+    <rect x="2" y="2.5" width="12" height="11" rx="2.6" fill="#fff"/>
+    <rect x="4.7" y="5.5" width="4.1" height="1.3" rx="0.55" fill="#000"/>
+    <path d="M8.4 4.7 L10.6 6.15 L8.4 7.6 Z" fill="#000"/>
+    <rect x="7.2" y="9.2" width="4.1" height="1.3" rx="0.55" fill="#000"/>
+    <path d="M7.6 8.4 L5.4 9.85 L7.6 11.3 Z" fill="#000"/>
+  </mask>
+  <rect width="16" height="16" fill="#2e3436" mask="url(#on)"/>
+</svg>
+SVG
+
+put_icon icons/puntu-paused-symbolic.svg "$ICONS/scalable/status/puntu-paused-symbolic.svg" || cat > "$ICONS/scalable/status/puntu-paused-symbolic.svg" <<'SVG'
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <mask id="pause">
+    <rect width="16" height="16" fill="#000"/>
+    <rect x="2" y="2.5" width="12" height="11" rx="2.6" fill="#fff"/>
+    <rect x="5.5" y="5.1" width="1.6" height="5.8" rx="0.6" fill="#000"/>
+    <rect x="8.9" y="5.1" width="1.6" height="5.8" rx="0.6" fill="#000"/>
+  </mask>
+  <rect width="16" height="16" fill="#2e3436" mask="url(#pause)"/>
+</svg>
+SVG
+
+put_icon icons/puntu-disabled-symbolic.svg "$ICONS/scalable/status/puntu-disabled-symbolic.svg" || cat > "$ICONS/scalable/status/puntu-disabled-symbolic.svg" <<'SVG'
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <mask id="off">
+    <rect width="16" height="16" fill="#000"/>
+    <rect x="2" y="2.5" width="12" height="11" rx="2.6" fill="#fff"/>
+    <rect x="3.6" y="4.1" width="8.8" height="7.8" rx="1.5" fill="#000"/>
+    <rect x="6.9" y="1.4" width="2.2" height="13.2" rx="1.1" transform="rotate(45 8 8)" fill="#000"/>
+  </mask>
+  <rect width="16" height="16" fill="#2e3436" mask="url(#off)"/>
+  <rect x="7.2" y="2.2" width="1.6" height="11.6" rx="0.8" transform="rotate(45 8 8)" fill="#2e3436"/>
+</svg>
+SVG
+
+gtk-update-icon-cache -f -t "$ICONS" >/dev/null 2>&1 || true
+
 # 7. App-menu entry: the Puntu application (settings + dictionary in one window) ----------
 say "Installing the application menu entry…"
 APPS_DIR="$HOME/.local/share/applications"
@@ -182,7 +257,7 @@ Name=Puntu
 Comment=Настройки и словарь автопереключения раскладки
 Comment[en]=Keyboard layout auto-corrector: settings and dictionary
 Exec=$BIN_DIR/puntu-app
-Icon=input-keyboard
+Icon=puntu
 Type=Application
 Terminal=false
 Categories=Utility;Settings;
@@ -201,7 +276,7 @@ if [[ -x "$BIN_DIR/puntu-gui" ]]; then
 Name=Puntu Tray
 Comment=Индикатор и быстрые действия Puntu
 Exec=$BIN_DIR/puntu-gui
-Icon=input-keyboard
+Icon=puntu
 Type=Application
 Terminal=false
 X-GNOME-Autostart-enabled=true

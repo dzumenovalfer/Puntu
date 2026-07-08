@@ -78,12 +78,15 @@ impl Tray for PuntuTray {
     }
 
     fn icon_name(&self) -> String {
+        // Puntu's own symbolic icons, installed into the hicolor theme by install.sh
+        // (~/.local/share/icons/hicolor/scalable/status/). The shell recolours them to the
+        // panel foreground, so they read on both light and dark top bars.
         if !self.state.engine_on {
-            "action-unavailable-symbolic".into()
+            "puntu-disabled-symbolic".into()
         } else if self.state.paused {
-            "media-playback-pause-symbolic".into()
+            "puntu-paused-symbolic".into()
         } else {
-            "input-keyboard-symbolic".into()
+            "puntu-symbolic".into()
         }
     }
 

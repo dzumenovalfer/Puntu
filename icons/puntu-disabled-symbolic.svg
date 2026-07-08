@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Puntu status: engine off (not the active input source).
+       Hollow keycap outline + diagonal slash = disabled. -->
+  <mask id="off">
+    <rect width="16" height="16" fill="#000"/>
+    <!-- frame: outer keycap minus inner hole -->
+    <rect x="2" y="2.5" width="12" height="11" rx="2.6" fill="#fff"/>
+    <rect x="3.6" y="4.1" width="8.8" height="7.8" rx="1.5" fill="#000"/>
+    <!-- reopen a channel so the slash reads as one clean stroke over the frame -->
+    <rect x="6.9" y="1.4" width="2.2" height="13.2" rx="1.1"
+          transform="rotate(45 8 8)" fill="#000"/>
+  </mask>
+  <rect width="16" height="16" fill="#2e3436" mask="url(#off)"/>
+  <!-- diagonal slash -->
+  <rect x="7.2" y="2.2" width="1.6" height="11.6" rx="0.8"
+        transform="rotate(45 8 8)" fill="#2e3436"/>
+</svg>
