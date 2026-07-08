@@ -206,40 +206,28 @@ SVG
 
 put_icon icons/puntu-symbolic.svg "$ICONS/scalable/status/puntu-symbolic.svg" || cat > "$ICONS/scalable/status/puntu-symbolic.svg" <<'SVG'
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <mask id="on">
-    <rect width="16" height="16" fill="#000"/>
-    <rect x="2" y="2.5" width="12" height="11" rx="2.6" fill="#fff"/>
-    <rect x="4.7" y="5.5" width="4.1" height="1.3" rx="0.55" fill="#000"/>
-    <path d="M8.4 4.7 L10.6 6.15 L8.4 7.6 Z" fill="#000"/>
-    <rect x="7.2" y="9.2" width="4.1" height="1.3" rx="0.55" fill="#000"/>
-    <path d="M7.6 8.4 L5.4 9.85 L7.6 11.3 Z" fill="#000"/>
-  </mask>
-  <rect width="16" height="16" fill="#2e3436" mask="url(#on)"/>
+  <path fill="#2e3436" fill-rule="evenodd"
+        d="M4.6 2.5h6.8A2.6 2.6 0 0 1 14 5.1v5.8a2.6 2.6 0 0 1-2.6 2.6H4.6A2.6 2.6 0 0 1 2 10.9V5.1a2.6 2.6 0 0 1 2.6-2.6Z
+           M4.7 5.5h3.7v-0.8l2.2 1.45-2.2 1.45v-0.8h-3.7Z
+           M11.3 9.2h-3.7v-0.8l-2.2 1.45 2.2 1.45v-0.8h3.7Z"/>
 </svg>
 SVG
 
 put_icon icons/puntu-paused-symbolic.svg "$ICONS/scalable/status/puntu-paused-symbolic.svg" || cat > "$ICONS/scalable/status/puntu-paused-symbolic.svg" <<'SVG'
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <mask id="pause">
-    <rect width="16" height="16" fill="#000"/>
-    <rect x="2" y="2.5" width="12" height="11" rx="2.6" fill="#fff"/>
-    <rect x="5.5" y="5.1" width="1.6" height="5.8" rx="0.6" fill="#000"/>
-    <rect x="8.9" y="5.1" width="1.6" height="5.8" rx="0.6" fill="#000"/>
-  </mask>
-  <rect width="16" height="16" fill="#2e3436" mask="url(#pause)"/>
+  <path fill="#2e3436" fill-rule="evenodd"
+        d="M4.6 2.5h6.8A2.6 2.6 0 0 1 14 5.1v5.8a2.6 2.6 0 0 1-2.6 2.6H4.6A2.6 2.6 0 0 1 2 10.9V5.1a2.6 2.6 0 0 1 2.6-2.6Z
+           M5.5 5.7a0.6 0.6 0 0 1 0.6-0.6h0.4a0.6 0.6 0 0 1 0.6 0.6v4.6a0.6 0.6 0 0 1-0.6 0.6h-0.4a0.6 0.6 0 0 1-0.6-0.6Z
+           M8.9 5.7a0.6 0.6 0 0 1 0.6-0.6h0.4a0.6 0.6 0 0 1 0.6 0.6v4.6a0.6 0.6 0 0 1-0.6 0.6h-0.4a0.6 0.6 0 0 1-0.6-0.6Z"/>
 </svg>
 SVG
 
 put_icon icons/puntu-disabled-symbolic.svg "$ICONS/scalable/status/puntu-disabled-symbolic.svg" || cat > "$ICONS/scalable/status/puntu-disabled-symbolic.svg" <<'SVG'
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <mask id="off">
-    <rect width="16" height="16" fill="#000"/>
-    <rect x="2" y="2.5" width="12" height="11" rx="2.6" fill="#fff"/>
-    <rect x="3.6" y="4.1" width="8.8" height="7.8" rx="1.5" fill="#000"/>
-    <rect x="6.9" y="1.4" width="2.2" height="13.2" rx="1.1" transform="rotate(45 8 8)" fill="#000"/>
-  </mask>
-  <rect width="16" height="16" fill="#2e3436" mask="url(#off)"/>
-  <rect x="7.2" y="2.2" width="1.6" height="11.6" rx="0.8" transform="rotate(45 8 8)" fill="#2e3436"/>
+  <path fill="#2e3436" fill-rule="evenodd"
+        d="M4.6 2.5h6.8A2.6 2.6 0 0 1 14 5.1v5.8a2.6 2.6 0 0 1-2.6 2.6H4.6A2.6 2.6 0 0 1 2 10.9V5.1a2.6 2.6 0 0 1 2.6-2.6Z
+           M5.1 4.1h5.8a1.5 1.5 0 0 1 1.5 1.5v4.8a1.5 1.5 0 0 1-1.5 1.5H5.1a1.5 1.5 0 0 1-1.5-1.5V5.6a1.5 1.5 0 0 1 1.5-1.5Z
+           M9.98 4.3l1.24 1-5.2 6.4-1.24-1Z"/>
 </svg>
 SVG
 

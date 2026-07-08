@@ -1,11 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <!-- Puntu status: paused.
-       Solid keycap (engine still the active source) with two pause bars knocked out. -->
-  <mask id="pause">
-    <rect width="16" height="16" fill="#000"/>
-    <rect x="2" y="2.5" width="12" height="11" rx="2.6" fill="#fff"/>
-    <rect x="5.5" y="5.1" width="1.6" height="5.8" rx="0.6" fill="#000"/>
-    <rect x="8.9" y="5.1" width="1.6" height="5.8" rx="0.6" fill="#000"/>
-  </mask>
-  <rect width="16" height="16" fill="#2e3436" mask="url(#pause)"/>
+  <!-- Puntu status: paused. Solid keycap with two pause bars knocked out.
+       Single even-odd path — see puntu-symbolic.svg for why masks are off-limits. -->
+  <path fill="#2e3436" fill-rule="evenodd"
+        d="M4.6 2.5h6.8A2.6 2.6 0 0 1 14 5.1v5.8a2.6 2.6 0 0 1-2.6 2.6H4.6A2.6 2.6 0 0 1 2 10.9V5.1a2.6 2.6 0 0 1 2.6-2.6Z
+           M5.5 5.7a0.6 0.6 0 0 1 0.6-0.6h0.4a0.6 0.6 0 0 1 0.6 0.6v4.6a0.6 0.6 0 0 1-0.6 0.6h-0.4a0.6 0.6 0 0 1-0.6-0.6Z
+           M8.9 5.7a0.6 0.6 0 0 1 0.6-0.6h0.4a0.6 0.6 0 0 1 0.6 0.6v4.6a0.6 0.6 0 0 1-0.6 0.6h-0.4a0.6 0.6 0 0 1-0.6-0.6Z"/>
 </svg>

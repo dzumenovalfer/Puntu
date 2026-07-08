@@ -1,17 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <!-- Puntu status: engine off (not the active input source).
-       Hollow keycap outline + diagonal slash = disabled. -->
-  <mask id="off">
-    <rect width="16" height="16" fill="#000"/>
-    <!-- frame: outer keycap minus inner hole -->
-    <rect x="2" y="2.5" width="12" height="11" rx="2.6" fill="#fff"/>
-    <rect x="3.6" y="4.1" width="8.8" height="7.8" rx="1.5" fill="#000"/>
-    <!-- reopen a channel so the slash reads as one clean stroke over the frame -->
-    <rect x="6.9" y="1.4" width="2.2" height="13.2" rx="1.1"
-          transform="rotate(45 8 8)" fill="#000"/>
-  </mask>
-  <rect width="16" height="16" fill="#2e3436" mask="url(#off)"/>
-  <!-- diagonal slash -->
-  <rect x="7.2" y="2.2" width="1.6" height="11.6" rx="0.8"
-        transform="rotate(45 8 8)" fill="#2e3436"/>
+  <!-- Puntu status: engine off. Hollow keycap outline with a diagonal slash inside
+       (like action-unavailable-symbolic). Single even-odd path: outer contour →
+       inner hole → slash re-filled at depth 3. No masks — see puntu-symbolic.svg. -->
+  <path fill="#2e3436" fill-rule="evenodd"
+        d="M4.6 2.5h6.8A2.6 2.6 0 0 1 14 5.1v5.8a2.6 2.6 0 0 1-2.6 2.6H4.6A2.6 2.6 0 0 1 2 10.9V5.1a2.6 2.6 0 0 1 2.6-2.6Z
+           M5.1 4.1h5.8a1.5 1.5 0 0 1 1.5 1.5v4.8a1.5 1.5 0 0 1-1.5 1.5H5.1a1.5 1.5 0 0 1-1.5-1.5V5.6a1.5 1.5 0 0 1 1.5-1.5Z
+           M9.98 4.3l1.24 1-5.2 6.4-1.24-1Z"/>
 </svg>
