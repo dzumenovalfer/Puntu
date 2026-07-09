@@ -17,6 +17,14 @@ use puntu::detect::userdict::{ListKind, UserDict};
 use puntu::keymap::Lang;
 
 fn main() -> eframe::Result {
+    // Одно окно настроек: повторный запуск (из сетки приложений, трея, терминала) тихо
+    // выходит, а не открывает второе такое же окно рядом с первым.
+    if another_instance_running() {
+        return Ok(());
+    }
+    // Значок состояния должен появляться вместе с приложением: автостарт трея на логине
+    // мог проиграть гонку расширению AppIndicator и не подняться. Дубликат выйдет сам.
+    ensure_tray();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([680.0, 600.0])
@@ -27,7 +35,14 @@ fn main() -> eframe::Result {
             .with_decorations(false)
             .with_transparent(true)
             // Matches puntu.desktop, so the dock/alt-tab show the proper icon and name.
-            .with_app_id("puntu"),
+            .with_app_id("puntu")
+            // The icon compiled into the binary (icons/puntu.png, rendered from puntu.svg).
+            // GNOME on Wayland takes the icon from the desktop file via app_id, but X11,
+            // XWayland and other desktops read the window icon — cover them all.
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../../icons/puntu.png"))
+                    .expect("embedded icons/puntu.png is a valid PNG"),
+            ),
         ..Default::default()
     };
     eframe::run_native(
@@ -40,6 +55,46 @@ fn main() -> eframe::Result {
             Ok(Box::new(App::new()))
         }),
     )
+}
+
+/// Другой живой `puntu-app` (кроме нас)? Зомби не считаются (`--runstates` без Z):
+/// закрытое окно, которое родитель ещё не дожал, — это не работающий экземпляр.
+fn another_instance_running() -> bool {
+    let me = std::process::id();
+    std::process::Command::new("pgrep")
+        .args(["-x", "--runstates", "R,S,D,T", "puntu-app"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .any(|pid| pid != me)
+        })
+        .unwrap_or(false)
+}
+
+/// Start `puntu-gui` (the tray) unless one is already running. The binary installed
+/// next to us wins over `$PATH`, same as the tray does for its own siblings.
+fn ensure_tray() {
+    let running = std::process::Command::new("pgrep")
+        .args(["-x", "--runstates", "R,S,D,T", "puntu-gui"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if running {
+        return;
+    }
+    let bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("puntu-gui")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("puntu-gui"));
+    if let Ok(mut child) = std::process::Command::new(bin).spawn() {
+        // Дожинаем в фоне — иначе выход дубликата трея висел бы зомби до закрытия окна.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 /// Read the system look from GNOME: (accent colour, dark?). Follows the «Внешний вид»
@@ -430,29 +485,43 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     response
 }
 
-/// One settings row: name + short description on the left, the control on the right.
-fn row(ui: &mut egui::Ui, name: &str, desc: &str, control: impl FnOnce(&mut egui::Ui)) {
+/// One settings row: a bold name on the left, the control on the right. `_desc` is kept in
+/// the signature (call sites still pass it) but no longer rendered — the user asked for the
+/// grey subtitles to go.
+fn row(ui: &mut egui::Ui, name: &str, _desc: &str, control: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(egui::RichText::new(name).strong());
-            if !desc.is_empty() {
-                ui.label(egui::RichText::new(desc).weak().size(11.0));
-            }
-        });
+        ui.label(egui::RichText::new(name).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
     });
     ui.separator();
 }
 
+/// A triangle expander arrow: points right when closed, rotates to point down as `openness`
+/// goes 0 → 1. Matches GNOME's disclosure triangle.
+fn paint_arrow(painter: &egui::Painter, center: egui::Pos2, openness: f32, color: egui::Color32) {
+    use std::f32::consts::TAU;
+    let rot = egui::emath::Rot2::from_angle(openness * TAU * 0.25);
+    let r = 5.0;
+    let pts: Vec<egui::Pos2> = [
+        egui::vec2(0.4, 0.0),
+        egui::vec2(-0.4, 0.45),
+        egui::vec2(-0.4, -0.45),
+    ]
+    .iter()
+    .map(|&v| center + r * (rot * v))
+    .collect();
+    painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+}
 
-/// An Adwaita-style card (rounded box) with an expander arrow, a title and an optional
-/// master switch in the header — the GNOME Settings row look. Returns `true` when the
-/// switch changed. The body renders only while the switch is on.
+/// An Adwaita-style card (rounded box) with an expander arrow, a title and a master switch.
+/// The **entire header row** is a clickable button that expands/collapses the card (only the
+/// switch on the right keeps its own click). Returns `true` when the switch changed. No
+/// description subtitle. The body renders only while the switch is on.
 fn card_switch(
     ui: &mut egui::Ui,
     id: &str,
     title: &str,
-    desc: &str,
+    _desc: &str,
     on: &mut bool,
     body: impl FnOnce(&mut egui::Ui),
 ) -> bool {
@@ -464,32 +533,54 @@ fn card_switch(
         .outer_margin(egui::Margin { bottom: 6, ..Default::default() })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
                 ui.ctx(),
                 egui::Id::new(id),
                 false,
             );
-            state
-                .show_header(ui, |ui| {
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new(title).strong());
-                        if !desc.is_empty() {
-                            ui.label(egui::RichText::new(desc).weak().size(11.0));
-                        }
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if toggle(ui, on).changed() {
-                            changed = true;
-                        }
-                    });
-                })
-                .body(|ui| {
-                    if *on {
-                        body(ui);
-                    } else {
-                        ui.label(egui::RichText::new("выключено").weak());
-                    }
-                });
+
+            // Full-width clickable header. Allocated FIRST so it sits BELOW the switch in the
+            // interaction order — a click on the switch goes to the switch, a click anywhere
+            // else on the row toggles the card.
+            let width = ui.available_width();
+            let height = ui.spacing().interact_size.y.max(24.0);
+            let (rect, header) =
+                ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+            if header.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let openness = state.openness(ui.ctx());
+            let mut hui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            paint_arrow(
+                hui.painter(),
+                rect.left_center() + egui::vec2(9.0, 0.0),
+                openness,
+                hui.visuals().text_color(),
+            );
+            hui.add_space(22.0);
+            hui.label(egui::RichText::new(title).strong().size(15.0));
+            hui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if toggle(ui, on).changed() {
+                    changed = true;
+                }
+            });
+            if header.clicked() {
+                let open = state.is_open();
+                state.set_open(!open);
+                state.store(ui.ctx());
+            }
+
+            state.show_body_unindented(ui, |ui| {
+                if *on {
+                    body(ui);
+                } else {
+                    ui.label(egui::RichText::new("выключено").weak());
+                }
+            });
         });
     changed
 }

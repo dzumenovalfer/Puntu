@@ -248,6 +248,9 @@ Exec=$BIN_DIR/puntu-app
 Icon=puntu
 Type=Application
 Terminal=false
+# Match the window to this entry (and its Icon) when the app runs under X11/XWayland,
+# where the shell sees WM_CLASS instead of the Wayland app_id.
+StartupWMClass=puntu
 Categories=Utility;Settings;
 Keywords=puntu;keyboard;layout;раскладка;настройки;словарь;dictionary;
 DESK
@@ -270,7 +273,11 @@ Terminal=false
 X-GNOME-Autostart-enabled=true
 NoDisplay=true
 DESK
-  pgrep -x puntu-gui >/dev/null 2>&1 || setsid "$BIN_DIR/puntu-gui" >/dev/null 2>&1 < /dev/null &
+  # Restart, not just start-if-absent: a tray from the previous version would otherwise
+  # keep running with the old binary (and the old icons) until the next login.
+  pkill -x puntu-gui >/dev/null 2>&1 || true
+  sleep 0.5
+  setsid "$BIN_DIR/puntu-gui" >/dev/null 2>&1 < /dev/null &
 fi
 
 # 8. Electron/Chromium apps: enable the system input method -------------------

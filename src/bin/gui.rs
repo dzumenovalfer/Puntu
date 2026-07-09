@@ -42,7 +42,13 @@ fn sibling(name: &str) -> PathBuf {
 }
 
 fn open_app() {
-    let _ = std::process::Command::new(sibling("puntu-app")).spawn();
+    if let Ok(mut child) = std::process::Command::new(sibling("puntu-app")).spawn() {
+        // Дожинаем ребёнка в фоне: без wait() каждое закрытое окно настроек висело бы
+        // зомби, пока жив трей, и pgrep-подсчёты экземпляров считали бы его живым.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 /// Is the Puntu engine the active IBus input source right now?
@@ -90,6 +96,15 @@ impl Tray for PuntuTray {
         }
     }
 
+    fn icon_theme_path(&self) -> String {
+        // The dir with our icons, verbatim. The AppIndicator host resolves names here
+        // directly, so the icon shows up even when the shell started before install.sh
+        // created ~/.local/share/icons and hasn't rescanned the theme yet.
+        std::env::var("HOME")
+            .map(|h| format!("{h}/.local/share/icons/hicolor/scalable/status"))
+            .unwrap_or_default()
+    }
+
     fn status(&self) -> Status {
         Status::Active // always visible — this is the control point
     }
@@ -135,7 +150,9 @@ impl Tray for PuntuTray {
             .into(),
             CheckmarkItem {
                 label: "Приостановить".into(),
-                checked: self.state.paused,
+                // «Выключен» поглощает «на паузе»: у выключенного движка галочка паузы
+                // не показывается, даже если маркер остался от внешних действий.
+                checked: self.state.paused && engine_on,
                 enabled: engine_on,
                 activate: Box::new(|t: &mut Self| {
                     t.state.paused = !t.state.paused;
@@ -155,6 +172,10 @@ impl Tray for PuntuTray {
                     let cmd = if engine_on { "disable" } else { "enable" };
                     let _ = std::process::Command::new(sibling("puntu-ibus")).arg(cmd).status();
                     t.state.engine_on = !engine_on;
+                    // Любой щелчок тумблера снимает паузу: выключенный движок не может
+                    // быть «на паузе», а включённый не должен молча стартовать замороженным.
+                    t.state.paused = false;
+                    set_paused(false);
                 }),
                 ..Default::default()
             }
@@ -171,29 +192,67 @@ impl Tray for PuntuTray {
     }
 }
 
+/// Другой живой `puntu-gui` (кроме нас)? Автостарт логина и запуск из `puntu-app`
+/// могут стартовать нас одновременно — дубликат обязан тихо выйти, иначе в панели
+/// окажется два значка.
+fn another_instance_running() -> bool {
+    let me = std::process::id();
+    std::process::Command::new("pgrep")
+        // --runstates без Z: зомби — это не работающий экземпляр.
+        .args(["-x", "--runstates", "R,S,D,T", "puntu-gui"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .any(|pid| pid != me)
+        })
+        .unwrap_or(false)
+}
+
+/// Регистрация в трее с повторами: при логине автостарт обгоняет расширение
+/// AppIndicator (StatusNotifierWatcher ещё не поднят), и первая попытка проваливается —
+/// раньше это молча оставляло сессию без значка состояния.
+async fn register_with_retry() -> anyhow::Result<ksni::Handle<PuntuTray>> {
+    let mut last = None;
+    for _ in 0..60 {
+        match (PuntuTray { state: read_state() }).spawn().await {
+            Ok(handle) => return Ok(handle),
+            Err(e) => last = Some(e),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Err(anyhow::anyhow!(
+        "не удалось зарегистрировать значок в трее (нужно расширение AppIndicator): {}",
+        last.map(|e| e.to_string()).unwrap_or_default()
+    ))
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let tray = PuntuTray { state: read_state() };
-    let handle = tray.spawn().await.map_err(|e| {
-        anyhow::anyhow!(
-            "не удалось зарегистрировать значок в трее (нужно расширение AppIndicator): {e}"
-        )
-    })?;
-
-    // Отражаем изменения, сделанные не из трея: пауза из приложения/CLI, смена источника
-    // ввода через Super+Space. Дёшево: файл + один subprocess раз в 2 секунды.
-    loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let next = read_state();
-        let updated = handle
-            .update(move |t: &mut PuntuTray| {
-                t.state = next;
-            })
-            .await;
-        // `update` возвращает None, когда сервис трея остановлен — тогда выходим и мы.
-        if updated.is_none() {
-            break;
-        }
+    if another_instance_running() {
+        return Ok(());
     }
-    Ok(())
+
+    loop {
+        let handle = register_with_retry().await?;
+
+        // Отражаем изменения, сделанные не из трея: пауза из приложения/CLI, смена источника
+        // ввода через Super+Space. Дёшево: файл + один subprocess раз в 2 секунды.
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let next = read_state();
+            let updated = handle
+                .update(move |t: &mut PuntuTray| {
+                    t.state = next;
+                })
+                .await;
+            // `update` возвращает None, когда сервис трея остановлен.
+            if updated.is_none() {
+                break;
+            }
+        }
+        // Сервис пропал — обычно перезапуск gnome-shell или расширения. Регистрируемся
+        // заново, а не выходим: раньше любой рестарт шелла навсегда убирал значок.
+    }
 }
