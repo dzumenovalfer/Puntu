@@ -513,10 +513,66 @@ fn paint_arrow(painter: &egui::Painter, center: egui::Pos2, openness: f32, color
     painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
 }
 
-/// An Adwaita-style card (rounded box) with an expander arrow, a title and a master switch.
-/// The **entire header row** is a clickable button that expands/collapses the card (only the
-/// switch on the right keeps its own click). Returns `true` when the switch changed. No
-/// description subtitle. The body renders only while the switch is on.
+/// The subtle border that gives each card definition (so nested cards read as separate
+/// boxes on the same background).
+fn card_frame(ui: &egui::Ui) -> egui::Frame {
+    let border = if ui.visuals().dark_mode {
+        egui::Color32::from_gray(0x45)
+    } else {
+        egui::Color32::from_gray(0xd6)
+    };
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(10)
+        .inner_margin(10)
+        .outer_margin(egui::Margin { bottom: 6, ..Default::default() })
+}
+
+/// Draw the clickable card header (arrow + title, optional switch on the right) into a
+/// full-width row and return `(header_clicked, switch_changed)`. The header sits BELOW the
+/// switch in the interaction order, so a click on the switch toggles the switch and a click
+/// anywhere else on the row expands/collapses the card.
+fn card_header(
+    ui: &mut egui::Ui,
+    openness: f32,
+    title: &str,
+    switch: Option<&mut bool>,
+) -> (bool, bool) {
+    let width = ui.available_width();
+    let height = ui.spacing().interact_size.y.max(24.0);
+    let (rect, header) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    if header.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let mut changed = false;
+    let mut hui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    paint_arrow(
+        hui.painter(),
+        rect.left_center() + egui::vec2(9.0, 0.0),
+        openness,
+        hui.visuals().text_color(),
+    );
+    hui.add_space(22.0);
+    hui.label(egui::RichText::new(title).strong().size(15.0));
+    if let Some(on) = switch {
+        hui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if toggle(ui, on).changed() {
+                changed = true;
+            }
+        });
+    }
+    (header.clicked(), changed)
+}
+
+/// An Adwaita-style card with an expander arrow, a title and a master switch. The whole
+/// header is clickable; the body renders only while the switch is on. Returns `true` when the
+/// switch changed.
 fn card_switch(
     ui: &mut egui::Ui,
     id: &str,
@@ -526,62 +582,70 @@ fn card_switch(
     body: impl FnOnce(&mut egui::Ui),
 ) -> bool {
     let mut changed = false;
-    egui::Frame::new()
-        .fill(ui.visuals().faint_bg_color)
-        .corner_radius(10)
-        .inner_margin(10)
-        .outer_margin(egui::Margin { bottom: 6, ..Default::default() })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                ui.ctx(),
-                egui::Id::new(id),
-                false,
-            );
-
-            // Full-width clickable header. Allocated FIRST so it sits BELOW the switch in the
-            // interaction order — a click on the switch goes to the switch, a click anywhere
-            // else on the row toggles the card.
-            let width = ui.available_width();
-            let height = ui.spacing().interact_size.y.max(24.0);
-            let (rect, header) =
-                ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
-            if header.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    card_frame(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            egui::Id::new(id),
+            false,
+        );
+        let openness = state.openness(ui.ctx());
+        let (clicked, ch) = card_header(ui, openness, title, Some(on));
+        changed = ch;
+        if clicked {
+            let open = state.is_open();
+            state.set_open(!open);
+            state.store(ui.ctx());
+        }
+        state.show_body_unindented(ui, |ui| {
+            if *on {
+                body(ui);
+            } else {
+                ui.label(egui::RichText::new("выключено").weak());
             }
-            let openness = state.openness(ui.ctx());
-            let mut hui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(rect)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            paint_arrow(
-                hui.painter(),
-                rect.left_center() + egui::vec2(9.0, 0.0),
-                openness,
-                hui.visuals().text_color(),
-            );
-            hui.add_space(22.0);
-            hui.label(egui::RichText::new(title).strong().size(15.0));
-            hui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        });
+    });
+    changed
+}
+
+/// A collapsible card with **no switch** — for a setting that is always on and just has a
+/// value to reveal (e.g. tap duration).
+fn card_plain(ui: &mut egui::Ui, id: &str, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    card_frame(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            egui::Id::new(id),
+            false,
+        );
+        let openness = state.openness(ui.ctx());
+        let (clicked, _) = card_header(ui, openness, title, None);
+        if clicked {
+            let open = state.is_open();
+            state.set_open(!open);
+            state.store(ui.ctx());
+        }
+        state.show_body_unindented(ui, body);
+    });
+}
+
+/// A card that is **just a switch** — a rounded box with a title and a toggle, no arrow and
+/// nothing to expand (e.g. an on/off with no further options). Returns `true` when changed.
+fn card_toggle(ui: &mut egui::Ui, title: &str, on: &mut bool) -> bool {
+    let mut changed = false;
+    card_frame(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            // Align with the arrow-indented cards next to it.
+            ui.add_space(31.0);
+            ui.label(egui::RichText::new(title).strong().size(15.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if toggle(ui, on).changed() {
                     changed = true;
                 }
             });
-            if header.clicked() {
-                let open = state.is_open();
-                state.set_open(!open);
-                state.store(ui.ctx());
-            }
-
-            state.show_body_unindented(ui, |ui| {
-                if *on {
-                    body(ui);
-                } else {
-                    ui.label(egui::RichText::new("выключено").weak());
-                }
-            });
         });
+    });
     changed
 }
 
@@ -795,61 +859,60 @@ impl App {
                 "исправление слов, набранных не в той раскладке",
                 &mut master_on,
                 |ui| {
-                    // ---- внутренние настройки автокоррекции ----
-                    let mut suggest = cfg.learning.suggest_after > 0;
-                    row(ui, "Предлагать запоминание", "после N ручных переводов слова", |ui| {
-                        if toggle(ui, &mut suggest).changed() {
-                            cfg.learning.suggest_after = if suggest { 3 } else { 0 };
-                            save = true;
-                        }
-                        if cfg.learning.suggest_after > 0 {
-                            let mut n = cfg.learning.suggest_after;
+                    // ---- Предлагать запоминание ----
+                    let mut suggest_on = cfg.learning.suggest_after > 0;
+                    if card_switch(ui, "suggest", "Предлагать запоминание", "", &mut suggest_on, |ui| {
+                        let mut n = cfg.learning.suggest_after.max(1);
+                        row(ui, "После скольких переводов", "", |ui| {
                             if ui
-                                .add(egui::DragValue::new(&mut n).range(1..=9).prefix("N = "))
+                                .add(egui::DragValue::new(&mut n).range(1..=9))
                                 .changed()
                             {
                                 cfg.learning.suggest_after = n;
                                 save = true;
                             }
-                        }
-                    });
+                        });
+                    }) {
+                        cfg.learning.suggest_after = if suggest_on { 3 } else { 0 };
+                        save = true;
+                    }
 
-                    let mut remember_on =
-                        !parse_off(&cfg.ibus_hotkeys.remember_key);
-                    row(ui, "Запомнить слово", "выделенное/последнее слово — в словарь", |ui| {
-                        if toggle(ui, &mut remember_on).changed() {
-                            cfg.ibus_hotkeys.remember_key = if remember_on {
-                                remember_prev.clone()
-                            } else {
-                                "none".to_string()
-                            };
-                            save = true;
-                        }
-                        if remember_on
-                            && ui
+                    // ---- Запомнить слово ----
+                    let mut remember_on = !parse_off(&cfg.ibus_hotkeys.remember_key);
+                    if card_switch(ui, "remember", "Запомнить слово", "", &mut remember_on, |ui| {
+                        row(ui, "Клавиша", "", |ui| {
+                            if ui
                                 .button(binding_label(&cfg.ibus_hotkeys.remember_key))
                                 .clicked()
-                        {
-                            capture_request = Some(Capture::Remember);
-                        }
-                    });
+                            {
+                                capture_request = Some(Capture::Remember);
+                            }
+                        });
+                    }) {
+                        cfg.ibus_hotkeys.remember_key = if remember_on {
+                            remember_prev.clone()
+                        } else {
+                            "none".to_string()
+                        };
+                        save = true;
+                    }
 
+                    // ---- Флип последнего слова ----
                     let mut undo_on = !parse_off(&cfg.ibus_hotkeys.undo_key);
-                    row(ui, "Флип последнего слова", "перевести туда-обратно", |ui| {
-                        if toggle(ui, &mut undo_on).changed() {
-                            cfg.ibus_hotkeys.undo_key = if undo_on {
-                                undo_prev.clone()
-                            } else {
-                                "none".to_string()
-                            };
-                            save = true;
-                        }
-                        if undo_on
-                            && ui.button(binding_label(&cfg.ibus_hotkeys.undo_key)).clicked()
-                        {
-                            capture_request = Some(Capture::Undo);
-                        }
-                    });
+                    if card_switch(ui, "undo", "Флип последнего слова", "", &mut undo_on, |ui| {
+                        row(ui, "Клавиша", "", |ui| {
+                            if ui.button(binding_label(&cfg.ibus_hotkeys.undo_key)).clicked() {
+                                capture_request = Some(Capture::Undo);
+                            }
+                        });
+                    }) {
+                        cfg.ibus_hotkeys.undo_key = if undo_on {
+                            undo_prev.clone()
+                        } else {
+                            "none".to_string()
+                        };
+                        save = true;
+                    }
 
                     // ---- Переключение на другую раскладку ----
                     let mut switch_on = !(parse_off(&cfg.ibus_hotkeys.mode_toggle)
@@ -956,15 +1019,17 @@ impl App {
                     }
 
                     // ---- Длительность тапа ----
-                    row(ui, "Длительность тапа", "дольше — считается шорткатом, не тапом", |ui| {
-                        let mut ms = cfg.tap_max_hold_ms;
-                        if ui
-                            .add(egui::DragValue::new(&mut ms).range(100..=2000).suffix(" мс"))
-                            .changed()
-                        {
-                            cfg.tap_max_hold_ms = ms;
-                            save = true;
-                        }
+                    card_plain(ui, "tap_hold", "Длительность тапа", |ui| {
+                        row(ui, "Максимум удержания", "", |ui| {
+                            let mut ms = cfg.tap_max_hold_ms;
+                            if ui
+                                .add(egui::DragValue::new(&mut ms).range(100..=2000).suffix(" мс"))
+                                .changed()
+                            {
+                                cfg.tap_max_hold_ms = ms;
+                                save = true;
+                            }
+                        });
                     });
                 },
             ) {
@@ -982,27 +1047,24 @@ impl App {
                 "пРИВЕТ → Привет; ПРивет → Привет (по словарю)",
                 &mut case_card_on,
                 |ui| {
-                    row(ui, "Автоматически", "чинит случайный CapsLock и поздний Shift", |ui| {
-                        if toggle(ui, &mut cfg.fix_case).changed() {
-                            save = true;
-                        }
-                    });
+                    if card_toggle(ui, "Автоматически", &mut cfg.fix_case) {
+                        save = true;
+                    }
                     let mut key_on = !parse_off(&cfg.ibus_hotkeys.case_key);
-                    row(ui, "Регистр слова (клавиша)", "слово → Слово → СЛОВО, как флип перевода", |ui| {
-                        if toggle(ui, &mut key_on).changed() {
-                            cfg.ibus_hotkeys.case_key = if key_on {
-                                case_prev.clone()
-                            } else {
-                                "none".to_string()
-                            };
-                            save = true;
-                        }
-                        if key_on
-                            && ui.button(binding_label(&cfg.ibus_hotkeys.case_key)).clicked()
-                        {
-                            capture_request = Some(Capture::CaseKey);
-                        }
-                    });
+                    if card_switch(ui, "case_key", "Регистр слова (клавиша)", "", &mut key_on, |ui| {
+                        row(ui, "Клавиша", "", |ui| {
+                            if ui.button(binding_label(&cfg.ibus_hotkeys.case_key)).clicked() {
+                                capture_request = Some(Capture::CaseKey);
+                            }
+                        });
+                    }) {
+                        cfg.ibus_hotkeys.case_key = if key_on {
+                            case_prev.clone()
+                        } else {
+                            "none".to_string()
+                        };
+                        save = true;
+                    }
                 },
             ) {
                 if case_card_on {
