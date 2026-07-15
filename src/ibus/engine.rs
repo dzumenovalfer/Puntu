@@ -286,12 +286,32 @@ pub struct PuntuEngine {
     /// `suggest_after` manual conversions of the same word, a zenity dialog offers to
     /// remember it. Value = (count, last typed form — for the dialog text).
     convert_counts: ConvertCounts,
+    /// The last (original → converted) selection pair — the stale-PRIMARY guard.
+    last_converted: LastConverted,
     /// The `[learning] suggest_after` config value; 0 disables the offer.
     suggest_after: u32,
 }
 
 /// Shared manual-conversion counter: converted word → (count, last typed form).
 type ConvertCounts = Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, String)>>>;
+
+/// The last (original → converted) selection pair, shared across engines. Used to refuse
+/// converting a STALE primary selection — see [`is_stale_selection`].
+type LastConverted = Arc<std::sync::Mutex<Option<(String, String)>>>;
+
+/// Is `sel` just the residue of the previous conversion still sitting in PRIMARY? After a
+/// replacement the selection buffer keeps the OLD text (the replaced original — or, in some
+/// apps, the inserted form). Wayland has no "selection cleared" signal we could use, and
+/// apps that never publish PRIMARY at all (egui/winit — Puntu's own window) leave whatever
+/// was there before. Converting that residue re-inserted the previous word at the caret —
+/// the reported «вставка переведённого слова при наборе следующего». The uinput daemon has
+/// carried the same guard since M2 (capture.rs: "selection matches last converted pair").
+fn is_stale_selection(last: &Option<(String, String)>, sel: &str) -> bool {
+    last.as_ref().is_some_and(|(orig, conv)| {
+        let s = sel.trim();
+        s == orig.trim() || s == conv.trim()
+    })
+}
 
 /// `IBusInputPurpose` values we care about (mirror `GtkInputPurpose`).
 const PURPOSE_PASSWORD: u32 = 8;
@@ -309,6 +329,7 @@ impl PuntuEngine {
         fix_case: bool,
         paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
         convert_counts: ConvertCounts,
+        last_converted: LastConverted,
         suggest_after: u32,
     ) -> Self {
         Self {
@@ -327,6 +348,7 @@ impl PuntuEngine {
             hint_shown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             paused,
             convert_counts,
+            last_converted,
             suggest_after,
         }
     }
@@ -531,6 +553,7 @@ impl PuntuEngine {
         let dict = Arc::clone(&self.dict);
         let hint_shown = Arc::clone(&self.hint_shown);
         let counts = Arc::clone(&self.convert_counts);
+        let last_converted = Arc::clone(&self.last_converted);
         let suggest_after = self.suggest_after;
         let se = se.to_owned();
         tokio::spawn(async move {
@@ -547,6 +570,21 @@ impl PuntuEngine {
                 Self::show_hint_shared(&se, &hint_shown, "Puntu: нет выделения").await;
                 return;
             };
+            // Stale-PRIMARY guard: nothing NEW is selected — converting the residue of the
+            // previous conversion would re-insert the old word at the caret.
+            if is_stale_selection(&last_converted.lock().unwrap().clone(), &selection) {
+                tracing::info!(
+                    "[puntu-engine {id}] convert-selection: PRIMARY still holds the previous \
+                     pair ({selection:?}) — skipping"
+                );
+                Self::show_hint_shared(
+                    &se,
+                    &hint_shown,
+                    "Puntu: нет нового выделения — выделите текст заново",
+                )
+                .await;
+                return;
+            }
             // Per-word detection first: only wrong-layout words convert; correctly-typed
             // words, punctuation and spacing stay. This is what fixes a mixed selection like
             // «почему то не переводит ghbdtn» — only the ghbdtn becomes привет, instead of
@@ -590,6 +628,7 @@ impl PuntuEngine {
             tracing::info!(
                 "[puntu-engine {id}] convert-selection: {selection:?} → {converted:?}"
             );
+            *last_converted.lock().unwrap() = Some((selection.clone(), converted.clone()));
             forward_backspace(&se).await;
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             // A selection conversion is a manual conversion — feed the repeat counter
@@ -1203,6 +1242,7 @@ pub struct PuntuFactory {
     paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Manual-conversion counter, shared by every engine this factory creates.
     convert_counts: ConvertCounts,
+    last_converted: LastConverted,
     suggest_after: u32,
     next_id: u64,
 }
@@ -1227,6 +1267,7 @@ impl PuntuFactory {
             fix_case,
             paused,
             convert_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            last_converted: Arc::new(std::sync::Mutex::new(None)),
             suggest_after,
             next_id: 1,
         }
@@ -1253,6 +1294,7 @@ impl IBusFactory<PuntuEngine> for PuntuFactory {
             self.fix_case,
             std::sync::Arc::clone(&self.paused),
             Arc::clone(&self.convert_counts),
+            Arc::clone(&self.last_converted),
             self.suggest_after,
         ))
     }
@@ -2011,6 +2053,18 @@ mod tests {
     }
 
     #[test]
+    fn stale_primary_selection_is_refused() {
+        let last = Some(("drk".to_string(), "вкл".to_string()));
+        // Both halves of the previous pair are residue, not a fresh selection.
+        assert!(is_stale_selection(&last, "drk"));
+        assert!(is_stale_selection(&last, "вкл"));
+        assert!(is_stale_selection(&last, " drk ")); // trailing space from double-click
+        // A genuinely new selection converts as usual.
+        assert!(!is_stale_selection(&last, "ghbdtn"));
+        assert!(!is_stale_selection(&None, "drk"));
+    }
+
+    #[test]
     fn case_signatures_fix_and_intentional_case_survives() {
         let known = |w: &str| ["привет", "работа"].contains(&w);
         // Паттерн 1: CapsLock-инверсия — чинится без словаря.
@@ -2090,6 +2144,7 @@ mod tests {
             true,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(Default::default())),
+            Arc::new(std::sync::Mutex::new(None)),
             3,
         );
         // Passwords/PINs: fully transparent.

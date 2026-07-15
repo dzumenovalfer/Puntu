@@ -245,6 +245,8 @@ struct App {
     /// Last dictionary re-read — the window refreshes every couple of seconds, so words
     /// added from gestures (Ctrl+Alt+D) or the CLI show up while it is open.
     dict_refreshed: std::time::Instant,
+    /// Last selection we published to PRIMARY (see `publish_selection`).
+    last_primary: String,
     /// Live system-theme updates (accent colour, dark?) from the gsettings poller thread.
     theme_rx: mpsc::Receiver<(egui::Color32, bool)>,
     /// Previous bindings, so a switch turned back on restores what the user had.
@@ -306,6 +308,7 @@ impl App {
             restart_rx: None,
             capture_peak: egui::Modifiers::NONE,
             dict_refreshed: std::time::Instant::now(),
+            last_primary: String::new(),
             theme_rx,
             mode_prev,
             convert_prev,
@@ -647,6 +650,30 @@ fn card_toggle(ui: &mut egui::Ui, title: &str, on: &mut bool) -> bool {
         });
     });
     changed
+}
+
+/// egui/winit не публикуют выделение в PRIMARY на Wayland, а конверсия выделения в движке
+/// читает именно PRIMARY — без этого Ctrl+Shift внутри самого Puntu конвертировал
+/// устаревший текст из других окон. Публикуем выделение наших полей сами (wl-copy).
+fn publish_selection(last: &mut String, out: &egui::widgets::text_edit::TextEditOutput, text: &str) {
+    let Some(cr) = out.cursor_range else { return };
+    let (a, b) = (
+        cr.primary.index.min(cr.secondary.index).0,
+        cr.primary.index.max(cr.secondary.index).0,
+    );
+    if a == b {
+        return;
+    }
+    let sel: String = text.chars().skip(a).take(b - a).collect();
+    if sel.is_empty() || sel == *last {
+        return;
+    }
+    *last = sel.clone();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("wl-copy")
+            .args(["--primary", "--", &sel])
+            .status();
+    });
 }
 
 /// Is a tap-combo config value effectively "off"?
@@ -1090,14 +1117,19 @@ impl App {
     fn dictionary_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("🔍 Поиск:");
-            ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(220.0));
+            let out = egui::TextEdit::singleline(&mut self.search)
+                .desired_width(220.0)
+                .show(ui);
+            publish_selection(&mut self.last_primary, &out, &self.search);
         });
         ui.horizontal(|ui| {
             ui.label("Новое слово (правильное написание):");
-            let add_field =
-                ui.add(egui::TextEdit::singleline(&mut self.new_word).desired_width(180.0));
-            let submitted =
-                add_field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let add_out = egui::TextEdit::singleline(&mut self.new_word)
+                .desired_width(180.0)
+                .show(ui);
+            publish_selection(&mut self.last_primary, &add_out, &self.new_word);
+            let submitted = add_out.response.response.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if (ui.button("➕ Добавить").clicked() || submitted)
                 && !self.new_word.trim().is_empty()
             {
