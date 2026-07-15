@@ -155,6 +155,18 @@ pub trait IBusEngine: Send + Sync {
     fn set_content_type(&mut self, _purpose: u32, _hints: u32) -> fdo::Result<()> {
         Ok(())
     }
+
+    /// The client updated the text around the caret (`SetSurroundingText`): `text` is the
+    /// plain surrounding text, `cursor_pos`/`anchor_pos` are char offsets into it; when they
+    /// differ, the span between them is the current selection.
+    fn set_surrounding_text(
+        &mut self,
+        _text: String,
+        _cursor_pos: u32,
+        _anchor_pos: u32,
+    ) -> fdo::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Ord, Eq)]
@@ -537,11 +549,23 @@ impl<T: IBusEngine + 'static> Engine<T> {
     // 忽略
     fn set_surrounding_text(
         &mut self,
-        _text: Value,
-        _cursor_pos: u32,
-        _anchor_pos: u32,
+        text: Value,
+        cursor_pos: u32,
+        anchor_pos: u32,
     ) -> fdo::Result<()> {
-        Ok(())
+        // IBusText is (sa{sv}sv); field 2 is the plain string.
+        let s = match &text {
+            Value::Structure(st) => st
+                .fields()
+                .get(2)
+                .and_then(|f| match f {
+                    Value::Str(s) => Some(s.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.e.set_surrounding_text(s, cursor_pos, anchor_pos)
     }
 
     // 忽略 (用户界面相关)
@@ -622,8 +646,7 @@ impl<T: IBusEngine + 'static> Engine<T> {
 
     #[zbus(property)]
     fn active_surrounding_text(&self) -> bool {
-        // TODO
-        false
+        true
     }
 }
 

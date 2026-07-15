@@ -288,6 +288,11 @@ pub struct PuntuEngine {
     convert_counts: ConvertCounts,
     /// The last (original → converted) selection pair — the stale-PRIMARY guard.
     last_converted: LastConverted,
+    /// The client-reported text around the caret with the selection bounds
+    /// (`SetSurroundingText`): (text, cursor, anchor) in chars. The IM-native way to read
+    /// the current selection — Chromium/Electron (Claude, VS Code) send it, while their
+    /// Wayland PRIMARY publishing is unreliable.
+    surrounding: Option<(String, u32, u32)>,
     /// The `[learning] suggest_after` config value; 0 disables the offer.
     suggest_after: u32,
 }
@@ -298,6 +303,18 @@ type ConvertCounts = Arc<std::sync::Mutex<std::collections::HashMap<String, (u32
 /// The last (original → converted) selection pair, shared across engines. Used to refuse
 /// converting a STALE primary selection — see [`is_stale_selection`].
 type LastConverted = Arc<std::sync::Mutex<Option<(String, String)>>>;
+
+/// The selected span of the client-reported surrounding text, if any: the chars between
+/// `cursor` and `anchor` (either order). `None` when there is no selection.
+fn surrounding_selection(sur: &Option<(String, u32, u32)>) -> Option<String> {
+    let (text, cursor, anchor) = sur.as_ref()?;
+    let (a, b) = (*cursor.min(anchor) as usize, *cursor.max(anchor) as usize);
+    if a == b {
+        return None;
+    }
+    let sel: String = text.chars().skip(a).take(b - a).collect();
+    (!sel.is_empty()).then_some(sel)
+}
 
 /// Is `sel` just the residue of the previous conversion still sitting in PRIMARY? After a
 /// replacement the selection buffer keeps the OLD text (the replaced original — or, in some
@@ -349,6 +366,7 @@ impl PuntuEngine {
             paused,
             convert_counts,
             last_converted,
+            surrounding: None,
             suggest_after,
         }
     }
@@ -555,24 +573,37 @@ impl PuntuEngine {
         let counts = Arc::clone(&self.convert_counts);
         let last_converted = Arc::clone(&self.last_converted);
         let suggest_after = self.suggest_after;
+        // The IM-native selection, straight from the client. Snapshot before spawning —
+        // it lives on `self`, the task doesn't.
+        let surround_sel = surrounding_selection(&self.surrounding);
         let se = se.to_owned();
         tokio::spawn(async move {
-            let selection =
+            let from_client = surround_sel.is_some();
+            let selection = if let Some(sel) = surround_sel {
+                tracing::info!(
+                    "[puntu-engine {id}] convert-selection: from surrounding text {sel:?}"
+                );
+                Some(sel)
+            } else {
                 match tokio::task::spawn_blocking(move || read_primary_selection(id)).await {
                     Ok(sel) => sel,
                     Err(e) => {
                         tracing::warn!("[puntu-engine {id}] convert-selection task failed: {e}");
                         None
                     }
-                };
+                }
+            };
             let Some(selection) = selection else {
                 // The silent no-op here is what read as "Ctrl+Shift не работает" — say why.
                 Self::show_hint_shared(&se, &hint_shown, "Puntu: нет выделения").await;
                 return;
             };
             // Stale-PRIMARY guard: nothing NEW is selected — converting the residue of the
-            // previous conversion would re-insert the old word at the caret.
-            if is_stale_selection(&last_converted.lock().unwrap().clone(), &selection) {
+            // previous conversion would re-insert the old word at the caret. Only for the
+            // PRIMARY path: the client-reported selection is authoritative and fresh.
+            if !from_client
+                && is_stale_selection(&last_converted.lock().unwrap().clone(), &selection)
+            {
                 tracing::info!(
                     "[puntu-engine {id}] convert-selection: PRIMARY still holds the previous \
                      pair ({selection:?}) — skipping"
@@ -1168,6 +1199,7 @@ impl IBusEngine for PuntuEngine {
         debug!("[puntu-engine {}] disable", self.id);
         // Switching away from the engine must not eat the word that only exists in preedit.
         self.flush_all(&se).await;
+        self.surrounding = None;
         self.tap.hard_reset();
         Ok(())
     }
@@ -1194,6 +1226,7 @@ impl IBusEngine for PuntuEngine {
         self.flush_all(&se).await;
         // Drop any half-tracked modifier tap: a Ctrl held across a focus change (Ctrl+click,
         // window switch) must not fire the mode toggle when it's finally released.
+        self.surrounding = None;
         self.tap.hard_reset();
         Ok(())
     }
@@ -1210,6 +1243,21 @@ impl IBusEngine for PuntuEngine {
         // "стирается слово"). Commit them at the spot where the user already saw them instead.
         self.flush_all(&se).await;
         self.tap.hard_reset();
+        Ok(())
+    }
+
+    fn set_surrounding_text(
+        &mut self,
+        text: String,
+        cursor_pos: u32,
+        anchor_pos: u32,
+    ) -> fdo::Result<()> {
+        tracing::debug!(
+            "[puntu-engine {}] surrounding: cursor={cursor_pos} anchor={anchor_pos} len={}",
+            self.id,
+            text.chars().count()
+        );
+        self.surrounding = Some((text, cursor_pos, anchor_pos));
         Ok(())
     }
 
@@ -2050,6 +2098,18 @@ mod tests {
         // The mode-toggle key parses CapsLock and Pause.
         assert_eq!(parse_hotkey("CapsLock").map(|h| h.keysym), Some(Keysym::Caps_Lock));
         assert_eq!(parse_hotkey("Pause").map(|h| h.keysym), Some(Keysym::Pause));
+    }
+
+    #[test]
+    fn surrounding_selection_extracts_the_span() {
+        // Cursor/anchor in either order; char (not byte) offsets — Cyrillic-safe.
+        let sur = Some(("привет мир".to_string(), 7, 10));
+        assert_eq!(surrounding_selection(&sur).as_deref(), Some("мир"));
+        let sur = Some(("привет мир".to_string(), 10, 7));
+        assert_eq!(surrounding_selection(&sur).as_deref(), Some("мир"));
+        // No selection when the bounds coincide, or nothing was reported.
+        assert_eq!(surrounding_selection(&Some(("привет".to_string(), 3, 3))), None);
+        assert_eq!(surrounding_selection(&None), None);
     }
 
     #[test]
