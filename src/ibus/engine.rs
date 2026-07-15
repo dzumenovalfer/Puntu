@@ -300,9 +300,14 @@ pub struct PuntuEngine {
 /// Shared manual-conversion counter: converted word → (count, last typed form).
 type ConvertCounts = Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, String)>>>;
 
-/// The last (original → converted) selection pair, shared across engines. Used to refuse
-/// converting a STALE primary selection — see [`is_stale_selection`].
-type LastConverted = Arc<std::sync::Mutex<Option<(String, String)>>>;
+/// The last (original → converted, when) selection triple, shared across engines. Used to
+/// refuse converting a STALE primary selection — see [`is_stale_selection`].
+type LastConverted = Arc<std::sync::Mutex<Option<(String, String, std::time::Instant)>>>;
+
+/// How long after a conversion a matching PRIMARY text is treated as residue. The harmful
+/// replay (tap while typing the next word) happens within seconds; a DELIBERATE re-selection
+/// of the same word later must convert again — «стало хуже переводить» when it didn't.
+const STALE_PAIR_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The selected span of the client-reported surrounding text, if any: the chars between
 /// `cursor` and `anchor` (either order). `None` when there is no selection.
@@ -323,10 +328,10 @@ fn surrounding_selection(sur: &Option<(String, u32, u32)>) -> Option<String> {
 /// was there before. Converting that residue re-inserted the previous word at the caret —
 /// the reported «вставка переведённого слова при наборе следующего». The uinput daemon has
 /// carried the same guard since M2 (capture.rs: "selection matches last converted pair").
-fn is_stale_selection(last: &Option<(String, String)>, sel: &str) -> bool {
-    last.as_ref().is_some_and(|(orig, conv)| {
+fn is_stale_selection(last: &Option<(String, String, std::time::Instant)>, sel: &str) -> bool {
+    last.as_ref().is_some_and(|(orig, conv, when)| {
         let s = sel.trim();
-        s == orig.trim() || s == conv.trim()
+        when.elapsed() <= STALE_PAIR_WINDOW && (s == orig.trim() || s == conv.trim())
     })
 }
 
@@ -579,6 +584,7 @@ impl PuntuEngine {
         let surround_sel = surrounding_selection(&self.surrounding.take());
         let se = se.to_owned();
         tokio::spawn(async move {
+            let from_client = surround_sel.is_some();
             let selection = if let Some(sel) = surround_sel {
                 tracing::info!(
                     "[puntu-engine {id}] convert-selection: from surrounding text {sel:?}"
@@ -598,11 +604,13 @@ impl PuntuEngine {
                 Self::show_hint_shared(&se, &hint_shown, "Puntu: нет выделения").await;
                 return;
             };
-            // Stale-selection guard: nothing NEW is selected — converting the residue of
-            // the previous conversion would re-insert the old word at the caret. Applies to
-            // both sources: PRIMARY keeps the old text after a replacement, and clients can
-            // re-report the old bounds too.
-            if is_stale_selection(&last_converted.lock().unwrap().clone(), &selection) {
+            // Stale-PRIMARY guard: PRIMARY keeps the old text after a replacement, so a tap
+            // with nothing newly selected would re-insert the previous word at the caret.
+            // The client-reported selection skips it — it is fresh by construction (one-shot
+            // and voided by any key press or reset).
+            if !from_client
+                && is_stale_selection(&last_converted.lock().unwrap().clone(), &selection)
+            {
                 tracing::info!(
                     "[puntu-engine {id}] convert-selection: PRIMARY still holds the previous \
                      pair ({selection:?}) — skipping"
@@ -658,7 +666,8 @@ impl PuntuEngine {
             tracing::info!(
                 "[puntu-engine {id}] convert-selection: {selection:?} → {converted:?}"
             );
-            *last_converted.lock().unwrap() = Some((selection.clone(), converted.clone()));
+            *last_converted.lock().unwrap() =
+                Some((selection.clone(), converted.clone(), std::time::Instant::now()));
             forward_backspace(&se).await;
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             // A selection conversion is a manual conversion — feed the repeat counter
@@ -1208,12 +1217,17 @@ impl IBusEngine for PuntuEngine {
 
     async fn focus_in(
         &mut self,
-        _se: SignalEmitter<'_>,
+        se: SignalEmitter<'_>,
         _server: &ObjectServer,
     ) -> fdo::Result<()> {
         debug!("[puntu-engine {}] focus_in", self.id);
         // Same reset as `enable`: purpose describes the field being left otherwise.
         self.purpose = 0;
+        // Some clients only start reporting surrounding text after the engine asks for
+        // it — the static ActiveSurroundingText property alone is not always honoured.
+        let _ = se
+            .emit("org.freedesktop.IBus.Engine", "RequireSurroundingText", &())
+            .await;
         Ok(())
     }
 
@@ -1255,11 +1269,18 @@ impl IBusEngine for PuntuEngine {
         cursor_pos: u32,
         anchor_pos: u32,
     ) -> fdo::Result<()> {
-        tracing::debug!(
-            "[puntu-engine {}] surrounding: cursor={cursor_pos} anchor={anchor_pos} len={}",
-            self.id,
-            text.chars().count()
-        );
+        if cursor_pos != anchor_pos {
+            tracing::info!(
+                "[puntu-engine {}] surrounding selection: cursor={cursor_pos} anchor={anchor_pos}",
+                self.id
+            );
+        } else {
+            tracing::debug!(
+                "[puntu-engine {}] surrounding: caret={cursor_pos} len={}",
+                self.id,
+                text.chars().count()
+            );
+        }
         self.surrounding = Some((text, cursor_pos, anchor_pos));
         Ok(())
     }
@@ -2117,7 +2138,8 @@ mod tests {
 
     #[test]
     fn stale_primary_selection_is_refused() {
-        let last = Some(("drk".to_string(), "вкл".to_string()));
+        let now = std::time::Instant::now();
+        let last = Some(("drk".to_string(), "вкл".to_string(), now));
         // Both halves of the previous pair are residue, not a fresh selection.
         assert!(is_stale_selection(&last, "drk"));
         assert!(is_stale_selection(&last, "вкл"));
@@ -2125,6 +2147,13 @@ mod tests {
         // A genuinely new selection converts as usual.
         assert!(!is_stale_selection(&last, "ghbdtn"));
         assert!(!is_stale_selection(&None, "drk"));
+        // The guard expires: re-selecting the same word later must convert again.
+        let old = Some((
+            "drk".to_string(),
+            "вкл".to_string(),
+            now - (STALE_PAIR_WINDOW + std::time::Duration::from_secs(1)),
+        ));
+        assert!(!is_stale_selection(&old, "drk"));
     }
 
     #[test]
