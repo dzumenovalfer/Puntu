@@ -141,5 +141,18 @@ fn print_help() {
 
 fn init_logging() {
     let filter = EnvFilter::try_from_env("PUNTU_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).with_target(false).init();
+    // ibus-daemon swallows the engine's stderr, so diagnosing anything used to require a
+    // wrapper script. Log to a file instead (truncated on every start — one session's worth):
+    // /tmp/puntu-engine.log is the first thing to look at when something misbehaves.
+    match std::fs::File::create("/tmp/puntu-engine.log") {
+        Ok(file) => {
+            fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+        }
+        Err(_) => fmt().with_env_filter(filter).with_target(false).init(),
+    }
 }

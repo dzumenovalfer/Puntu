@@ -1,6 +1,6 @@
 [package]
 name = "puntu"
-version = "0.9.3"
+version = "0.9.4"
 edition = "2021"
 description = "Punto Switcher analog for Ubuntu (Wayland/GNOME): automatic keyboard layout corrector"
 license = "MIT"

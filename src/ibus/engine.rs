@@ -573,12 +573,12 @@ impl PuntuEngine {
         let counts = Arc::clone(&self.convert_counts);
         let last_converted = Arc::clone(&self.last_converted);
         let suggest_after = self.suggest_after;
-        // The IM-native selection, straight from the client. Snapshot before spawning —
-        // it lives on `self`, the task doesn't.
-        let surround_sel = surrounding_selection(&self.surrounding);
+        // The IM-native selection, straight from the client — consumed one-shot: if the
+        // client never re-reports after our replacement, a second tap must NOT reuse the
+        // old bounds (that re-inserted the previous word).
+        let surround_sel = surrounding_selection(&self.surrounding.take());
         let se = se.to_owned();
         tokio::spawn(async move {
-            let from_client = surround_sel.is_some();
             let selection = if let Some(sel) = surround_sel {
                 tracing::info!(
                     "[puntu-engine {id}] convert-selection: from surrounding text {sel:?}"
@@ -598,12 +598,11 @@ impl PuntuEngine {
                 Self::show_hint_shared(&se, &hint_shown, "Puntu: нет выделения").await;
                 return;
             };
-            // Stale-PRIMARY guard: nothing NEW is selected — converting the residue of the
-            // previous conversion would re-insert the old word at the caret. Only for the
-            // PRIMARY path: the client-reported selection is authoritative and fresh.
-            if !from_client
-                && is_stale_selection(&last_converted.lock().unwrap().clone(), &selection)
-            {
+            // Stale-selection guard: nothing NEW is selected — converting the residue of
+            // the previous conversion would re-insert the old word at the caret. Applies to
+            // both sources: PRIMARY keeps the old text after a replacement, and clients can
+            // re-report the old bounds too.
+            if is_stale_selection(&last_converted.lock().unwrap().clone(), &selection) {
                 tracing::info!(
                     "[puntu-engine {id}] convert-selection: PRIMARY still holds the previous \
                      pair ({selection:?}) — skipping"
@@ -1025,6 +1024,9 @@ impl IBusEngine for PuntuEngine {
         if keyval != Keysym::Caps_Lock && !released {
             // Any non-modifier press while a tap was armed turns it into a chord — cancel.
             self.tap.cancel();
+            // …and it is about to change the text, so the client-reported surrounding
+            // text (with its selection bounds) is no longer true.
+            self.surrounding = None;
         }
         // We only act on key presses. Releases pass through unchanged.
         if released {
@@ -1242,6 +1244,7 @@ impl IBusEngine for PuntuEngine {
         // is what made the last typed word visibly VANISH on a click ("слово пропало",
         // "стирается слово"). Commit them at the spot where the user already saw them instead.
         self.flush_all(&se).await;
+        self.surrounding = None;
         self.tap.hard_reset();
         Ok(())
     }
