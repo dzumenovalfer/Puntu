@@ -765,31 +765,45 @@ fn handle_hotkey(
     Ok(())
 }
 
-/// Handle a modifier tap: **Ctrl** converts the current word, **Ctrl+Shift** converts the
-/// selection (Punto-style triggers that work without a Pause/Break key).
+/// Handle a modifier tap. Which gesture does what is **configured**, not hard-coded: the
+/// settings window writes `ibus_hotkeys.mode_toggle` / `convert_last` and offers `Alt+Shift`,
+/// `Ctrl+Alt`, `Super` alongside `Ctrl` and `Ctrl+Shift`. This front-end used to test for
+/// Ctrl and Ctrl+Shift literally, so picking any other gesture silently did nothing here.
+///
+/// The mode-toggle gesture switches the SYSTEM layout on this front-end — the uinput daemon
+/// has no internal EN/RU mode of its own, so that is its counterpart of the engine's toggle.
 fn handle_tap(
     mods: Mods,
     em: &mut Emitter,
     last_selection: &mut Option<LastSelection>,
     shared: &State,
 ) -> Result<()> {
-    let only_ctrl = mods.ctrl && !mods.shift && !mods.alt && !mods.meta;
-    let ctrl_shift = mods.ctrl && mods.shift && !mods.alt && !mods.meta;
-    if !only_ctrl && !ctrl_shift {
+    let (dry, mode_toggle, convert_last) = {
+        let s = shared.lock().unwrap();
+        (
+            s.cfg.dry_run,
+            crate::config::parse_tap_combo(&s.cfg.ibus_hotkeys.mode_toggle),
+            crate::config::parse_tap_combo(&s.cfg.ibus_hotkeys.convert_last),
+        )
+    };
+    let tapped = crate::config::ModCombo::from(mods);
+    let is_mode_toggle = mode_toggle == Some(tapped);
+    let is_convert = convert_last == Some(tapped);
+    if !is_mode_toggle && !is_convert {
         return Ok(());
     }
-    let dry = shared.lock().unwrap().cfg.dry_run;
 
-    if only_ctrl {
-        // Ctrl tap → toggle the system keyboard layout (En↔Ru), like the language-switch key.
+    if is_mode_toggle {
+        // Mode-toggle tap → switch the system keyboard layout (En↔Ru), like the
+        // language-switch key.
         if dry {
             tracing::info!("[dry-run] would switch keyboard layout");
         } else {
             em.switch_layout()?;
-            tracing::info!("tap Ctrl → switched keyboard layout");
+            tracing::info!("tap {tapped:?} → switched keyboard layout");
         }
     } else {
-        // Ctrl+Shift tap → convert the selection. Guard against re-converting after the previous
+        // Convert-selection tap. Guard against re-converting after the previous
         // conversion: PRIMARY may still hold the original OR may already hold the converted form
         // (Mutter re-highlights the pasted text). Both must skip, or we'd silently back-convert
         // `руддщ`→`hello` and paste the original back over what we just changed.
@@ -800,7 +814,7 @@ fn handle_tap(
         if let Some(prev) = last_selection.as_ref() {
             if sel == prev.original || sel == prev.converted {
                 tracing::debug!(
-                    "Ctrl+Shift: selection matches last converted pair — skipping (PRIMARY is {})",
+                    "convert tap: selection matches last converted pair — skipping (PRIMARY is {})",
                     if sel == prev.original { "original" } else { "converted" }
                 );
                 return Ok(());

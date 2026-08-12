@@ -38,8 +38,10 @@ pub struct Flags {
     pub lang: Arc<Mutex<Lang>>,
 }
 
-/// Run the daemon. `device` optionally overrides keyboard autodetection.
-pub fn run(cfg: Config, device: Option<String>) -> Result<()> {
+/// Run the daemon. `device` optionally overrides keyboard autodetection; `config_path`
+/// overrides where the config is read from, scaffolded to, and watched (`--config`).
+pub fn run(cfg: Config, device: Option<String>, config_path: Option<std::path::PathBuf>) -> Result<()> {
+    let config_path = config_path.unwrap_or_else(Config::path);
     // Two layers of defense against running two daemons concurrently — they would fight over
     // every correction (double backspace / double paste, lost keystrokes).
     //
@@ -60,8 +62,8 @@ pub fn run(cfg: Config, device: Option<String>) -> Result<()> {
     // persist a transient CLI override like `--dry-run`.
     let dir = config::config_dir();
     std::fs::create_dir_all(&dir).ok();
-    if !Config::path().exists() {
-        let _ = Config::default().save();
+    if !config_path.exists() {
+        let _ = Config::default().save_to(&config_path);
     }
 
     let models = Models::load(&dir);
@@ -107,8 +109,9 @@ pub fn run(cfg: Config, device: Option<String>) -> Result<()> {
 
     let emitter = emitter::Emitter::new()?;
 
-    // (No layout watcher: the active layout is read fresh from `mru-sources` per word, which is
-    // authoritative — `gsettings current` is not reliably updated when Mutter switches layout.)
+    // (The active layout comes from `mru-sources`, which is authoritative — `gsettings current`
+    // is not reliably updated when Mutter switches layout. It is polled into `flags.lang` by
+    // the watcher spawned below, so the capture loop never forks a process in its hot path.)
 
     // Mouse click watcher (read-only) for context invalidation.
     if let Some((_, pointer)) = devices::find_pointer() {
@@ -128,7 +131,8 @@ pub fn run(cfg: Config, device: Option<String>) -> Result<()> {
     // Config + dictionary hot-reload.
     {
         let shared = shared.clone();
-        std::thread::spawn(move || reload_watcher(shared));
+        let config_path = config_path.clone();
+        std::thread::spawn(move || reload_watcher(shared, config_path));
     }
 
     // IPC control socket.
@@ -188,12 +192,19 @@ fn acquire_instance_lock() -> Result<std::fs::File> {
     Ok(file)
 }
 
-/// Poll `gsettings` every 100ms and publish the active layout to the shared cache. Errors
-/// (gsettings hung, GNOME restarting) are swallowed — the previous cached value remains in
-/// effect so the capture loop never stalls waiting for a system service.
+/// Poll `gsettings` and publish the active layout to the shared cache. Errors (gsettings
+/// hung, GNOME restarting) are swallowed — the previous cached value remains in effect so the
+/// capture loop never stalls waiting for a system service.
+///
+/// Each poll forks a `gsettings` process, so the interval is a real cost, not a detail: at
+/// the original 100 ms this was ~864 000 processes a day for a value that changes when the
+/// user presses the layout-switch key. A second is far below human switching speed and three
+/// orders of magnitude cheaper.
+const LAYOUT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn layout_watcher(cache: Arc<Mutex<Lang>>) {
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(LAYOUT_POLL_INTERVAL);
         if let Ok(Some(l)) = layout::active_lang() {
             if let Ok(mut c) = cache.lock() {
                 if *c != l {
@@ -218,13 +229,18 @@ impl PendingReload {
         self.config || self.dict || self.models
     }
 
-    /// Classify a changed path: which subsystem(s) does it belong to?
-    fn observe(&mut self, path: &std::path::Path) {
+    /// Classify a changed path: which subsystem(s) does it belong to? `config_path` is the
+    /// config file actually in use — matched in full, since `--config` can point anywhere and
+    /// need not be called `config.toml`.
+    fn observe(&mut self, path: &std::path::Path, config_path: &std::path::Path) {
+        if path == config_path {
+            self.config = true;
+            return;
+        }
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             return;
         };
         match name {
-            "config.toml" => self.config = true,
             // FST → rebuild language models.
             "russian.fst" => self.models = true,
             // Commands list is language-neutral and only lives in the dict.
@@ -256,10 +272,10 @@ impl PendingReload {
 /// the few microseconds of an `Arc` swap — not the few hundred milliseconds of disk I/O. Before
 /// this split, every config-dir change paused keystroke processing long enough for the kernel
 /// evdev queue to overflow and **drop events** under fast typing.
-fn apply_reload(shared: &State, pending: &PendingReload) {
+fn apply_reload(shared: &State, pending: &PendingReload, config_path: &std::path::Path) {
     let started = std::time::Instant::now();
     let new_cfg = if pending.config {
-        match Config::load() {
+        match Config::load_from(config_path) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!("config reload failed (keeping old): {e}");
@@ -305,7 +321,7 @@ fn apply_reload(shared: &State, pending: &PendingReload) {
 /// **debounced** (300 ms trailing edge) and classified by filename so only the affected
 /// subsystem reloads — e.g. editing `manual.txt` no longer rebuilds the 35 MB language models.
 /// All disk I/O happens outside the `Shared` mutex so the capture loop never stalls.
-fn reload_watcher(shared: State) {
+fn reload_watcher(shared: State, config_path: std::path::PathBuf) {
     use notify::{RecursiveMode, Watcher};
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
@@ -327,6 +343,13 @@ fn reload_watcher(shared: State) {
     if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err() {
         return;
     }
+    // A `--config` file outside the config dir needs its own watch, or edits to the file the
+    // daemon actually reads would never be noticed.
+    if let Some(cfg_dir) = config_path.parent() {
+        if cfg_dir != dir && watcher.watch(cfg_dir, RecursiveMode::NonRecursive).is_err() {
+            tracing::warn!("cannot watch {} for config edits", cfg_dir.display());
+        }
+    }
 
     let mut pending = PendingReload::default();
     let mut deadline: Option<Instant> = None;
@@ -338,7 +361,7 @@ fn reload_watcher(shared: State) {
         match rx.recv_timeout(timeout) {
             Ok(Ok(ev)) => {
                 for p in &ev.paths {
-                    pending.observe(p);
+                    pending.observe(p, &config_path);
                 }
                 // Editor swap-files etc. don't match any subsystem — don't even arm the timer.
                 if pending.any() {
@@ -350,7 +373,7 @@ fn reload_watcher(shared: State) {
             }
             Err(RecvTimeoutError::Timeout) => {
                 if pending.any() {
-                    apply_reload(&shared, &pending);
+                    apply_reload(&shared, &pending, &config_path);
                     pending = PendingReload::default();
                 }
                 deadline = None;
@@ -365,9 +388,10 @@ mod tests {
     use super::PendingReload;
     use std::path::PathBuf;
 
+    /// `notify` reports absolute paths, so the helper resolves `name` inside the config dir.
     fn observe(name: &str) -> PendingReload {
         let mut p = PendingReload::default();
-        p.observe(&PathBuf::from(name));
+        p.observe(&crate::config::config_dir().join(name), &crate::config::Config::path());
         p
     }
 
@@ -412,6 +436,22 @@ mod tests {
     fn observes_config_and_fst() {
         assert!(observe("config.toml").config);
         assert!(observe("russian.fst").models);
+    }
+
+    #[test]
+    fn config_is_matched_by_full_path_not_by_name() {
+        // `--config` can point anywhere and need not be called `config.toml`: the daemon used
+        // to reload `Config::load()` (the default path) regardless, silently moving itself
+        // back to ~/.config/puntu/config.toml on the first reload.
+        let custom = PathBuf::from("/tmp/puntu-test/my-settings.toml");
+        let mut p = PendingReload::default();
+        p.observe(&custom, &custom);
+        assert!(p.config, "the config file actually in use must trigger a reload");
+
+        // …and the default one, which this daemon is not reading, must not.
+        let mut p = PendingReload::default();
+        p.observe(&crate::config::Config::path(), &custom);
+        assert!(!p.config, "an unrelated config.toml must not trigger a reload");
     }
 
     #[test]

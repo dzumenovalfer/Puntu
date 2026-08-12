@@ -229,17 +229,30 @@ impl Detector {
 
         // Strong asymmetric signal: `cur` contains command-shaped symbols but `alt` is clean
         // alphabetic letters. In a wrong-layout word those symbols are real Cyrillic letters
-        // (`.`=ю, `,`=б, `;`=ж, `'`=э, `[`=х, `]`=ъ, `` ` ``=ё), so the n-gram score for `cur` is
-        // noise (the trigrams involving `,`/`.`/`;` never appear in either language model and all
-        // hit the smoothing floor). Requiring a large `score_alt - score_cur` delta would be
-        // meaningless here. Convert as long as `alt` isn't catastrophically unlikely.
+        // (`.`=ю, `,`=б, `;`=ж, `'`=э, `[`=х, `]`=ъ, `` ` ``=ё), so scoring `cur` as-is is noise:
+        // the trigrams involving `,`/`.`/`;` never appear in either language model and all hit
+        // the smoothing floor, which is what makes the plain delta comparison meaningless here.
+        //
+        // The fix is to compare the LETTERS-ONLY projections instead of loosening the gate.
+        // Stripping the punctuation keys from `cur` (`yflj,yj` → `yfljyj`) leaves two strings
+        // both models can score honestly, so the ordinary thresholds keep their meaning. The
+        // previous "loose floor" (`alt_valid_min - 2.5` = -5.8) sat BELOW the model's own
+        // unseen-trigram default (ln(0.5/33) = -4.19), so it accepted essentially any string:
+        // every out-of-dictionary word followed by a `.` or `,` — a name, a brand, a technical
+        // term — was rewritten into Cyrillic gibberish (`puntu.` → `згтегю`).
         if cur_has_symbols && !alt_has_symbols {
-            let loose_floor = self.cfg.alt_valid_min - 2.5;
+            let letters_cur = self.models.model(cur_lang).score(&cur_letters);
+            let letters_alt = self.models.model(other).score(&alt_letters);
             tracing::debug!(
-                "asymmetric: cur={:?} score={:.2}, alt={:?} score={:.2} (floor={:.2})",
-                word.cur, score_cur, word.alt, score_alt, loose_floor
+                "asymmetric: cur={:?}/{:?} score={:.2}, alt={:?}/{:?} score={:.2} \
+                 (need>{:.2}, alt>={:.2})",
+                word.cur, cur_letters, letters_cur,
+                word.alt, alt_letters, letters_alt,
+                self.cfg.switch_delta, self.cfg.alt_valid_min
             );
-            if score_alt >= loose_floor {
+            if letters_alt - letters_cur > self.cfg.switch_delta
+                && letters_alt >= self.cfg.alt_valid_min
+            {
                 return Decision::Convert { to: other };
             }
             return Decision::Leave;
@@ -497,6 +510,41 @@ mod tests {
                 "key {code} ({:?}) must not convert",
                 w.cur
             );
+        }
+    }
+
+    /// A word typed on the EN layout, built straight from its characters' physical keys.
+    fn typed_en(s: &str) -> CompletedWord {
+        let keys: Vec<(u16, bool)> = s
+            .chars()
+            .map(|c| crate::keymap::find_key(c, Lang::En).expect("char is on the US layout"))
+            .collect();
+        CompletedWord::from_keys(keys, Lang::En, true)
+    }
+
+    #[test]
+    fn punctuation_key_word_needs_a_plausible_alt() {
+        // The real bundled word lists — this branch is entirely about how the n-gram scores
+        // compare, so the toy lists used by the other tests would prove nothing.
+        let det = Detector::new(Models::builtin(), DetectConfig::default());
+        let dict = UserDict::empty("/tmp/x-asym".into());
+
+        // Wrong-layout words whose punctuation keys are real Cyrillic letters still convert:
+        // `,`=б, `.`=ю are part of the word, and the Russian reading is clearly a word.
+        for s in ["yflj,yj", "ghbdtn."] {
+            assert_eq!(
+                det.decide(&typed_en(s), &dict),
+                Decision::Convert { to: Lang::Ru },
+                "{s} must still convert"
+            );
+        }
+
+        // …but an out-of-dictionary Latin word followed by a `.`/`,` must be LEFT ALONE.
+        // The old gate (`alt_valid_min - 2.5` = -5.8) sat below the model's own unseen-trigram
+        // default (-4.19), so it accepted any string at all and rewrote every name, brand and
+        // technical term that ended a sentence into gibberish (`puntu.` → `згтегю`).
+        for s in ["puntu.", "alfer.", "serde.", "evdev.", "myword."] {
+            assert_eq!(det.decide(&typed_en(s), &dict), Decision::Leave, "{s} must be left alone");
         }
     }
 

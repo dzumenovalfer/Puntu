@@ -50,11 +50,36 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_zoom_factor(1.1);
+            disable_ime(&cc.egui_ctx);
             let (accent, dark) = read_system_theme();
             apply_adwaita_theme(&cc.egui_ctx, accent, dark);
             Ok(Box::new(App::new()))
         }),
     )
+}
+
+/// Наши поля ввода не должны проходить через движок ввода — в том числе через наш
+/// собственный.
+///
+/// Puntu держит набираемое слово в preedit, то есть композиция активна почти всегда. А
+/// egui-winit на каждом кадре с событиями зовёт `set_ime_cursor_area`, от которого winit на
+/// Wayland присылает пустой `Ime::Preedit("")`; егешная защита от такого события работает
+/// только когда композиции НЕТ, поэтому здесь она не срабатывала и preedit удалялся из поля
+/// — набранное исчезало на глазах.
+///
+/// Отключаем окно как IME-клиента целиком: тогда движок про эти поля просто не узнаёт и они
+/// получают обычные события клавиш.
+///
+/// **Не `IMEPurpose::Password`.** Он тоже делал движок прозрачным (`is_passthrough`), но
+/// ценой того, что в IBus движок ОДИН на все контексты ввода: purpose, объявленный нашим
+/// окном, уносил в прозрачность вообще весь ввод в системе, и Puntu «переставал работать»
+/// везде, пока окно настроек открыто. `IMEAllowed(false)` действует только на наше окно.
+///
+/// Команду приходится повторять: egui-winit пересчитывает разрешение IME каждый кадр
+/// (`allow_ime = ime.is_some()`) и включает его обратно, как только поле получает фокус —
+/// см. вызов в `ui()`.
+fn disable_ime(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(false));
 }
 
 /// Другой живой `puntu-app` (кроме нас)? Зомби не считаются (`--runstates` без Z):
@@ -225,20 +250,57 @@ impl Action {
     }
 }
 
+/// What the status dot in the headerbar is telling the user.
+#[derive(Clone, Copy, PartialEq)]
+enum Engine {
+    /// Puntu is the active input source and running the settings on disk.
+    Active,
+    /// Settings changed; the engine restart that applies them is queued.
+    Pending,
+    /// Restart in flight.
+    Restarting,
+    /// Puntu is not the active input source, or the restart failed.
+    Off,
+}
+
+impl Engine {
+    /// (dot colour, label). Adwaita's success/warning/error hues.
+    fn look(self) -> (egui::Color32, &'static str) {
+        match self {
+            Engine::Active => (egui::Color32::from_rgb(0x2e, 0xc2, 0x7e), "активен"),
+            Engine::Pending => (egui::Color32::from_rgb(0xe5, 0xa5, 0x0a), "применяю…"),
+            Engine::Restarting => (egui::Color32::from_rgb(0xe5, 0xa5, 0x0a), "перезапуск…"),
+            Engine::Off => (egui::Color32::from_rgb(0xe0, 0x1b, 0x24), "выключен"),
+        }
+    }
+}
+
+/// How long to wait after the last change before restarting the engine. Long enough that
+/// dragging a slider through twenty values is one restart, short enough to feel automatic.
+const AUTO_APPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(1200);
+
 struct App {
     cfg: Config,
     dict: UserDict,
     tab: Tab,
     capture: Option<Capture>,
-    /// Config changed since the engine was last (re)started.
-    dirty: bool,
+    /// Engine state shown by the headerbar dot.
+    engine: Engine,
+    /// When the queued auto-restart should fire (set on every saved change).
+    apply_at: Option<std::time::Instant>,
+    /// Live "is Puntu the active input source?" polling, so the dot stays honest when the
+    /// user switches input sources from outside this window.
+    engine_rx: mpsc::Receiver<bool>,
     search: String,
     new_word: String,
     status: String,
     /// remember_key value before it was switched off, to restore on re-enable.
     remember_prev: String,
     /// Result channel of the engine-restart thread (None = no restart in flight).
-    restart_rx: Option<mpsc::Receiver<String>>,
+    restart_rx: Option<mpsc::Receiver<(bool, String)>>,
+    /// Result channel of the file chooser: `Some((is_export, path))`, or `None` when the user
+    /// cancelled. Runs off the UI thread — a modal dialog must not freeze the window.
+    file_rx: Option<mpsc::Receiver<Option<(bool, std::path::PathBuf)>>>,
     /// Peak modifiers seen during an active capture — releasing them all without a plain
     /// key assigns a modifier TAP (`Ctrl`, `Alt+Shift`, …) instead of a hotkey.
     capture_peak: egui::Modifiers,
@@ -295,17 +357,34 @@ impl App {
                 std::thread::sleep(std::time::Duration::from_secs(3));
             }
         });
+        // Is Puntu the active input source? Cheap poll (one subprocess every few seconds),
+        // the same check the tray does.
+        let (engine_tx, engine_rx) = mpsc::channel();
+        std::thread::spawn(move || loop {
+            let active = std::process::Command::new("ibus")
+                .arg("engine")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "puntu")
+                .unwrap_or(false);
+            if engine_tx.send(active).is_err() {
+                return; // window closed
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        });
         App {
             cfg,
             dict,
             tab: Tab::Settings,
             capture: None,
-            dirty: false,
+            engine: Engine::Active,
+            apply_at: None,
+            engine_rx,
             search: String::new(),
             new_word: String::new(),
             status: String::new(),
             remember_prev,
             restart_rx: None,
+            file_rx: None,
             capture_peak: egui::Modifiers::NONE,
             dict_refreshed: std::time::Instant::now(),
             last_primary: String::new(),
@@ -322,13 +401,21 @@ impl App {
         self.capture_peak = egui::Modifiers::NONE;
     }
 
+    /// Persist the config and queue the engine restart that applies it. The engine reads its
+    /// settings once at startup, so a saved change means nothing until it restarts — leaving
+    /// that to a button the user had to notice is why changed settings looked like they did
+    /// nothing.
     fn save_cfg(&mut self) {
         match self.cfg.save_to(&Config::path()) {
             Ok(()) => {
-                self.dirty = true;
+                self.apply_at = Some(std::time::Instant::now() + AUTO_APPLY_DELAY);
+                self.engine = Engine::Pending;
                 self.status.clear();
             }
-            Err(e) => self.status = format!("Не удалось сохранить: {e}"),
+            Err(e) => {
+                self.engine = Engine::Off;
+                self.status = format!("Не удалось сохранить: {e}");
+            }
         }
     }
 
@@ -342,24 +429,81 @@ impl App {
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let _ = std::process::Command::new("ibus").args(["engine", "puntu"]).status();
-            let active = std::process::Command::new("ibus")
-                .arg("engine")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "puntu")
-                .unwrap_or(false);
-            let _ = tx.send(if ok && active {
-                "Движок перезапущен, Puntu активен".to_string()
-            } else if ok {
-                "Движок перезапущен; выберите Puntu в переключателе раскладок".to_string()
-            } else {
-                "Не удалось перезапустить движок (ibus restart)".to_string()
+            // ibus-daemon comes back asynchronously: setting the engine too early fails with
+            // «Не удалось настроить глобальный модуль», so wait, then retry a few times.
+            let mut active = false;
+            for _ in 0..6 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = std::process::Command::new("ibus").args(["engine", "puntu"]).status();
+                active = std::process::Command::new("ibus")
+                    .arg("engine")
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "puntu")
+                    .unwrap_or(false);
+                if active {
+                    break;
+                }
+            }
+            let _ = tx.send(match (ok, active) {
+                (_, true) => (true, "Настройки применены".to_string()),
+                (true, false) => (
+                    false,
+                    "Движок перезапущен; выберите Puntu в переключателе раскладок".to_string(),
+                ),
+                (false, false) => {
+                    (false, "Не удалось перезапустить движок (ibus restart)".to_string())
+                }
             });
         });
         self.restart_rx = Some(rx);
-        self.dirty = false;
-        self.status = "Перезапускаю движок…".to_string();
+        self.apply_at = None;
+        self.engine = Engine::Restarting;
+    }
+
+    /// Ask for a file with zenity, off the UI thread. `export` switches the dialog to save
+    /// mode. If zenity isn't installed we still export — to a predictable name in `$HOME`,
+    /// reported in the status line — but we can't guess a file to import from.
+    fn pick_file(&mut self, export: bool) {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("zenity");
+            cmd.arg("--file-selection").arg("--title=Словарь Puntu");
+            if export {
+                cmd.args(["--save", "--confirm-overwrite", "--filename=puntu-dictionary.txt"]);
+            }
+            let picked = match cmd.output() {
+                Ok(o) if o.status.success() => {
+                    let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    (!p.is_empty()).then(|| std::path::PathBuf::from(p))
+                }
+                Ok(_) => None, // отмена
+                Err(_) if export => std::env::var_os("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join("puntu-dictionary.txt")),
+                Err(_) => None,
+            };
+            let _ = tx.send(picked.map(|p| (export, p)));
+        });
+        self.file_rx = Some(rx);
+    }
+
+    /// Write every user list to `path`.
+    fn export_dict(&mut self, path: &std::path::Path) {
+        self.status = match std::fs::write(path, self.dict.export()) {
+            Ok(()) => format!("Словарь сохранён: {}", path.display()),
+            Err(e) => format!("Не удалось сохранить словарь: {e}"),
+        };
+    }
+
+    /// Merge an exported file back in. The engine picks the changed list files up by itself.
+    fn import_dict(&mut self, path: &std::path::Path) {
+        self.status = match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| self.dict.import_str(&text).map_err(|e| e.to_string()))
+        {
+            Ok(0) => "В файле не было новых слов".to_string(),
+            Ok(n) => format!("Добавлено слов: {n}"),
+            Err(e) => format!("Не удалось прочитать словарь: {e}"),
+        };
     }
 
     /// Collect dictionary rows across the user lists (built-in seeds excluded).
@@ -422,6 +566,33 @@ impl App {
     }
 }
 
+
+/// The engine-state dot in the headerbar: a small coloured circle plus a word. Deliberately
+/// quiet — it is a status light, not a control. Pulses gently while a restart is in flight so
+/// the user can see that something is happening without a modal or a spinner.
+fn engine_indicator(ui: &mut egui::Ui, state: Engine) {
+    let (color, label) = state.look();
+    let color = if state == Engine::Restarting {
+        // 0.45..1.0 sine — visible movement, no strobing.
+        let t = ui.input(|i| i.time) as f32;
+        ui.ctx().request_repaint();
+        color.gamma_multiply(0.45 + 0.55 * (0.5 + 0.5 * (t * 4.0).sin()))
+    } else {
+        color
+    };
+    ui.horizontal(|ui| {
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, color);
+        ui.label(egui::RichText::new(label).weak().size(11.0));
+        resp.on_hover_text(match state {
+            Engine::Active => "Puntu — активный источник ввода",
+            Engine::Pending => "Настройки сохранены, применяю…",
+            Engine::Restarting => "Перезапускаю движок…",
+            Engine::Off => "Puntu не выбран в переключателе раскладок",
+        });
+    });
+}
 
 /// GNOME-style round titlebar button with a painted glyph.
 #[derive(Clone, Copy)]
@@ -1064,6 +1235,77 @@ impl App {
                 save = true;
             }
 
+            // ============== Как долго слово можно откатить (отдельный раздел) ==============
+            card_plain(ui, "hold_commit", "Окно отката последнего слова", |ui| {
+                row(
+                    ui,
+                    "Держать слово",
+                    "пока слово держится, его можно перевернуть флипом или сменить регистр; \
+                     после этого оно становится обычным текстом",
+                    |ui| {
+                        let mut ms = cfg.hold_commit_ms;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut ms)
+                                    .range(0..=10_000)
+                                    .speed(50.0)
+                                    .suffix(" мс"),
+                            )
+                            .changed()
+                        {
+                            cfg.hold_commit_ms = ms;
+                            save = true;
+                        }
+                    },
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Больше — больше времени на откат. Меньше — меньше шансов, что слово \
+                         уедет туда, куда вы кликнули. 0 — держать без ограничения.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+            });
+
+            // ============== Пороги детектора (для тонкой настройки) ==============
+            card_plain(ui, "detect", "Чувствительность детектора", |ui| {
+                row(ui, "Минимальная длина слова", "короче — не трогаем", |ui| {
+                    let mut n = cfg.detect.min_word_len;
+                    if ui.add(egui::DragValue::new(&mut n).range(1..=8)).changed() {
+                        cfg.detect.min_word_len = n;
+                        save = true;
+                    }
+                });
+                row(ui, "Насколько другая раскладка должна быть лучше", "", |ui| {
+                    let mut v = cfg.detect.switch_delta;
+                    if ui
+                        .add(egui::DragValue::new(&mut v).range(0.0..=5.0).speed(0.1).fixed_decimals(1))
+                        .changed()
+                    {
+                        cfg.detect.switch_delta = v;
+                        save = true;
+                    }
+                });
+                row(ui, "Минимальная «похожесть на слово»", "выше — реже исправляет", |ui| {
+                    let mut v = cfg.detect.alt_valid_min;
+                    if ui
+                        .add(egui::DragValue::new(&mut v).range(-6.0..=0.0).speed(0.1).fixed_decimals(1))
+                        .changed()
+                    {
+                        cfg.detect.alt_valid_min = v;
+                        save = true;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Исправляет лишнее — поднимите оба порога. Пропускает нужное — опустите.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+            });
+
             // ============== Исправление регистра (отдельный раздел) ==============
             let case_prev = &self.case_prev;
             let mut case_card_on = cfg.fix_case || !parse_off(&cfg.ibus_hotkeys.case_key);
@@ -1115,13 +1357,33 @@ impl App {
     }
 
     fn dictionary_tab(&mut self, ui: &mut egui::Ui) {
+        let mut pick: Option<bool> = None;
         ui.horizontal(|ui| {
             ui.label("🔍 Поиск:");
             let out = egui::TextEdit::singleline(&mut self.search)
                 .desired_width(220.0)
                 .show(ui);
             publish_selection(&mut self.last_primary, &out, &self.search);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("Импорт…")
+                    .on_hover_text("Слить словарь из файла (свои слова сохранятся)")
+                    .clicked()
+                {
+                    pick = Some(false);
+                }
+                if ui
+                    .button("Экспорт…")
+                    .on_hover_text("Сохранить все свои слова в один файл")
+                    .clicked()
+                {
+                    pick = Some(true);
+                }
+            });
         });
+        if let Some(export) = pick {
+            self.pick_file(export);
+        }
         ui.horizontal(|ui| {
             ui.label("Новое слово (правильное написание):");
             let add_out = egui::TextEdit::singleline(&mut self.new_word)
@@ -1242,10 +1504,54 @@ impl eframe::App for App {
             self.dict_refreshed = std::time::Instant::now();
         }
 
+        // Our own text fields must not go through an input method — see `disable_ime`.
+        // Re-asserted while a text field has focus, because that is exactly when egui-winit
+        // turns IME back on (`allow_ime = ime.is_some()`).
+        if ui.ctx().text_edit_focused() {
+            disable_ime(ui.ctx());
+        }
+
+        // Is Puntu still the active input source? (Ignored while we are mid-restart, which
+        // owns the indicator until it reports back.)
+        while let Ok(active) = self.engine_rx.try_recv() {
+            if !matches!(self.engine, Engine::Pending | Engine::Restarting) {
+                self.engine = if active { Engine::Active } else { Engine::Off };
+            }
+        }
+
+        // Auto-apply: settings are saved immediately, and the engine restart that makes them
+        // real fires once the user stops changing things.
+        if let Some(at) = self.apply_at {
+            if self.restart_rx.is_none() && std::time::Instant::now() >= at {
+                self.restart_engine();
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
+
+        // File chooser (export/import) finished?
+        if let Some(rx) = &self.file_rx {
+            match rx.try_recv() {
+                Ok(choice) => {
+                    self.file_rx = None;
+                    match choice {
+                        Some((true, path)) => self.export_dict(&path),
+                        Some((false, path)) => self.import_dict(&path),
+                        None => {} // отмена или zenity не установлен
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.file_rx = None,
+            }
+        }
+
         // Engine-restart progress: poll the background thread's answer.
         if let Some(rx) = &self.restart_rx {
             match rx.try_recv() {
-                Ok(msg) => {
+                Ok((ok, msg)) => {
+                    self.engine = if ok { Engine::Active } else { Engine::Off };
                     self.status = msg;
                     self.restart_rx = None;
                 }
@@ -1253,6 +1559,7 @@ impl eframe::App for App {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.engine = Engine::Off;
                     self.status = "Не удалось перезапустить движок".to_string();
                     self.restart_rx = None;
                 }
@@ -1309,6 +1616,8 @@ impl eframe::App for App {
                         if window_button(ui, WinGlyph::Min).clicked() {
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
+                        ui.add_space(6.0);
+                        engine_indicator(ui, self.engine);
                     });
                 });
             });
@@ -1322,15 +1631,9 @@ impl eframe::App for App {
             }))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if self.dirty {
-                        if ui.button("Применить (перезапустить движок)").clicked() {
-                            self.restart_engine();
-                        }
-                    } else if self.restart_rx.is_none() {
-                        ui.label(
-                            egui::RichText::new("Изменения словаря применяются сами").weak(),
-                        );
-                    }
+                    ui.label(
+                        egui::RichText::new("Изменения применяются автоматически").weak(),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(&self.status);
                     });

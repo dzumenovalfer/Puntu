@@ -156,6 +156,10 @@ enum DictOp {
     },
     /// Open a simple dictionary window (zenity): word pairs («привет / ghbdtn»), add, remove.
     Ui,
+    /// Write every user list to one portable file (stdout if no path is given).
+    Export { path: Option<PathBuf> },
+    /// Merge a previously exported file back in (existing words are kept, not duplicated).
+    Import { path: PathBuf },
     /// Remove a word from every list.
     Rm { word: String },
     /// Remove a single learned word.
@@ -175,7 +179,9 @@ fn main() -> Result<()> {
     let cfg = load_config(cli.config.as_deref())?;
 
     match cli.cmd.unwrap_or(Cmd::Run { dry_run: false, device: None }) {
-        Cmd::Run { dry_run, device } => run_daemon(cfg, dry_run, device),
+        Cmd::Run { dry_run, device } => {
+            run_daemon(cfg, dry_run, device, cli.config.clone())
+        }
         Cmd::Stdin => run_stdin(cfg),
         Cmd::Dict { op } => run_dict(op),
         Cmd::Config { op } => run_config(op, cli.config.as_deref()),
@@ -209,19 +215,28 @@ fn run_mode(target: ModeTarget) -> Result<()> {
         // would terminate ourselves mid-command (the previous version of this code did exactly
         // that). The daemon writes its PID to ~/.config/puntu/puntu.pid on startup; if the
         // file's absent or stale, the daemon isn't actually running and there's nothing to do.
-        let pidfile = puntu::config::config_dir().join("puntu.pid");
-        if let Ok(content) = std::fs::read_to_string(&pidfile) {
-            if let Ok(pid) = content.trim().parse::<i32>() {
-                if pid != std::process::id() as i32 {
-                    // SIGTERM the daemon; ignore failures (already dead, etc.).
-                    unsafe {
-                        libc::kill(pid, libc::SIGTERM);
-                    }
-                    // Give it ~200ms to release the keyboard, then check.
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
+        if let Some(pid) = daemon_pid() {
+            // SIGTERM the daemon; ignore failures (already dead, etc.).
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
             }
+            // Give it ~200ms to release the keyboard, then check.
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
+    }
+    /// The PID from the pidfile, but only if it is alive AND really is a puntu daemon.
+    ///
+    /// A pidfile left behind by a crashed daemon eventually names a PID the kernel has handed
+    /// to something else entirely, and signalling that would kill an unrelated process. The
+    /// pidfile is not authoritative on its own — `/proc/<pid>/comm` is.
+    fn daemon_pid() -> Option<i32> {
+        let pidfile = puntu::config::config_dir().join("puntu.pid");
+        let pid: i32 = std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()?;
+        if pid <= 1 || pid == std::process::id() as i32 {
+            return None;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        (comm.trim() == "puntu").then_some(pid)
     }
     fn start_uinput_daemon() -> Result<()> {
         let r = Command::new("systemctl").args(["--user", "start", "puntu.service"]).status();
@@ -269,21 +284,9 @@ fn run_mode(target: ModeTarget) -> Result<()> {
     }
     fn uinput_running() -> bool {
         // Use the pidfile rather than `pgrep -x puntu`: pgrep would match this very process
-        // (we're also named `puntu`), giving a false positive on status. The daemon writes
-        // its pid to ~/.config/puntu/puntu.pid; we check if that PID is actually alive AND is
-        // someone other than us.
-        let pidfile = puntu::config::config_dir().join("puntu.pid");
-        let Ok(content) = std::fs::read_to_string(&pidfile) else {
-            return false;
-        };
-        let Ok(pid) = content.trim().parse::<i32>() else {
-            return false;
-        };
-        if pid == std::process::id() as i32 {
-            return false;
-        }
-        // Signal 0 = check that the process exists without sending anything.
-        unsafe { libc::kill(pid, 0) == 0 }
+        // (we're also named `puntu`), giving a false positive on status. `daemon_pid` checks
+        // both that the PID is alive and that it really is a puntu daemon.
+        daemon_pid().is_some()
     }
 
     match target {
@@ -373,16 +376,26 @@ fn init_logging() {
 // ---- daemon (feature-gated) ----
 
 #[cfg(feature = "daemon")]
-fn run_daemon(mut cfg: Config, dry_run: bool, device: Option<String>) -> Result<()> {
+fn run_daemon(
+    mut cfg: Config,
+    dry_run: bool,
+    device: Option<String>,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
     init_logging();
     if dry_run {
         cfg.dry_run = true;
     }
-    puntu::input::run(cfg, device)
+    puntu::input::run(cfg, device, config_path)
 }
 
 #[cfg(not(feature = "daemon"))]
-fn run_daemon(_cfg: Config, _dry_run: bool, _device: Option<String>) -> Result<()> {
+fn run_daemon(
+    _cfg: Config,
+    _dry_run: bool,
+    _device: Option<String>,
+    _config_path: Option<PathBuf>,
+) -> Result<()> {
     anyhow::bail!("this build has no `daemon` feature; rebuild with default features to run the daemon")
 }
 
@@ -666,10 +679,21 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
             let mut cfg = load_config(path)?;
             // Boolean flags — value parsed as on/off/true/false/1/0.
             let bool_keys = ["dry_run", "paste_convert", "enable_modifier_taps", "fix_case"];
-            // String flags — IBus hotkey names. `undo_key`: keysym name (Pause, F12, Insert,
-            // Menu, ScrollLock, F1..F12). `mode_toggle` / `convert_last`: modifier tap combo
-            // (Ctrl, Shift, Ctrl+Shift, or "none" to disable).
-            let string_keys = ["undo_key", "mode_toggle", "convert_last", "convert_selection_key"];
+            // Numeric flags — durations in ms and counts.
+            let number_keys = ["tap_max_hold_ms", "hold_commit_ms", "suggest_after"];
+            // String flags — IBus hotkey names. `undo_key` / `mode_toggle_key` / `case_key` /
+            // `remember_key` / `convert_selection_key`: a key with optional modifiers
+            // (`Ctrl+grave`, `F12`, `Pause`, `Ctrl+Alt+d`). `mode_toggle` / `convert_last`:
+            // a modifier tap combo (Ctrl, Ctrl+Shift, Alt+Shift, …). "none" disables any of them.
+            let string_keys = [
+                "undo_key",
+                "mode_toggle",
+                "mode_toggle_key",
+                "convert_last",
+                "convert_selection_key",
+                "remember_key",
+                "case_key",
+            ];
             let display = match key.as_str() {
                 "dry_run" => { cfg.dry_run = parse_bool(&value)?; format!("{}", cfg.dry_run) }
                 "paste_convert" => { cfg.paste_convert = parse_bool(&value)?; format!("{}", cfg.paste_convert) }
@@ -678,6 +702,13 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
                 "tap_max_hold_ms" => {
                     cfg.tap_max_hold_ms = value.trim().parse().context("expected milliseconds (e.g. 500)")?;
                     format!("{}", cfg.tap_max_hold_ms)
+                }
+                "hold_commit_ms" => {
+                    cfg.hold_commit_ms = value
+                        .trim()
+                        .parse()
+                        .context("expected milliseconds (e.g. 1500; 0 = hold indefinitely)")?;
+                    format!("{}", cfg.hold_commit_ms)
                 }
                 "suggest_after" => {
                     cfg.learning.suggest_after =
@@ -694,6 +725,7 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
                 other => anyhow::bail!(
                     "unknown config key {other:?}\n\
                      boolean keys: {bool_keys:?}\n\
+                     number keys: {number_keys:?}\n\
                      string keys: {string_keys:?}\n\
                      examples:\n  \
                      puntu config set undo_key 'Ctrl+grave'\n  \
@@ -779,6 +811,29 @@ fn run_dict(op: DictOp) -> Result<()> {
             println!(
                 "learned {word:?} as a recognized {lang} word: typing {other:?} will convert \
                  to {word:?} (picked up within a second — no restart)"
+            );
+        }
+        DictOp::Export { path } => {
+            let text = dict.export();
+            match path {
+                Some(p) => {
+                    std::fs::write(&p, &text)
+                        .with_context(|| format!("writing {}", p.display()))?;
+                    println!("exported to {}", p.display());
+                }
+                // No path → stdout, so it can be piped or redirected.
+                None => print!("{text}"),
+            }
+        }
+        DictOp::Import { path } => {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let added = dict.import_str(&text)?;
+            println!(
+                "imported {} new word(s) from {} (the running engine picks them up within a \
+                 second — no restart)",
+                added,
+                path.display()
             );
         }
         DictOp::Ui => run_dict_ui(&mut dict)?,

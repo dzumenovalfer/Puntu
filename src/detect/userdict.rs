@@ -167,34 +167,22 @@ impl UserDict {
             }
             _ => {}
         }
-        match (kind, lang) {
-            (ListKind::Command, _) => {
-                self.commands.insert(w.clone());
-            }
-            (ListKind::Manual, Lang::Ru) => {
-                self.ru.manual.insert(w.clone());
-            }
-            (ListKind::Manual, Lang::En) => {
-                self.en.manual.insert(w.clone());
-            }
-            (ListKind::Learned, Lang::Ru) => {
-                self.ru.learned.insert(w.clone());
-            }
-            (ListKind::Learned, Lang::En) => {
-                self.en.learned.insert(w.clone());
-            }
-            (ListKind::Force, Lang::Ru) => {
-                self.ru.force.insert(w.clone());
-            }
-            (ListKind::Force, Lang::En) => {
-                self.en.force.insert(w.clone());
-            }
-            (ListKind::Recognized, Lang::Ru) => {
-                self.ru.recognized.insert(w.clone());
-            }
-            (ListKind::Recognized, Lang::En) => {
-                self.en.recognized.insert(w.clone());
-            }
+        let is_new = match (kind, lang) {
+            (ListKind::Command, _) => self.commands.insert(w.clone()),
+            (ListKind::Manual, Lang::Ru) => self.ru.manual.insert(w.clone()),
+            (ListKind::Manual, Lang::En) => self.en.manual.insert(w.clone()),
+            (ListKind::Learned, Lang::Ru) => self.ru.learned.insert(w.clone()),
+            (ListKind::Learned, Lang::En) => self.en.learned.insert(w.clone()),
+            (ListKind::Force, Lang::Ru) => self.ru.force.insert(w.clone()),
+            (ListKind::Force, Lang::En) => self.en.force.insert(w.clone()),
+            (ListKind::Recognized, Lang::Ru) => self.ru.recognized.insert(w.clone()),
+            (ListKind::Recognized, Lang::En) => self.en.recognized.insert(w.clone()),
+        };
+        // Only append a word the list didn't already have. Appending unconditionally grew the
+        // files with duplicate lines every time a word was re-added (the sets dedupe on load,
+        // so nothing ever cleaned them up).
+        if !is_new {
+            return Ok(());
         }
         append_line(&self.dir.join(kind.file_name(lang)), &w)
     }
@@ -228,9 +216,7 @@ impl UserDict {
         }
         if self.commands.remove(&w) {
             // Only persist the user-added portion (drop the built-ins on rewrite).
-            let builtins: HashSet<&str> = BUILTIN_COMMANDS.iter().copied().collect();
-            let extra: Vec<String> =
-                self.commands.iter().filter(|c| !builtins.contains(c.as_str())).cloned().collect();
+            let extra = self.user_words(ListKind::Command, Lang::En);
             write_list(&self.dir.join("commands.txt"), &extra)?;
         }
         Ok(())
@@ -259,9 +245,7 @@ impl UserDict {
     /// Recognized words the **user** added — built-in seeds (api, css, …) filtered out.
     /// What a dictionary UI shows and lets the user delete.
     pub fn user_recognized(&self, lang: Lang) -> Vec<String> {
-        let mut v = persistable(&self.lists(lang).recognized, lang, ListKind::Recognized);
-        v.sort();
-        v
+        self.user_words(ListKind::Recognized, lang)
     }
 
     /// Snapshot a list for display (the `dict list` command).
@@ -277,6 +261,105 @@ impl UserDict {
         v
     }
 
+    /// The user's own words in `kind`/`lang` — built-in seeds (the EN abbreviations, the
+    /// command list) filtered out, sorted. This is what export writes and what a dictionary UI
+    /// should show: the built-ins come back on their own at load time.
+    pub fn user_words(&self, kind: ListKind, lang: Lang) -> Vec<String> {
+        let mut v: Vec<String> = match kind {
+            ListKind::Command => {
+                let builtin: HashSet<&str> = BUILTIN_COMMANDS.iter().copied().collect();
+                self.commands.iter().filter(|c| !builtin.contains(c.as_str())).cloned().collect()
+            }
+            _ => persistable(self.set(lang, kind), lang, kind),
+        };
+        v.sort();
+        v
+    }
+
+    /// Every user list as one portable, hand-editable text file.
+    ///
+    /// Sections are `[<kind> <lang>]`, one word per line — the same shape as the on-disk
+    /// lists, so the file reads like something you could have written yourself. Built-in seeds
+    /// are excluded: importing this on another machine must not freeze today's built-ins into
+    /// that user's files.
+    pub fn export(&self) -> String {
+        let mut out = String::from(
+            "# Puntu — экспорт пользовательского словаря.\n\
+             # Восстановить:  puntu dict import <файл>\n\
+             # Секция = список и язык; пустые строки и строки с # игнорируются.\n",
+        );
+        for (kind, lang) in EXPORT_SECTIONS {
+            let words = self.user_words(*kind, *lang);
+            if words.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("\n[{} {}]\n", section_name(*kind), lang));
+            for w in words {
+                out.push_str(&w);
+                out.push('\n');
+            }
+        }
+        let commands = self.user_words(ListKind::Command, Lang::En);
+        if !commands.is_empty() {
+            out.push_str("\n[commands]\n");
+            for w in commands {
+                out.push_str(&w);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Merge an exported file back in. Every word goes through [`Self::add`], so the same
+    /// «последнее действие побеждает» conflict resolution applies as when the user adds a word
+    /// by hand. Returns how many words were actually new. Unknown section headers are skipped
+    /// with a warning rather than failing the whole import — a partial restore beats none.
+    pub fn import_str(&mut self, text: &str) -> Result<usize> {
+        let mut section: Option<(ListKind, Lang)> = None;
+        let mut added = 0usize;
+        for (n, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                section = parse_section(header);
+                if section.is_none() {
+                    tracing::warn!("import: неизвестная секция {header:?} (строка {})", n + 1);
+                }
+                continue;
+            }
+            let Some((kind, lang)) = section else {
+                tracing::warn!("import: слово вне секции — пропущено (строка {})", n + 1);
+                continue;
+            };
+            let word = line.to_lowercase();
+            if !self.contains(&word, lang, kind) {
+                added += 1;
+            }
+            self.add(&word, lang, kind)?;
+        }
+        Ok(added)
+    }
+
+    fn contains(&self, word: &str, lang: Lang, kind: ListKind) -> bool {
+        match kind {
+            ListKind::Command => self.commands.contains(word),
+            _ => self.set(lang, kind).contains(word),
+        }
+    }
+
+    fn set(&self, lang: Lang, kind: ListKind) -> &HashSet<String> {
+        let lists = self.lists(lang);
+        match kind {
+            ListKind::Manual => &lists.manual,
+            ListKind::Learned => &lists.learned,
+            ListKind::Force => &lists.force,
+            ListKind::Recognized => &lists.recognized,
+            ListKind::Command => &self.commands,
+        }
+    }
+
     fn set_mut(&mut self, lang: Lang, kind: ListKind) -> &mut HashSet<String> {
         let lists = match lang {
             Lang::Ru => &mut self.ru,
@@ -290,6 +373,51 @@ impl UserDict {
             ListKind::Command => unreachable!("commands are language-neutral"),
         }
     }
+}
+
+/// Per-language sections of an export, in the order they are written. Commands are appended
+/// separately — they are language-neutral.
+const EXPORT_SECTIONS: &[(ListKind, Lang)] = &[
+    (ListKind::Recognized, Lang::Ru),
+    (ListKind::Recognized, Lang::En),
+    (ListKind::Manual, Lang::Ru),
+    (ListKind::Manual, Lang::En),
+    (ListKind::Learned, Lang::Ru),
+    (ListKind::Learned, Lang::En),
+    (ListKind::Force, Lang::Ru),
+    (ListKind::Force, Lang::En),
+];
+
+/// The stable name a list has in an exported file. Deliberately not `Debug`: the file format
+/// must not change just because a variant is renamed.
+fn section_name(kind: ListKind) -> &'static str {
+    match kind {
+        ListKind::Recognized => "recognized",
+        ListKind::Manual => "manual",
+        ListKind::Learned => "learned",
+        ListKind::Force => "force",
+        ListKind::Command => "commands",
+    }
+}
+
+/// Parse a section header body (`recognized ru`, `commands`) back into a list + language.
+fn parse_section(header: &str) -> Option<(ListKind, Lang)> {
+    let mut parts = header.split_whitespace();
+    let kind = match parts.next()?.to_ascii_lowercase().as_str() {
+        "recognized" => ListKind::Recognized,
+        "manual" => ListKind::Manual,
+        "learned" => ListKind::Learned,
+        "force" => ListKind::Force,
+        // Language-neutral; any language tag on it is ignored.
+        "commands" => return Some((ListKind::Command, Lang::En)),
+        _ => return None,
+    };
+    let lang = match parts.next()?.to_ascii_lowercase().as_str() {
+        "ru" => Lang::Ru,
+        "en" => Lang::En,
+        _ => return None,
+    };
+    parts.next().is_none().then_some((kind, lang))
 }
 
 /// The subset of an in-memory set worth writing to the user's file: built-in seeds are merged
@@ -418,6 +546,81 @@ mod tests {
         // The reverse: a later flip-back exception clears the recognized entry.
         d.add("eds", Lang::En, ListKind::Learned).unwrap();
         assert!(!d.is_recognized("увы", Lang::Ru), "flip-back must clear the taught word");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adding_a_word_twice_does_not_duplicate_the_line() {
+        let dir = tmp("dup");
+        let mut d = UserDict::empty(dir.clone());
+        d.add("tiktok", Lang::En, ListKind::Recognized).unwrap();
+        d.add("tiktok", Lang::En, ListKind::Recognized).unwrap();
+        d.add("tiktok", Lang::En, ListKind::Recognized).unwrap();
+        let file = std::fs::read_to_string(dir.join("words.en.txt")).unwrap();
+        let lines: Vec<&str> = file.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines, vec!["tiktok"], "re-adding a word must not grow the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_round_trips_through_import() {
+        let src = tmp("export-src");
+        let mut a = UserDict::empty(src.clone());
+        a.add("увы", Lang::Ru, ListKind::Recognized).unwrap();
+        a.add("tiktok", Lang::En, ListKind::Recognized).unwrap();
+        a.add("превед", Lang::Ru, ListKind::Manual).unwrap();
+        a.add("ghbdtn", Lang::En, ListKind::Learned).unwrap();
+        a.add("ckjdj", Lang::En, ListKind::Force).unwrap();
+        a.add("mycmd", Lang::En, ListKind::Command).unwrap();
+        let text = a.export();
+
+        // Built-in seeds must never leak into the file — importing it elsewhere would freeze
+        // today's built-ins into that user's own lists.
+        assert!(!text.contains("\napi\n"), "built-in abbreviations must not be exported");
+        assert!(!text.contains("\ngit\n"), "built-in commands must not be exported");
+
+        let dst = tmp("export-dst");
+        let mut b = UserDict::empty(dst.clone());
+        assert_eq!(b.import_str(&text).unwrap(), 6, "every word is new in an empty dictionary");
+        assert!(b.is_recognized("увы", Lang::Ru));
+        assert!(b.is_recognized("tiktok", Lang::En));
+        assert!(b.is_exception("превед", Lang::Ru));
+        assert!(b.is_exception("ghbdtn", Lang::En));
+        assert!(b.is_force("ckjdj", Lang::En));
+        assert!(b.is_exception("mycmd", Lang::En)); // commands are exceptions
+        assert_eq!(b.export(), text, "a round trip must be byte-identical");
+
+        // Re-importing the same file adds nothing and doesn't duplicate anything.
+        assert_eq!(b.import_str(&text).unwrap(), 0);
+        assert_eq!(b.export(), text);
+        for d in [src, dst] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn import_survives_junk_and_unknown_sections() {
+        let dir = tmp("import-junk");
+        let mut d = UserDict::empty(dir.clone());
+        let added = d
+            .import_str(
+                "# комментарий\n\
+                 \n\
+                 сирота\n\
+                 [wat ru]\n\
+                 мусор\n\
+                 [recognized ru]\n\
+                   Увы  \n\
+                 [commands]\n\
+                 mycmd\n",
+            )
+            .unwrap();
+        // The orphan line and the unknown section are skipped; the rest is imported, and the
+        // word is trimmed and lowercased like everywhere else.
+        assert_eq!(added, 2);
+        assert!(d.is_recognized("увы", Lang::Ru));
+        assert!(!d.is_recognized("мусор", Lang::Ru));
+        assert!(!d.is_recognized("сирота", Lang::Ru));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -196,6 +196,12 @@ impl Mods {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyEvent {
     /// A letter that extends the current word.
+    ///
+    /// Only `code` and `shift` reach [`crate::buffer::WordBuffer`]; the word is re-rendered
+    /// from that pair at finish time, so **`shift` alone decides the case** and `cur`/`alt`
+    /// are informational (they document the mapping and are asserted in tests). Feeding a
+    /// `shift` that disagrees with `cur` silently inverts the case of the committed text —
+    /// which is exactly what the IBus front-end used to do under CapsLock.
     Letter { code: u16, shift: bool, cur: char, alt: char },
     /// Whitespace or punctuation that ends the current word.
     Separator,
