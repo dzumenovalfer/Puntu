@@ -43,30 +43,25 @@ struct Held {
     /// Set once a forward flip has been counted, so toggling back and forth on one word
     /// doesn't inflate the manual-conversion counter.
     counted: bool,
+    /// Which hold this is. The idle-commit timer captures the value it was armed with and
+    /// only commits while it still matches — so a timer left over from a word that has since
+    /// been flushed, flipped or extended can never fire on the new one.
+    generation: u64,
 }
+
+/// The held word, shared with the idle-commit timer ([`PuntuEngine::arm_hold_timer`]).
+/// A `std::sync::Mutex` on purpose: its guard is `!Send`, so the compiler rejects any attempt
+/// to hold the lock across an `.await` — exactly the mistake that would deadlock the engine.
+type HeldSlot = Arc<std::sync::Mutex<Option<Held>>>;
 
 use crate::buffer::{CompletedWord, WordBuffer};
 use crate::detect::userdict::{ListKind, UserDict};
 use crate::detect::{Decision, Detector};
 use crate::keymap::{self, KeyEvent, Lang, Mods};
 
-/// A modifier-set gesture: press the set (any order), release it, with no other key in
-/// between. `Ctrl`, `Ctrl+Shift`, `Alt+Shift`, `Ctrl+Alt`, `Super` … — matched against the
-/// configured `mode_toggle` / `convert_last` bindings, like the system layout-switch options
-/// in GNOME Tweaks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct ModCombo {
-    pub ctrl: bool,
-    pub shift: bool,
-    pub alt: bool,
-    pub sup: bool,
-}
-
-impl ModCombo {
-    pub fn size(self) -> u32 {
-        self.ctrl as u32 + self.shift as u32 + self.alt as u32 + self.sup as u32
-    }
-}
+// `ModCombo` and its parser live in `config` so BOTH front-ends can honour the configured
+// gesture — the uinput daemon builds without the `ibus` feature.
+pub use crate::config::{parse_tap_combo, ModCombo};
 
 /// The four tracked modifiers (index into [`TapDetector`] arrays).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,7 +245,7 @@ impl HotkeyBindings {
 /// One engine instance per focused input context. IBus calls `CreateEngine` whenever a new
 /// text field gets focus and our engine is active for it.
 pub struct PuntuEngine {
-    detector: Arc<Detector>,
+    detector: DetectorSlot,
     /// User dictionaries — consulted by the detector on every finished word, and appended to
     /// (learned list) when the user flips an auto-conversion back.
     dict: Arc<AsyncMutex<UserDict>>,
@@ -264,7 +259,13 @@ pub struct PuntuEngine {
     mode: EngineMode,
     /// The just-finished word, kept in preedit (not committed) so the flip hotkey can
     /// re-render it without deleting committed text. See [`Held`].
-    held: Option<Held>,
+    held: HeldSlot,
+    /// Bumped every time a word is held (or the held word is extended), so a stale
+    /// idle-commit timer can tell it no longer owns what's in [`Self::held`].
+    held_gen: u64,
+    /// How long a finished word may sit in preedit before it is committed on its own.
+    /// `0` disables the timer (the word then waits indefinitely, as it used to).
+    hold_commit: Option<std::time::Duration>,
     /// Resolved hotkey bindings from config — undo key, mode-toggle tap, convert-last tap.
     hotkeys: HotkeyBindings,
     /// Run the detector on every finished word in Correcting mode (`!dry_run`). When off,
@@ -295,14 +296,47 @@ pub struct PuntuEngine {
     surrounding: Option<(String, u32, u32)>,
     /// The `[learning] suggest_after` config value; 0 disables the offer.
     suggest_after: u32,
+    /// Were we transparent (paused / password field) at the previous key event? Used to spot
+    /// the moment transparency switches ON, which is when anything still pending has to be
+    /// committed — see [`Self::become_transparent`].
+    was_transparent: bool,
+    /// The client's `IBusCapabilite` bits, or `None` until it reports them. Absent is treated
+    /// as capable: IBus older than the `SetCapabilities` call must not silently disable us.
+    caps: Option<u32>,
+    /// The focused client's name, as it passed it to `CreateInputContext` (`"gtk-im"`,
+    /// `"xim"`, `"SDL2_Application"`, …). Empty until `FocusInId` reports one.
+    client: String,
+    /// Which clients we refuse to touch, and whether a missing preedit capability disables us.
+    clients: crate::config::ClientPolicy,
+    /// Consecutive failed/timed-out DBus emits. Reset by any success.
+    emit_failures: u32,
+    /// Latched once [`MAX_EMIT_FAILURES`] emits fail in a row: the engine gives up and goes
+    /// transparent so the user can at least type. Cleared on `focus_in`/`enable`.
+    degraded: bool,
 }
 
 /// Shared manual-conversion counter: converted word → (count, last typed form).
 type ConvertCounts = Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, String)>>>;
 
+/// The detector, swappable so the dictionary watcher can rebuild the language models while
+/// engines are live. Readers clone the inner `Arc` under a brief read lock and then use it
+/// freely — including across `.await`, which a lock guard could never survive.
+pub type DetectorSlot = Arc<std::sync::RwLock<Arc<Detector>>>;
+
 /// The last (original → converted, when) selection triple, shared across engines. Used to
 /// refuse converting a STALE primary selection — see [`is_stale_selection`].
 type LastConverted = Arc<std::sync::Mutex<Option<(String, String, std::time::Instant)>>>;
+
+/// Lock a mutex, ignoring poisoning.
+///
+/// These mutexes guard plain data (the held word, the conversion tallies) that is rebuilt on
+/// the next keystroke anyway, so a panic elsewhere leaves nothing genuinely inconsistent. What
+/// it *would* leave, with `.unwrap()`, is every later key event panicking on the poison — one
+/// bad moment turning into a keyboard that stays broken until the daemon is restarted, which
+/// is the exact failure mode we are here to remove.
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// How long after a conversion a matching PRIMARY text is treated as residue. The harmful
 /// replay (tap while typing the next word) happens within seconds; a DELIBERATE re-selection
@@ -340,19 +374,80 @@ const PURPOSE_PASSWORD: u32 = 8;
 const PURPOSE_PIN: u32 = 9;
 const PURPOSE_TERMINAL: u32 = 10;
 
+/// `IBusCapabilite` bit for "this client displays `UpdatePreeditText`". Everything the user
+/// types lives in the preedit until it is committed, so without this bit the client shows
+/// **nothing at all** while typing — the keyboard looks dead even though the engine is
+/// happily processing every key.
+const CAP_PREEDIT_TEXT: u32 = 1 << 0;
+
+/// Ceiling on any single DBus emit made while answering a key event. The client is blocked on
+/// our `ProcessKeyEvent` reply for as long as we sit in there, so an emit that never completes
+/// is a keyboard that never responds. Past this, the emit is treated as failed and we get out
+/// of the way. Generous next to a healthy emit (microseconds) and short enough that a user
+/// would read a one-off as a hiccup rather than a freeze.
+const EMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Consecutive failed emits after which the engine stops trying and turns transparent for the
+/// rest of the focus. Corrections stop working; typing keeps working — which is the right way
+/// round. One-offs (a busy daemon) are absorbed by the counter reset on the next success.
+const MAX_EMIT_FAILURES: u32 = 3;
+
+/// The plain-data engine settings, bundled so the constructor doesn't grow another argument
+/// per config key (it is already at the `too_many_arguments` limit) and so the factory can
+/// hand every engine the same copy.
+#[derive(Clone, Debug)]
+pub struct EngineOptions {
+    /// Run the detector on every finished word in Correcting mode (`!dry_run`).
+    pub autocorrect: bool,
+    /// Fix accidental-caps signatures (`пРИВЕТ`, `ПРивет`) on finished words.
+    pub fix_case: bool,
+    /// `[learning] suggest_after`; 0 disables the "remember this word?" offer.
+    pub suggest_after: u32,
+    /// How long a finished word may sit in preedit before it commits itself; 0 disables.
+    pub hold_commit_ms: u64,
+    /// Which clients the engine refuses to touch (games, clients with no preedit).
+    pub clients: crate::config::ClientPolicy,
+}
+
+impl EngineOptions {
+    /// Read the options out of a loaded config. `dry_run` doubles as the auto-correct kill
+    /// switch: detect-but-don't-touch means words are held exactly as typed and only convert
+    /// on the manual flip hotkey.
+    pub fn from_config(cfg: &crate::config::Config) -> Self {
+        EngineOptions {
+            autocorrect: !cfg.dry_run,
+            fix_case: cfg.fix_case,
+            suggest_after: cfg.learning.suggest_after,
+            hold_commit_ms: cfg.hold_commit_ms,
+            clients: cfg.ibus_clients.clone(),
+        }
+    }
+}
+
+/// Why the engine is staying out of the way, for the log line — and `None` when it isn't.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Passthrough {
+    /// Password / PIN field: a password must never sit in a preedit or be transliterated.
+    Secret,
+    /// The client never renders a preedit, so anything held there is invisible.
+    NoPreedit,
+    /// The client is on the configured passthrough list (SDL games and friends).
+    Client,
+    /// Too many emits failed in a row — see [`MAX_EMIT_FAILURES`].
+    Degraded,
+}
+
 impl PuntuEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
-        detector: Arc<Detector>,
+        detector: DetectorSlot,
         dict: Arc<AsyncMutex<UserDict>>,
         hotkeys: HotkeyBindings,
-        autocorrect: bool,
-        fix_case: bool,
+        opts: EngineOptions,
         paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
         convert_counts: ConvertCounts,
         last_converted: LastConverted,
-        suggest_after: u32,
     ) -> Self {
         Self {
             detector,
@@ -362,17 +457,26 @@ impl PuntuEngine {
             id,
             tap: TapDetector::new(hotkeys.tap_max_hold_ms),
             mode: EngineMode::Correcting,
-            held: None,
+            held: Arc::new(std::sync::Mutex::new(None)),
+            held_gen: 0,
+            hold_commit: (opts.hold_commit_ms > 0)
+                .then(|| std::time::Duration::from_millis(opts.hold_commit_ms)),
             hotkeys,
-            autocorrect,
-            fix_case,
+            autocorrect: opts.autocorrect,
+            fix_case: opts.fix_case,
             purpose: 0,
             hint_shown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             paused,
             convert_counts,
             last_converted,
             surrounding: None,
-            suggest_after,
+            suggest_after: opts.suggest_after,
+            was_transparent: false,
+            caps: None,
+            client: String::new(),
+            clients: opts.clients,
+            emit_failures: 0,
+            degraded: false,
         }
     }
 
@@ -386,7 +490,32 @@ impl PuntuEngine {
     /// one terminal visit the engine stayed transparent in every app (hence the purpose
     /// reset in `focus_in`/`enable`).
     fn is_passthrough(&self) -> bool {
-        matches!(self.purpose, PURPOSE_PASSWORD | PURPOSE_PIN)
+        self.passthrough_reason().is_some()
+    }
+
+    /// Why the engine is transparent right now, or `None` when it isn't. Split out from
+    /// [`Self::is_passthrough`] so the log line can say *which* rule fired — "Puntu ничего не
+    /// делает в этом приложении" is unanswerable otherwise.
+    fn passthrough_reason(&self) -> Option<Passthrough> {
+        if matches!(self.purpose, PURPOSE_PASSWORD | PURPOSE_PIN) {
+            return Some(Passthrough::Secret);
+        }
+        // A client that never draws a preedit would show nothing at all while the user types,
+        // because that is the only place a word lives before it is committed.
+        if self.clients.require_preedit_capability
+            && self.caps.is_some_and(|c| c & CAP_PREEDIT_TEXT == 0)
+        {
+            return Some(Passthrough::NoPreedit);
+        }
+        // Games (SDL opens an IBus context for its text input, so WASD arrives here looking
+        // exactly like typing) and anything else the user listed.
+        if self.clients.matches_client(&self.client) {
+            return Some(Passthrough::Client);
+        }
+        if self.degraded {
+            return Some(Passthrough::Degraded);
+        }
+        None
     }
 
     /// Terminal field (VTE sets `InputPurpose::TERMINAL`): automatic conversions are off —
@@ -396,6 +525,202 @@ impl PuntuEngine {
     /// it would append text instead.
     fn in_terminal(&self) -> bool {
         self.purpose == PURPOSE_TERMINAL
+    }
+
+    /// The current detector. Cloning the `Arc` out from under the read lock keeps the lock
+    /// held for nanoseconds and leaves the caller free to `.await` while using it.
+    fn detector(&self) -> Arc<Detector> {
+        Arc::clone(&self.detector.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Is a finished word currently held in preedit?
+    fn is_holding(&self) -> bool {
+        lock(&self.held).is_some()
+    }
+
+    /// Take the held word out of the shared slot (also disarming any pending idle-commit
+    /// timer, which checks the generation before touching anything).
+    fn take_held(&mut self) -> Option<Held> {
+        lock(&self.held).take()
+    }
+
+    /// Hold `held` in preedit and (re)start the idle-commit countdown for it.
+    ///
+    /// A finished word lives ONLY in the preedit so the flip hotkey can re-render it without
+    /// deleting committed text. The cost is that it belongs to a caret position we stop
+    /// controlling the moment the user reaches for the mouse: apps move the caret on a click
+    /// and only then send `reset()`, so committing there put the word wherever the user had
+    /// just clicked («вставляется слово, которое печатал последним»). Committing it on its own
+    /// after a short idle keeps the word where it was typed, and leaves nothing for a later
+    /// click to displace.
+    fn hold(&mut self, se: &SignalEmitter<'_>, mut held: Held) {
+        self.held_gen = self.held_gen.wrapping_add(1);
+        held.generation = self.held_gen;
+        *lock(&self.held) = Some(held);
+        self.arm_hold_timer(se);
+    }
+
+    /// Restart the idle countdown for the word already held — the user just did something to
+    /// it (flipped its layout, cycled its case, typed another separator after it). Bumping the
+    /// generation also retires the timer armed by the previous interaction, so the countdown
+    /// really restarts instead of two timers racing.
+    fn touch_hold(&mut self, se: &SignalEmitter<'_>) {
+        self.held_gen = self.held_gen.wrapping_add(1);
+        let generation = self.held_gen;
+        {
+            let mut guard = lock(&self.held);
+            let Some(h) = guard.as_mut() else { return };
+            h.generation = generation;
+        }
+        self.arm_hold_timer(se);
+    }
+
+    /// Commit the held word by itself once the user has been idle for `hold_commit`, provided
+    /// it is still the same word this timer was armed for.
+    fn arm_hold_timer(&self, se: &SignalEmitter<'_>) {
+        let Some(delay) = self.hold_commit else {
+            return;
+        };
+        let slot = Arc::clone(&self.held);
+        let generation = self.held_gen;
+        let se = se.to_owned();
+        let id = self.id;
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let Some(h) = take_if_current(&slot, generation) else { return };
+            // The first one is INFO so «слово всё ещё уезжает по клику» can be answered from
+            // the log without a debug build; the rest are DEBUG (one per word is too noisy).
+            static ANNOUNCED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    "[puntu-engine {id}] idle commit active: held word committed after {:?} \
+                     ({:?})",
+                    delay,
+                    h.shown
+                );
+            } else {
+                debug!("[puntu-engine {id}] idle commit of held {:?}", h.shown);
+            }
+            // Preedit off first, then commit — same ordering as `flush_held`. Both are bounded
+            // so a wedged DBus path parks one task briefly instead of one per typed word,
+            // forever.
+            let _ = tokio::time::timeout(
+                EMIT_TIMEOUT,
+                <PuntuEngine as IBusEngineBackend>::update_preedit_text(
+                    &se,
+                    String::new(),
+                    0,
+                    false,
+                    librush::ibus::IBusPreeditFocusMode::Commit,
+                ),
+            )
+            .await;
+            match tokio::time::timeout(
+                EMIT_TIMEOUT,
+                <PuntuEngine as IBusEngineBackend>::commit_text(&se, h.shown),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("[puntu-engine {id}] idle commit failed: {e}"),
+                Err(_) => tracing::warn!("[puntu-engine {id}] idle commit timed out"),
+            }
+        });
+    }
+
+    /// Await one DBus emit under [`EMIT_TIMEOUT`] and record whether it worked. Returns
+    /// `false` on error **or** timeout — callers must treat both the same way, because from
+    /// the user's seat "the text never appeared" and "the text appeared four seconds later"
+    /// are the same bug.
+    ///
+    /// Every emit made while answering a key event goes through here. That is what makes
+    /// `ProcessKeyEvent` bounded: the client is blocked on our reply until we return, so an
+    /// emit that hangs is a keyboard that hangs.
+    async fn guard_emit(
+        &mut self,
+        what: &str,
+        fut: impl std::future::Future<Output = zbus::Result<()>>,
+    ) -> bool {
+        let ok = match tokio::time::timeout(EMIT_TIMEOUT, fut).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                tracing::warn!("[puntu-engine {}] {what} failed: {e}", self.id);
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "[puntu-engine {}] {what} timed out after {EMIT_TIMEOUT:?} — \
+                     giving the key back to the app",
+                    self.id
+                );
+                false
+            }
+        };
+        self.note_emit(ok);
+        ok
+    }
+
+    /// Track consecutive emit failures and latch [`Self::degraded`] once there are too many.
+    /// A wedged DBus path must cost the user corrections, never their typing.
+    fn note_emit(&mut self, ok: bool) {
+        if ok {
+            self.emit_failures = 0;
+            return;
+        }
+        self.emit_failures += 1;
+        if self.emit_failures >= MAX_EMIT_FAILURES && !self.degraded {
+            self.degraded = true;
+            // error-level: this is the state behind «puntu перестал печатать, помог только
+            // перезапуск», and it must be findable in the journal without a debug build.
+            tracing::error!(
+                "[puntu-engine {}] {} DBus emits failed in a row (client={:?}) — going \
+                 transparent until the next focus change; typing is unaffected, corrections \
+                 are off",
+                self.id,
+                self.emit_failures,
+                self.client,
+            );
+            notify(
+                "Puntu отключился в этом поле: IBus не принимает текст.\n\
+                 Ввод работает как обычно. Диагностика: puntu-ibus doctor",
+            );
+        }
+    }
+
+    /// The preedit update didn't reach the client, so `text` is currently visible **nowhere**.
+    /// Commit it as ordinary text and start the word over.
+    ///
+    /// This is the whole point of checking the emit result: the engine claims a letter key
+    /// (`Ok(true)`) on the promise that the preedit will show it. When that promise breaks,
+    /// silently keeping the key is how typing "stops working" with no error anywhere — the
+    /// user sees an empty screen and reaches for a restart. Better to lose the correction for
+    /// this word and keep the letters.
+    ///
+    /// Returns `Ok(true)`: the key is accounted for, either committed here or (if the commit
+    /// failed too) unrecoverable, and forwarding it on top would duplicate it.
+    async fn bail_out(&mut self, se: &SignalEmitter<'_>, text: String) -> fdo::Result<bool> {
+        tracing::warn!(
+            "[puntu-engine {}] preedit did not reach the client — committing {text:?} as \
+             plain text",
+            self.id
+        );
+        self.clear_preedit(se).await;
+        self.commit_str(se, text).await;
+        self.buffer.invalidate();
+        self.take_held();
+        Ok(true)
+    }
+
+    /// Un-latch [`Self::degraded`] on a lifecycle event. Whatever wedged the DBus path
+    /// belonged to the context we just left, so the next one deserves a fresh try — a fuse
+    /// that only ever blows would turn one bad moment into "Puntu is dead until I restart it".
+    fn recover(&mut self) {
+        if self.degraded {
+            tracing::info!("[puntu-engine {}] re-arming after a degraded context", self.id);
+        }
+        self.degraded = false;
+        self.emit_failures = 0;
     }
 
     /// Show a short auxiliary-text hint near the caret (hidden again on the next letter).
@@ -409,23 +734,27 @@ impl PuntuEngine {
         hint_shown: &std::sync::atomic::AtomicBool,
         text: &str,
     ) {
-        let _ = Self::update_auxiliary_text(se, text.to_string(), true).await;
+        let _ = tokio::time::timeout(
+            EMIT_TIMEOUT,
+            Self::update_auxiliary_text(se, text.to_string(), true),
+        )
+        .await;
         hint_shown.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Hide the auxiliary hint if one is showing.
     async fn hide_hint(&mut self, se: &SignalEmitter<'_>) {
         if self.hint_shown.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            let _ = Self::update_auxiliary_text(se, String::new(), false).await;
+            // Runs inside the key event, so it goes through the guard like every other emit.
+            self.guard_emit("hide_hint", Self::update_auxiliary_text(se, String::new(), false))
+                .await;
         }
     }
 
-    /// Commit `text`, logging (instead of swallowing) a DBus failure — a lost commit means
-    /// lost user text, which must at least be visible in the logs.
-    async fn commit_str(&self, se: &SignalEmitter<'_>, text: String) {
-        if let Err(e) = Self::commit_text(se, text).await {
-            tracing::warn!("[puntu-engine {}] commit_text failed: {e}", self.id);
-        }
+    /// Commit `text`. Returns whether it actually reached the client — a lost commit is lost
+    /// user text, so callers that still hold the text must know.
+    async fn commit_str(&mut self, se: &SignalEmitter<'_>, text: String) -> bool {
+        self.guard_emit("commit_text", Self::commit_text(se, text)).await
     }
 
     /// Handle a recognised modifier tap. Matches the tap kind against the configured
@@ -488,33 +817,41 @@ impl PuntuEngine {
     /// Flipping an **auto-converted** word back is the user rejecting the correction, so the
     /// typed form is added to the learned list (once) and won't be auto-converted again.
     async fn handle_undo(&mut self, se: &SignalEmitter<'_>) {
-        let Some(h) = self.held.as_mut() else {
+        // Scoped so the (non-Send) lock guard is gone before the first `.await` below.
+        let Some((shown, learn, manual)) = ({
+            let mut guard = lock(&self.held);
+            guard.as_mut().map(|h| {
+                std::mem::swap(&mut h.shown, &mut h.other);
+                let learn = if h.auto_converted && !h.learned {
+                    h.learned = true;
+                    Some(h.typed.clone())
+                } else {
+                    None
+                };
+                // A forward flip (detector left the word as typed, the user converted it by
+                // hand) is a manual conversion — feed the repeat counter, once per held word.
+                let manual =
+                    if !h.auto_converted && !h.counted && starts_with_word(&h.shown, &h.converted) {
+                        h.counted = true;
+                        Some((h.typed.clone(), h.converted.clone()))
+                    } else {
+                        None
+                    };
+                (h.shown.clone(), learn, manual)
+            })
+        }) else {
             debug!("[puntu-engine {}] flip: nothing held", self.id);
             return;
         };
-        std::mem::swap(&mut h.shown, &mut h.other);
-        let shown = h.shown.clone();
-        let learn = if h.auto_converted && !h.learned {
-            h.learned = true;
-            Some(h.typed.clone())
-        } else {
-            None
-        };
-        // A forward flip (detector left the word as typed, the user converted it by hand) is
-        // a manual conversion — feed the repeat counter, once per held word.
-        let manual = if !h.auto_converted && !h.counted && h.shown.starts_with(&h.converted) {
-            h.counted = true;
-            Some((h.typed.clone(), h.converted.clone()))
-        } else {
-            None
-        };
+        // The user is working on this word — restart its idle countdown.
+        self.touch_hold(se);
         debug!("[puntu-engine {}] flip: held → {:?}", self.id, shown);
         self.update_preedit(se, &shown).await;
         if let Some((typed, converted)) = manual {
             note_manual_conversion(
                 &self.convert_counts,
                 self.suggest_after,
-                &self.detector,
+                &self.detector(),
                 &self.dict,
                 &self.hint_shown,
                 se,
@@ -572,7 +909,7 @@ impl PuntuEngine {
         // practice the mouse click that made the selection already triggered `reset()`, which
         // commits anything pending (see `flush_all`), so `held` is normally empty by now.
         let id = self.id;
-        let detector = Arc::clone(&self.detector);
+        let detector = self.detector();
         let dict = Arc::clone(&self.dict);
         let hint_shown = Arc::clone(&self.hint_shown);
         let counts = Arc::clone(&self.convert_counts);
@@ -609,7 +946,7 @@ impl PuntuEngine {
             // The client-reported selection skips it — it is fresh by construction (one-shot
             // and voided by any key press or reset).
             if !from_client
-                && is_stale_selection(&last_converted.lock().unwrap().clone(), &selection)
+                && is_stale_selection(&lock(&last_converted).clone(), &selection)
             {
                 tracing::info!(
                     "[puntu-engine {id}] convert-selection: PRIMARY still holds the previous \
@@ -666,7 +1003,7 @@ impl PuntuEngine {
             tracing::info!(
                 "[puntu-engine {id}] convert-selection: {selection:?} → {converted:?}"
             );
-            *last_converted.lock().unwrap() =
+            *lock(&last_converted) =
                 Some((selection.clone(), converted.clone(), std::time::Instant::now()));
             forward_backspace(&se).await;
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
@@ -693,12 +1030,20 @@ impl PuntuEngine {
     /// A pure preedit re-render, exactly like the layout flip: instant, no deletions of
     /// committed text. No-op when nothing is held.
     async fn handle_case_cycle(&mut self, se: &SignalEmitter<'_>) {
-        let Some(h) = self.held.as_mut() else {
+        let Some(shown) = ({
+            let mut guard = lock(&self.held);
+            guard.as_mut().map(|h| {
+                h.shown = cycle_case(&h.shown);
+                // Carry the new case over to the flip target too, or flipping the layout
+                // afterwards silently threw the case away (`Слово ` → `ckjdj `).
+                h.other = match_case(&h.other, &h.shown);
+                h.shown.clone()
+            })
+        }) else {
             debug!("[puntu-engine {}] case cycle: nothing held", self.id);
             return;
         };
-        h.shown = cycle_case(&h.shown);
-        let shown = h.shown.clone();
+        self.touch_hold(se);
         debug!("[puntu-engine {}] case cycle -> {:?}", self.id, shown);
         self.update_preedit(se, &shown).await;
     }
@@ -709,14 +1054,14 @@ impl PuntuEngine {
     fn handle_remember(&mut self, se: &SignalEmitter<'_>) {
         let id = self.id;
         // Fallback when nothing is selected: whichever form of the held word is on screen.
-        let fallback = self.held.as_ref().map(|h| {
-            if h.shown.starts_with(&h.converted) {
+        let fallback = lock(&self.held).as_ref().map(|h| {
+            if starts_with_word(&h.shown, &h.converted) {
                 h.converted.clone()
             } else {
                 h.typed.clone()
             }
         });
-        let detector = Arc::clone(&self.detector);
+        let detector = self.detector();
         let dict = Arc::clone(&self.dict);
         let hint_shown = Arc::clone(&self.hint_shown);
         let se = se.to_owned();
@@ -771,7 +1116,10 @@ impl PuntuEngine {
     /// is held. Called when the next word starts, on a hard boundary (Enter/Tab), a chord, or a
     /// focus change — so the pending word is never lost.
     async fn flush_held(&mut self, se: &SignalEmitter<'_>) {
-        if let Some(h) = self.held.take() {
+        // `take_held` first, as its own statement: the lock guard must be dropped before the
+        // awaits below (and a `if let` scrutinee would keep it alive for the whole block).
+        let held = self.take_held();
+        if let Some(h) = held {
             debug!("[puntu-engine {}] flush held {:?}", self.id, h.shown);
             // Clear the preedit BEFORE committing. Some clients (Chromium/Electron with
             // text-input-v3) apply a trailing preedit-clear after the commit and clip the
@@ -803,29 +1151,38 @@ impl PuntuEngine {
         self.buffer.invalidate();
     }
 
-    /// Show `text` as the preedit (cursor at end; hidden when empty).
-    async fn update_preedit(&self, se: &SignalEmitter<'_>, text: &str) {
+    /// Show `text` as the preedit (cursor at end; hidden when empty). Returns whether the
+    /// update reached the client: the preedit is the ONLY place a half-typed word exists, so
+    /// a caller that swallowed the key on the strength of this must undo that decision when
+    /// it returns `false`.
+    async fn update_preedit(&mut self, se: &SignalEmitter<'_>, text: &str) -> bool {
         let n = text.chars().count() as u32;
-        let _ = Self::update_preedit_text(
-            se,
-            text.to_string(),
-            n,
-            !text.is_empty(),
-            librush::ibus::IBusPreeditFocusMode::Commit,
+        self.guard_emit(
+            "update_preedit_text",
+            Self::update_preedit_text(
+                se,
+                text.to_string(),
+                n,
+                !text.is_empty(),
+                librush::ibus::IBusPreeditFocusMode::Commit,
+            ),
         )
-        .await;
+        .await
     }
 
     /// Hide the preedit.
-    async fn clear_preedit(&self, se: &SignalEmitter<'_>) {
-        let _ = Self::update_preedit_text(
-            se,
-            String::new(),
-            0,
-            false,
-            librush::ibus::IBusPreeditFocusMode::Commit,
+    async fn clear_preedit(&mut self, se: &SignalEmitter<'_>) -> bool {
+        self.guard_emit(
+            "clear_preedit",
+            Self::update_preedit_text(
+                se,
+                String::new(),
+                0,
+                false,
+                librush::ibus::IBusPreeditFocusMode::Commit,
+            ),
         )
-        .await;
+        .await
     }
 
     /// Pick the `(shown, other, auto_converted)` renderings for a finished word per the
@@ -836,6 +1193,7 @@ impl PuntuEngine {
     /// the Russian rendering unless the Latin reading is a real word/abbreviation and the
     /// Russian one isn't.
     async fn decide_renderings(&self, word: &CompletedWord) -> (String, String, bool) {
+        let detector = self.detector();
         let (mut shown, other, auto_converted) = match self.mode {
             EngineMode::Correcting => {
                 if !self.autocorrect || self.in_terminal() {
@@ -845,7 +1203,7 @@ impl PuntuEngine {
                     return (word.cur.clone(), word.alt.clone(), false);
                 }
                 let dict = self.dict.lock().await;
-                match self.detector.decide(word, &dict) {
+                match detector.decide(word, &dict) {
                     Decision::Convert { .. } => {
                         debug!(
                             "[puntu-engine {}] auto-convert {:?} → {:?}",
@@ -862,9 +1220,9 @@ impl PuntuEngine {
                 // RU-direct mode right away — the built-in models load once at startup, so
                 // without this the teaching visibly "did nothing" until an engine restart.
                 let dict = self.dict.lock().await;
-                let cur_is_real_en = self.detector.is_known_word(&word.cur, self.lang)
+                let cur_is_real_en = detector.is_known_word(&word.cur, self.lang)
                     || dict.is_recognized(&word.cur, self.lang);
-                let alt_is_real_ru = self.detector.is_known_word(&word.alt, self.lang.other())
+                let alt_is_real_ru = detector.is_known_word(&word.alt, self.lang.other())
                     || dict.is_recognized(&word.alt, self.lang.other());
                 if cur_is_real_en && !alt_is_real_ru {
                     (word.cur.clone(), word.alt.clone(), false)
@@ -884,7 +1242,7 @@ impl PuntuEngine {
                 } else {
                     Lang::En
                 };
-                self.detector.is_known_word(w, lang) || dict.is_recognized(w, lang)
+                detector.is_known_word(w, lang) || dict.is_recognized(w, lang)
             };
             if let Some(fixed) = fix_case_word(&shown, known) {
                 debug!("[puntu-engine {}] case fix {:?} -> {:?}", self.id, shown, fixed);
@@ -921,19 +1279,40 @@ impl IBusEngine for PuntuEngine {
             state.mod4(),
             released,
         );
-        // Terminals / password / PIN fields: fully transparent, nothing below runs. This is
-        // what guarantees a terminal never sees an auto-conversion (the user's hard rule).
-        if self.is_passthrough() {
-            return Ok(false);
+        // Password / PIN fields and the tray pause («выключить временно») make the engine
+        // fully transparent: nothing below runs, every keystroke goes straight to the app.
+        //
+        // Both can switch on while a word is still held in preedit — the pause marker is
+        // flipped by a watcher thread, the purpose by the client. The preedit is the only
+        // place that word exists, so it has to become real text at that moment; otherwise it
+        // stayed pending, the keys typed afterwards reached the app first, and the word
+        // finally landed AFTER them on the next reset/focus change.
+        let transparent =
+            self.is_passthrough() || self.paused.load(std::sync::atomic::Ordering::Relaxed);
+        if transparent && !self.was_transparent {
+            tracing::info!(
+                "[puntu-engine {}] going transparent ({}) — flushing pending text",
+                self.id,
+                match self.passthrough_reason() {
+                    Some(r) => format!("{r:?}"),
+                    None => "paused".to_string(),
+                }
+            );
+            self.flush_all(&se).await;
         }
-        // Tray pause («выключить временно»): full transparency until the marker is removed.
-        if self.paused.load(std::sync::atomic::Ordering::Relaxed) {
+        self.was_transparent = transparent;
+        if transparent {
             return Ok(false);
         }
         // Undo hotkey (default `Ctrl+grave`, configurable via `ibus_hotkeys.undo_key`).
         // Matches on press with exact modifier state.
+        //
+        // Only claimed while a word is actually held: with nothing to flip this is a no-op,
+        // and swallowing the key anyway stole the app's own shortcut — the default
+        // `Ctrl+` `` ` `` is "toggle terminal" in VS Code, so it simply stopped working
+        // everywhere the engine was active. Falling through hands the key to the app.
         if let Some(undo_hk) = self.hotkeys.undo {
-            if undo_hk.matches(keyval, &state) && !released {
+            if undo_hk.matches(keyval, &state) && !released && self.is_holding() {
                 debug!("[puntu-engine {}] undo hotkey matched", self.id);
                 // The non-modifier press spoils any armed tap chain. Without this, the
                 // Ctrl release *after* `Ctrl+grave` would fire the Ctrl tap and flip the
@@ -966,9 +1345,10 @@ impl IBusEngine for PuntuEngine {
             }
         }
         // Case-cycle hotkey (default `Ctrl+Alt+u`): слово → Слово → СЛОВО on the held word —
-        // the case counterpart of the layout flip.
+        // the case counterpart of the layout flip. Claimed only while a word is held, for the
+        // same reason as the flip hotkey above.
         if let Some(case_hk) = self.hotkeys.case {
-            if case_hk.matches(keyval, &state) && !released {
+            if case_hk.matches(keyval, &state) && !released && self.is_holding() {
                 debug!("[puntu-engine {}] case-cycle hotkey matched", self.id);
                 self.tap.cancel(); // same reason as the undo hotkey above
                 self.handle_case_cycle(&se).await;
@@ -1055,11 +1435,18 @@ impl IBusEngine for PuntuEngine {
             return Ok(false);
         }
 
-        let kev = classify_keysym(keyval, mods, self.lang);
+        let kev = classify_keysym(keyval, self.lang);
         debug!(
             "[puntu-engine {}] keysym={:?} mode={:?} → {:?}",
             self.id, keyval, self.mode, kev
         );
+
+        // The user is typing again, so any hint on screen has been read (or ignored). Hiding
+        // it here rather than only on a letter means a hint left by a mode toggle or a failed
+        // selection conversion doesn't sit near the caret until the next word — pressing
+        // space, Enter or an arrow key clears it too. No-op (not even a DBus call) when no
+        // hint is showing.
+        self.hide_hint(&se).await;
 
         // Unified lazy-commit handling for both modes. A finished word is **held in preedit**
         // (not committed) until the next word starts, a hard boundary (Enter/Tab), a chord, or
@@ -1067,9 +1454,7 @@ impl IBusEngine for PuntuEngine {
         // text. `decide_renderings` picks the shown default and the flip target per mode.
         match kev {
             KeyEvent::Letter { .. } => {
-                // Typing resumes: drop any lingering hint, commit the held word (it's now
-                // final), then start the new one.
-                self.hide_hint(&se).await;
+                // Typing resumes: commit the held word (it's now final), then start the new one.
                 self.flush_held(&se).await;
                 self.buffer.push(kev);
                 if let Some(snap) = self.buffer.snapshot(self.lang) {
@@ -1077,7 +1462,9 @@ impl IBusEngine for PuntuEngine {
                         EngineMode::Correcting => snap.cur,
                         EngineMode::DirectRussian => snap.alt,
                     };
-                    self.update_preedit(&se, &shown).await;
+                    if !self.update_preedit(&se, &shown).await {
+                        return self.bail_out(&se, shown).await;
+                    }
                 }
                 Ok(true)
             }
@@ -1092,9 +1479,11 @@ impl IBusEngine for PuntuEngine {
                             EngineMode::DirectRussian => w.alt,
                         })
                         .unwrap_or_default();
-                    self.update_preedit(&se, &shown).await;
+                    if !self.update_preedit(&se, &shown).await {
+                        return self.bail_out(&se, shown).await;
+                    }
                     Ok(true)
-                } else if self.held.is_some() {
+                } else if self.is_holding() {
                     // Backspace right after a held word: commit it, then let the Backspace
                     // delete from the now-real text (one user-initiated keystroke).
                     self.flush_held(&se).await;
@@ -1110,11 +1499,16 @@ impl IBusEngine for PuntuEngine {
                 // (Shift+7 → `?`, Shift+4 → `;`, Shift+2 → `"` …), not the Latin keysym IBus
                 // delivered. Chars on the same key in both layouts (space, digits) map to
                 // themselves.
+                //
+                // The NUMPAD is exempt: it is layout-independent, so its symbols are the same
+                // in every layout. Remapping them ran the numpad char through the main-row
+                // table and printed the wrong key entirely — numpad `/` came out as `.` (the
+                // main-row slash key is `.` in ЙЦУКЕН), numpad `.` as `ю`, numpad `,` as `б`.
                 let sep = match self.mode {
-                    EngineMode::DirectRussian => {
+                    EngineMode::DirectRussian if !is_numpad(keyval) => {
                         crate::detect::translit::convert_char(raw_sep, Lang::En, Lang::Ru)
                     }
-                    EngineMode::Correcting => raw_sep,
+                    _ => raw_sep,
                 };
                 if let Some(word) = self.buffer.finish(self.lang) {
                     let (shown_word, other_word, auto_converted) =
@@ -1124,50 +1518,72 @@ impl IBusEngine for PuntuEngine {
                     if hard {
                         // Enter/Tab: commit the word immediately, then forward the key so the
                         // app acts on it (sends the message / inserts a tab).
-                        self.commit_str(&se, shown_word).await;
+                        //
+                        // Preedit off BEFORE the commit, for the same reason `flush_held`
+                        // does it in that order: Chromium/Electron with text-input-v3 apply a
+                        // trailing preedit-clear after the commit and clip the word that was
+                        // just committed. Here that costs a whole submitted message.
                         self.clear_preedit(&se).await;
+                        self.commit_str(&se, shown_word).await;
                         Ok(false)
                     } else {
                         // Space (soft): hold the word + separator in preedit, uncommitted, so
                         // the flip hotkey can still re-render it.
-                        let converted = if shown_word == word.cur {
-                            other_word.clone()
-                        } else {
-                            shown_word.clone()
-                        };
+                        //
+                        // The conversion target is simply the other-layout reading of what was
+                        // typed. Deriving it by comparing `shown_word` with `word.cur` broke
+                        // whenever `fix_case` rewrote `shown` without any layout change: the
+                        // strings then differed, and `converted` ended up being the *typed*
+                        // word — so the manual-conversion counter never fired for it and
+                        // «запомнить слово» offered the wrong form.
                         let held = Held {
                             shown: format!("{shown_word}{sep}"),
                             other: format!("{other_word}{sep}"),
                             auto_converted,
                             typed: word.cur.clone(),
-                            converted,
+                            converted: word.alt.clone(),
                             learned: false,
                             counted: false,
+                            generation: 0, // assigned by `hold`
                         };
-                        self.update_preedit(&se, &held.shown).await;
-                        self.held = Some(held);
+                        if !self.update_preedit(&se, &held.shown).await {
+                            return self.bail_out(&se, held.shown).await;
+                        }
+                        self.hold(&se, held);
                         Ok(true)
                     }
-                } else if self.held.is_some() {
+                } else if self.is_holding() {
                     if hard {
                         self.flush_held(&se).await;
                         Ok(false)
                     } else {
                         // Extra separator after a held word — append it to the held preedit.
-                        if let Some(h) = self.held.as_mut() {
-                            h.shown.push(sep);
-                            h.other.push(sep);
+                        let shown = {
+                            let mut guard = lock(&self.held);
+                            guard
+                                .as_mut()
+                                .map(|h| {
+                                    h.shown.push(sep);
+                                    h.other.push(sep);
+                                    h.shown.clone()
+                                })
+                                .unwrap_or_default()
+                        };
+                        // Still typing into this hold — restart its idle countdown.
+                        self.touch_hold(&se);
+                        if !self.update_preedit(&se, &shown).await {
+                            return self.bail_out(&se, shown).await;
                         }
-                        let shown =
-                            self.held.as_ref().map(|h| h.shown.clone()).unwrap_or_default();
-                        self.update_preedit(&se, &shown).await;
                         Ok(true)
                     }
                 } else if sep != raw_sep {
                     // RU-direct punctuation with nothing buffered: the app can't render the
                     // Russian char from the forwarded Latin keysym, so commit it ourselves.
-                    self.commit_str(&se, sep.to_string()).await;
-                    Ok(true)
+                    // If that commit didn't land, forward the key instead — the app then
+                    // inserts the Latin character, which is wrong but visible and fixable;
+                    // swallowing it would drop the keystroke without a trace.
+                    let committed = self.commit_str(&se, sep.to_string()).await;
+                    Ok(committed)
                 } else {
                     // Nothing buffered or held — forward the separator.
                     Ok(false)
@@ -1187,18 +1603,21 @@ impl IBusEngine for PuntuEngine {
 
     async fn enable(
         &mut self,
-        _se: SignalEmitter<'_>,
+        se: SignalEmitter<'_>,
         _server: &ObjectServer,
     ) -> fdo::Result<()> {
         debug!("[puntu-engine {}] enable", self.id);
-        self.buffer.invalidate();
-        self.held = None;
+        // Anything still pending belongs to the previous context and exists ONLY in preedit —
+        // dropping it here (the old behaviour) silently ate the word and left its preedit on
+        // screen. Turn it into real text first, exactly like `disable`/`focus_out`/`reset` do.
+        self.flush_all(&se).await;
         self.tap.hard_reset();
         // A new context: forget the previous one's purpose. Clients that care (terminals,
         // password fields) set it again right after; clients that don't would otherwise
         // inherit the stale value — one terminal visit left the engine transparent
         // EVERYWHERE until the next explicit SetContentType.
         self.purpose = 0;
+        self.recover();
         Ok(())
     }
 
@@ -1223,11 +1642,42 @@ impl IBusEngine for PuntuEngine {
         debug!("[puntu-engine {}] focus_in", self.id);
         // Same reset as `enable`: purpose describes the field being left otherwise.
         self.purpose = 0;
+        self.recover();
         // Some clients only start reporting surrounding text after the engine asks for
         // it — the static ActiveSurroundingText property alone is not always honoured.
         let _ = se
             .emit("org.freedesktop.IBus.Engine", "RequireSurroundingText", &())
             .await;
+        Ok(())
+    }
+
+    /// Same as [`Self::focus_in`], plus the client's name — which is the only way to tell a
+    /// game apart from a text field. IBus sends this **instead of** `FocusIn` once the
+    /// `FocusId` property reads true, so it must do everything `focus_in` does.
+    async fn focus_in_id(
+        &mut self,
+        se: SignalEmitter<'_>,
+        server: &ObjectServer,
+        object_path: String,
+        client: String,
+    ) -> fdo::Result<()> {
+        self.client = client;
+        // info-level and on every focus change: this is the line the user reads out of the
+        // journal to learn what their game calls itself before adding it to
+        // `[ibus_clients] passthrough_clients`.
+        tracing::info!(
+            "[puntu-engine {}] focus_in client={:?} caps={} context={object_path}",
+            self.id,
+            self.client,
+            self.caps.map(|c| format!("0x{c:02x}")).unwrap_or_else(|| "?".into()),
+        );
+        self.focus_in(se, server).await?;
+        if let Some(reason) = self.passthrough_reason() {
+            tracing::info!(
+                "[puntu-engine {}] transparent in this client ({reason:?})",
+                self.id
+            );
+        }
         Ok(())
     }
 
@@ -1240,6 +1690,17 @@ impl IBusEngine for PuntuEngine {
         // Commit the held word AND any half-typed buffer so nothing is lost when focus
         // leaves the field.
         self.flush_all(&se).await;
+        // Drop the purpose with the context it belonged to. IBus reuses ONE engine object for
+        // every input context, so a password/terminal purpose left behind by a field the user
+        // has already left makes the engine transparent for whatever they type NEXT — the
+        // engine looks dead everywhere until something happens to set the purpose again.
+        // `focus_in` resets it too; doing it on the way out as well means transparency can
+        // never outlive the field that asked for it.
+        self.purpose = 0;
+        // Capabilities and the client name describe that same field — a game's "no preedit"
+        // must not follow the user into their editor, and vice versa.
+        self.caps = None;
+        self.client.clear();
         // Drop any half-tracked modifier tap: a Ctrl held across a focus change (Ctrl+click,
         // window switch) must not fire the mode toggle when it's finally released.
         self.surrounding = None;
@@ -1285,6 +1746,22 @@ impl IBusEngine for PuntuEngine {
         Ok(())
     }
 
+    fn set_capabilities(&mut self, caps: u32) -> fdo::Result<()> {
+        if self.caps != Some(caps) {
+            tracing::info!(
+                "[puntu-engine {}] capabilities: 0x{caps:02x}{}",
+                self.id,
+                if caps & CAP_PREEDIT_TEXT == 0 {
+                    " → no preedit support (engine transparent here)"
+                } else {
+                    ""
+                }
+            );
+        }
+        self.caps = Some(caps);
+        Ok(())
+    }
+
     fn set_content_type(&mut self, purpose: u32, hints: u32) -> fdo::Result<()> {
         if purpose != self.purpose {
             tracing::info!(
@@ -1306,41 +1783,36 @@ impl IBusEngine for PuntuEngine {
 /// time a new input context activates ours. We share the immutable detector/dict so we don't
 /// re-parse the dictionary per text field.
 pub struct PuntuFactory {
-    detector: Arc<Detector>,
+    detector: DetectorSlot,
     dict: Arc<AsyncMutex<UserDict>>,
     hotkeys: HotkeyBindings,
-    autocorrect: bool,
-    fix_case: bool,
+    opts: EngineOptions,
     paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Manual-conversion counter, shared by every engine this factory creates.
     convert_counts: ConvertCounts,
     last_converted: LastConverted,
-    suggest_after: u32,
     next_id: u64,
 }
 
 impl PuntuFactory {
-    /// `dict` is shared: the caller keeps a clone for the hot-reload watcher, so `puntu dict
-    /// add/learn/rm` edits reach every live engine without a restart.
+    /// `dict` and `detector` are shared: the caller keeps clones for the hot-reload watcher, so
+    /// `puntu dict add/learn/rm` edits — and rebuilt language models — reach every live engine
+    /// without a restart.
     pub fn new(
-        detector: Detector,
+        detector: DetectorSlot,
         dict: Arc<AsyncMutex<UserDict>>,
         hotkeys: HotkeyBindings,
-        autocorrect: bool,
-        fix_case: bool,
+        opts: EngineOptions,
         paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        suggest_after: u32,
     ) -> Self {
         Self {
-            detector: Arc::new(detector),
+            detector,
             dict,
             hotkeys,
-            autocorrect,
-            fix_case,
+            opts,
             paused,
             convert_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             last_converted: Arc::new(std::sync::Mutex::new(None)),
-            suggest_after,
             next_id: 1,
         }
     }
@@ -1362,18 +1834,18 @@ impl IBusFactory<PuntuEngine> for PuntuFactory {
             Arc::clone(&self.detector),
             Arc::clone(&self.dict),
             self.hotkeys,
-            self.autocorrect,
-            self.fix_case,
+            self.opts.clone(),
             std::sync::Arc::clone(&self.paused),
             Arc::clone(&self.convert_counts),
             Arc::clone(&self.last_converted),
-            self.suggest_after,
         ))
     }
 }
 
-/// Classify an IBus keysym the same way our evdev tokenizer does.
-fn classify_keysym(keyval: Keysym, mods: Mods, lang: Lang) -> KeyEvent {
+/// Classify an IBus keysym the same way our evdev tokenizer does. Unlike the evdev
+/// tokenizer this needs no modifier state: IBus hands us the keysym *after* xkb applied
+/// Shift and CapsLock, so the keysym alone says which case was typed.
+fn classify_keysym(keyval: Keysym, lang: Lang) -> KeyEvent {
     use xkeysym::Keysym as K;
     match keyval {
         K::BackSpace => KeyEvent::Backspace,
@@ -1418,7 +1890,12 @@ fn classify_keysym(keyval: Keysym, mods: Mods, lang: Lang) -> KeyEvent {
             };
             let alt = keymap::char_for(code, shift, lang.other()).unwrap_or(cur_char);
             if cur_char.is_alphabetic() || alt.is_alphabetic() {
-                KeyEvent::Letter { code, shift: mods.shift, cur: cur_char, alt }
+                // `shift` comes from the KEYSYM, not from the physical Shift state: IBus
+                // delivers the already-adjusted keysym, so CapsLock ON gives `G` with
+                // `state.shift() == false`. The buffer stores only `(code, shift)` and
+                // re-renders through `char_for`, so taking `mods.shift` here inverted the
+                // case of everything typed with CapsLock on.
+                KeyEvent::Letter { code, shift, cur: cur_char, alt }
             } else {
                 KeyEvent::Separator
             }
@@ -1537,6 +2014,11 @@ async fn learn_recognized(
     }
 }
 
+/// Words that never reach `suggest_after` stay in the counter forever, so the map only ever
+/// grows over a session. It is a "did this happen a few times in a row" heuristic, not a
+/// history: past this many distinct words, start over rather than grow without bound.
+const MAX_TRACKED_CONVERSIONS: usize = 256;
+
 /// Bump the manual-conversion counter for `word`. Returns `true` when the count reaches
 /// `suggest_after` — the entry is then reset, so declining the offer doesn't re-ask on the
 /// very next conversion.
@@ -1546,7 +2028,12 @@ fn bump_conversion_count(
     word: &str,
     typed: &str,
 ) -> bool {
-    let mut m = counts.lock().unwrap();
+    let mut m = lock(counts);
+    if m.len() >= MAX_TRACKED_CONVERSIONS && !m.contains_key(word) {
+        // Dropping the tallies costs at most a delayed offer for words converted once or
+        // twice long ago — which is exactly the set worth forgetting.
+        m.clear();
+    }
     let entry = m.entry(word.to_string()).or_insert((0, String::new()));
     entry.0 += 1;
     entry.1 = typed.trim().to_string();
@@ -1663,6 +2150,20 @@ fn fix_case_word(word: &str, known: impl Fn(&str) -> bool) -> Option<String> {
     None
 }
 
+/// Re-case `word` the way `model` is cased: all-lower, Capitalized, or ALL-CAPS. Used to keep
+/// the flip target in step with the case-cycle hotkey.
+fn match_case(word: &str, model: &str) -> String {
+    let upper: String = model.chars().flat_map(|c| c.to_uppercase()).collect();
+    let lower: String = model.chars().flat_map(|c| c.to_lowercase()).collect();
+    if model == upper && model != lower {
+        word.chars().flat_map(|c| c.to_uppercase()).collect()
+    } else if model == capitalize(model) && model != lower {
+        capitalize(word)
+    } else {
+        word.chars().flat_map(|c| c.to_lowercase()).collect()
+    }
+}
+
 /// Cycle the case: `слово` → `Слово` → `СЛОВО` → `слово`. State is detected on the string
 /// as-is, so it works on a held preedit (word + trailing separator) too.
 fn cycle_case(w: &str) -> String {
@@ -1726,8 +2227,17 @@ async fn forward_key(
     keycode: u32,
     state: u32,
 ) -> zbus::Result<()> {
-    se.emit("org.freedesktop.IBus.Engine", "ForwardKeyEvent", &(keyval, keycode, state))
-        .await
+    let args = (keyval, keycode, state);
+    let emit = se.emit("org.freedesktop.IBus.Engine", "ForwardKeyEvent", &args);
+    match tokio::time::timeout(EMIT_TIMEOUT, emit).await {
+        Ok(r) => r,
+        // Bounded like every other emit: the selection-conversion task that calls this must
+        // not sit forever holding a half-applied replacement.
+        Err(_) => Err(zbus::Error::InputOutput(Arc::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "ForwardKeyEvent timed out",
+        )))),
+    }
 }
 
 /// Forward one Backspace as a press+release pair with a valid keycode. On a field with an
@@ -1892,25 +2402,35 @@ pub(crate) fn parse_keysym_name(name: &str) -> Option<Keysym> {
     parse_hotkey(name).map(|h| h.keysym)
 }
 
-/// Parse a tap-modifier combo from config (`"Ctrl"`, `"Alt+Shift"`, `"Ctrl+Alt"`, `"Super"`,
-/// `"none"`) into a [`ModCombo`]. Returns `None` for `"none"`/empty/unparseable input, and
-/// for a bare `"Shift"` — that gesture is an aborted capital letter, never a deliberate tap.
-pub(crate) fn parse_tap_combo(s: &str) -> Option<ModCombo> {
-    let mut combo = ModCombo::default();
-    for p in s.split('+') {
-        match p.trim().to_ascii_lowercase().as_str() {
-            "" => {}
-            "ctrl" | "control" => combo.ctrl = true,
-            "shift" => combo.shift = true,
-            "alt" => combo.alt = true,
-            "super" | "meta" | "win" => combo.sup = true,
-            _ => return None, // includes "none"
-        }
+/// Does the shown preedit start with `word`, ignoring case? Case-insensitive because the
+/// accidental-caps fix and the case-cycle hotkey both rewrite what is shown (`привет ` →
+/// `Привет `) while the word we compare against keeps the case it was rendered with.
+fn starts_with_word(shown: &str, word: &str) -> bool {
+    !word.is_empty() && shown.to_lowercase().starts_with(&word.to_lowercase())
+}
+
+/// Take the held word out of `slot`, but only while it is still the one `generation` was
+/// armed for. This is what keeps a fired idle-commit timer from touching a word the engine
+/// has meanwhile flushed, flipped or replaced — i.e. from committing the same text twice.
+fn take_if_current(slot: &HeldSlot, generation: u64) -> Option<Held> {
+    let mut guard = lock(slot);
+    match guard.as_ref() {
+        Some(h) if h.generation == generation => guard.take(),
+        _ => None,
     }
-    if combo.size() == 0 || combo == (ModCombo { shift: true, ..Default::default() }) {
-        return None;
-    }
-    Some(combo)
+}
+
+/// Is this a numpad keysym? The numpad is **layout-independent** — `/`, `*`, `-`, `+`, `.`,
+/// `,` and the digits are the same in US-QWERTY and ЙЦУКЕН alike — so its characters must
+/// never go through the main-row transliteration table (see the RU-direct separator remap).
+fn is_numpad(keyval: Keysym) -> bool {
+    use xkeysym::Keysym as K;
+    matches!(
+        keyval,
+        K::KP_0 | K::KP_1 | K::KP_2 | K::KP_3 | K::KP_4 | K::KP_5 | K::KP_6 | K::KP_7
+            | K::KP_8 | K::KP_9 | K::KP_Add | K::KP_Subtract | K::KP_Multiply | K::KP_Divide
+            | K::KP_Decimal | K::KP_Separator | K::KP_Equal | K::KP_Space | K::KP_Enter
+    )
 }
 
 /// Convert an IBus keysym to its Unicode character when one exists. For Latin-1 keysyms the
@@ -2058,7 +2578,7 @@ mod tests {
         ] {
             assert_eq!(keysym_to_char(k), Some(c), "{k:?}");
             assert_eq!(
-                classify_keysym(k, Mods::default(), Lang::En),
+                classify_keysym(k, Lang::En),
                 KeyEvent::Separator,
                 "{k:?} must classify as Separator"
             );
@@ -2066,7 +2586,7 @@ mod tests {
         // NumLock-off numpad = navigation → must invalidate, same as the main-row keys.
         for k in [Keysym::KP_Home, Keysym::KP_Left, Keysym::KP_Page_Down, Keysym::KP_Delete] {
             assert_eq!(
-                classify_keysym(k, Mods::default(), Lang::En),
+                classify_keysym(k, Lang::En),
                 KeyEvent::Invalidate,
                 "{k:?} must classify as Invalidate"
             );
@@ -2125,6 +2645,66 @@ mod tests {
     }
 
     #[test]
+    fn shown_word_is_matched_ignoring_case() {
+        // `fix_case` and the case-cycle hotkey rewrite what is SHOWN without changing the
+        // layout, so matching the shown preedit against the conversion target has to ignore
+        // case — otherwise the manual-conversion counter never fires for a word whose case
+        // was corrected, and «запомнить слово» offers the wrong form.
+        assert!(starts_with_word("Привет ", "привет"));
+        assert!(starts_with_word("СЛОВО ", "слово"));
+        assert!(!starts_with_word("ghbdtn ", "привет"));
+        assert!(!starts_with_word("привет ", ""));
+    }
+
+    #[test]
+    fn idle_commit_only_fires_for_the_word_it_was_armed_for() {
+        let held = |generation| Held {
+            shown: "привет ".into(),
+            other: "ghbdtn ".into(),
+            typed: "ghbdtn".into(),
+            converted: "привет".into(),
+            auto_converted: true,
+            learned: false,
+            counted: false,
+            generation,
+        };
+        let slot: HeldSlot = Arc::new(std::sync::Mutex::new(Some(held(7))));
+
+        // A timer armed for an older hold must not touch the word now in the slot — otherwise
+        // a word the user is still typing on gets committed out from under them, or the same
+        // text is committed twice.
+        assert!(take_if_current(&slot, 6).is_none());
+        assert!(slot.lock().unwrap().is_some(), "the current hold must survive a stale timer");
+
+        // The timer that owns the hold takes it, exactly once.
+        assert_eq!(take_if_current(&slot, 7).map(|h| h.shown).as_deref(), Some("привет "));
+        assert!(take_if_current(&slot, 7).is_none(), "an empty slot has nothing to commit");
+    }
+
+    #[test]
+    fn letter_case_comes_from_the_keysym_not_the_shift_state() {
+        // IBus delivers the keysym AFTER xkb applied Shift and CapsLock. With CapsLock on
+        // the user gets `G` while `state.shift()` is false; taking the physical Shift state
+        // instead of the keysym inverted the case of everything typed with CapsLock on
+        // (`ПРИВЕТ` committed as `привет`), because the buffer re-renders from `(code, shift)`.
+        let upper = classify_keysym(Keysym::G, Lang::En);
+        assert_eq!(
+            upper,
+            KeyEvent::Letter { code: 34, shift: true, cur: 'G', alt: 'П' },
+            "an uppercase keysym must record shift=true regardless of the modifier state"
+        );
+        let lower = classify_keysym(Keysym::g, Lang::En);
+        assert_eq!(lower, KeyEvent::Letter { code: 34, shift: false, cur: 'g', alt: 'п' });
+        // And the buffer renders back exactly what was typed.
+        let mut buf = WordBuffer::new();
+        buf.push(upper);
+        buf.push(lower);
+        let w = buf.finish(Lang::En).unwrap();
+        assert_eq!(w.cur, "Gg");
+        assert_eq!(w.alt, "Пп");
+    }
+
+    #[test]
     fn surrounding_selection_extracts_the_span() {
         // Cursor/anchor in either order; char (not byte) offsets — Cyrillic-safe.
         let sur = Some(("привет мир".to_string(), 7, 10));
@@ -2178,6 +2758,16 @@ mod tests {
     }
 
     #[test]
+    fn case_cycle_carries_over_to_the_flip_target() {
+        // Cycling the case then flipping the layout must not throw the case away.
+        assert_eq!(match_case("ckjdj ", "Слово "), "Ckjdj ");
+        assert_eq!(match_case("ckjdj ", "СЛОВО "), "CKJDJ ");
+        assert_eq!(match_case("CKJDJ ", "слово "), "ckjdj ");
+        // A word with no letters to case (a bare separator) is left alone.
+        assert_eq!(match_case(" ", " "), " ");
+    }
+
+    #[test]
     fn case_cycle_rotates_and_survives_separators() {
         assert_eq!(cycle_case("слово"), "Слово");
         assert_eq!(cycle_case("Слово"), "СЛОВО");
@@ -2220,25 +2810,41 @@ mod tests {
     }
 
     #[test]
-    fn purpose_policy() {
-        let hk = HotkeyBindings::from_config(&crate::config::Config::default());
-        let dict = UserDict::empty(std::env::temp_dir().join("puntu-test-purpose"));
+    fn conversion_counter_does_not_grow_without_bound() {
+        // Words that never reach the threshold used to stay in the map for the whole session.
+        let counts: ConvertCounts = Arc::new(std::sync::Mutex::new(Default::default()));
+        for i in 0..(MAX_TRACKED_CONVERSIONS * 2) {
+            assert!(!bump_conversion_count(&counts, 3, &format!("слово{i}"), "ckjdj"));
+        }
+        assert!(
+            counts.lock().unwrap().len() <= MAX_TRACKED_CONVERSIONS,
+            "the counter must stay bounded"
+        );
+    }
+
+    /// An engine wired up from `cfg`, for the policy tests. Nothing here touches DBus — the
+    /// transparency rules are pure state, which is exactly why they are testable.
+    fn test_engine(cfg: &crate::config::Config) -> PuntuEngine {
+        let dict = UserDict::empty(std::env::temp_dir().join("puntu-test-policy"));
         let det = Detector::new(
             crate::detect::Models::default(),
             crate::config::DetectConfig::default(),
         );
-        let mut e = PuntuEngine::new(
+        PuntuEngine::new(
             1,
-            Arc::new(det),
+            Arc::new(std::sync::RwLock::new(Arc::new(det))),
             Arc::new(AsyncMutex::new(dict)),
-            hk,
-            true,
-            true,
+            HotkeyBindings::from_config(cfg),
+            EngineOptions::from_config(cfg),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(Default::default())),
             Arc::new(std::sync::Mutex::new(None)),
-            3,
-        );
+        )
+    }
+
+    #[test]
+    fn purpose_policy() {
+        let mut e = test_engine(&crate::config::Config::default());
         // Passwords/PINs: fully transparent.
         for p in [PURPOSE_PASSWORD, PURPOSE_PIN] {
             e.purpose = p;
@@ -2254,6 +2860,79 @@ mod tests {
         e.purpose = 0;
         assert!(!e.is_passthrough());
         assert!(!e.in_terminal());
+    }
+
+    #[test]
+    fn a_client_without_preedit_support_is_transparent() {
+        // The engine shows a half-typed word only in the preedit, so a client that doesn't
+        // render one displays nothing at all while typing — «puntu перестал печатать».
+        let mut e = test_engine(&crate::config::Config::default());
+        assert!(!e.is_passthrough(), "capabilities unknown → assume the client is fine");
+
+        e.caps = Some(CAP_PREEDIT_TEXT | 0x20);
+        assert!(!e.is_passthrough());
+
+        e.caps = Some(0x08); // FOCUS only — no preedit
+        assert_eq!(e.passthrough_reason(), Some(Passthrough::NoPreedit));
+    }
+
+    #[test]
+    fn preedit_capability_rule_can_be_turned_off() {
+        let mut cfg = crate::config::Config::default();
+        cfg.ibus_clients.require_preedit_capability = false;
+        let mut e = test_engine(&cfg);
+        e.caps = Some(0x08);
+        assert!(!e.is_passthrough(), "the rule is opt-out for clients that under-report");
+    }
+
+    #[test]
+    fn listed_clients_are_transparent() {
+        // The reported case: an SDL game opens an IBus context, so WASD arrives looking like
+        // typing and gets swallowed into the word buffer instead of moving the character.
+        let mut e = test_engine(&crate::config::Config::default());
+        e.caps = Some(CAP_PREEDIT_TEXT);
+        e.client = "SDL2_Application".to_string();
+        assert_eq!(e.passthrough_reason(), Some(Passthrough::Client));
+
+        e.client = "gtk-im".to_string();
+        assert!(!e.is_passthrough());
+
+        // No client name at all (IBus older than FocusInId) must not disable the engine.
+        e.client.clear();
+        assert!(!e.is_passthrough());
+    }
+
+    #[test]
+    fn secret_fields_outrank_every_other_rule() {
+        // A password must never be buffered, whatever else is true of the client.
+        let mut e = test_engine(&crate::config::Config::default());
+        e.client = "SDL2_Application".to_string();
+        e.purpose = PURPOSE_PASSWORD;
+        assert_eq!(e.passthrough_reason(), Some(Passthrough::Secret));
+    }
+
+    #[test]
+    fn emit_failures_latch_degraded_and_a_focus_change_clears_it() {
+        let mut e = test_engine(&crate::config::Config::default());
+        for _ in 1..MAX_EMIT_FAILURES {
+            e.note_emit(false);
+            assert!(!e.is_passthrough(), "a stray failure must not disable the engine");
+        }
+        e.note_emit(false);
+        assert_eq!(e.passthrough_reason(), Some(Passthrough::Degraded));
+
+        // The fuse is per-context: the next field deserves a fresh try, or one bad moment
+        // would last until the daemon is restarted — the bug we are fixing.
+        e.recover();
+        assert!(!e.is_passthrough());
+
+        // A success mid-way resets the run, so slow-but-working stays working.
+        e.note_emit(false);
+        e.note_emit(true);
+        for _ in 1..MAX_EMIT_FAILURES {
+            e.note_emit(false);
+        }
+        assert!(!e.is_passthrough());
     }
 
     #[test]
@@ -2283,5 +2962,30 @@ mod tests {
         // Space and digits sit on the same keys in both layouts — unchanged.
         assert_eq!(convert_char(' ', Lang::En, Lang::Ru), ' ');
         assert_eq!(convert_char('5', Lang::En, Lang::Ru), '5');
+    }
+
+    #[test]
+    fn numpad_symbols_are_never_transliterated() {
+        // The numpad is layout-independent, so RU-direct must leave its characters alone.
+        // Running them through the main-row table printed a different key entirely.
+        for k in [
+            Keysym::KP_Divide,
+            Keysym::KP_Decimal,
+            Keysym::KP_Separator,
+            Keysym::KP_Add,
+            Keysym::KP_Subtract,
+            Keysym::KP_Multiply,
+            Keysym::KP_5,
+        ] {
+            assert!(is_numpad(k), "{k:?} must be recognised as numpad");
+        }
+        // What the guard prevents: the main-row table would turn these into other keys.
+        assert_eq!(convert_char('/', Lang::En, Lang::Ru), '.');
+        assert_eq!(convert_char('.', Lang::En, Lang::Ru), 'ю');
+        assert_eq!(convert_char(',', Lang::En, Lang::Ru), 'б');
+        // The main row itself is NOT numpad and must keep being remapped in RU-direct.
+        for k in [Keysym::slash, Keysym::period, Keysym::comma, Keysym::grave] {
+            assert!(!is_numpad(k), "{k:?} is a main-row key");
+        }
     }
 }

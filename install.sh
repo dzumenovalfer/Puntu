@@ -146,15 +146,30 @@ if [[ "$NO_SUDO" -eq 0 && -f "$USER_XML" ]]; then
 fi
 
 # 5. Restart IBus so it discovers the (re)registered component ----------------
+# GNOME runs ibus-daemon as part of the session; Hyprland/sway/i3 do not start anything, so
+# `ibus restart` has nothing to restart and the engine is never launched at all.
 say "Restarting IBus to pick up the engine…"
-ibus restart >/dev/null 2>&1 || warn "ibus restart failed — log out/in if Puntu doesn't appear."
+if pgrep -x ibus-daemon >/dev/null 2>&1; then
+  ibus restart >/dev/null 2>&1 || warn "ibus restart failed — log out/in if Puntu doesn't appear."
+else
+  say "ibus-daemon was not running — starting it…"
+  # -d daemonize, -r replace an old instance, -x start the XIM bridge (XWayland apps),
+  # -R restart the daemon if it dies.
+  ibus-daemon -drxR >/dev/null 2>&1 &
+fi
 sleep 1
 
-# 6. Add Puntu to GNOME input sources + activate it ---------------------------
-# So it shows up under Super+Space / the input-source icon and survives a reboot. Done
-# defensively: we only append if it isn't already there, and never rewrite an existing layout.
-if command -v gsettings >/dev/null 2>&1 \
+# 6. Make Puntu the active engine, and make that survive a reboot -------------
+# GNOME keeps its own input-source list; every other desktop relies on IBus's own
+# `preload-engines`. Doing only the GNOME half is why the engine "worked until reboot" (or
+# never appeared) outside GNOME.
+IS_GNOME=0
+case "${XDG_CURRENT_DESKTOP:-}" in *[Gg][Nn][Oo][Mm][Ee]*) IS_GNOME=1 ;; esac
+
+if [[ "$IS_GNOME" -eq 1 ]] && command -v gsettings >/dev/null 2>&1 \
    && gsettings writable org.gnome.desktop.input-sources sources >/dev/null 2>&1; then
+  # So it shows up under Super+Space / the input-source icon and survives a reboot. Done
+  # defensively: we only append if it isn't already there, and never rewrite an existing layout.
   CUR="$(gsettings get org.gnome.desktop.input-sources sources 2>/dev/null || echo '[]')"
   if [[ "$CUR" == *"'puntu'"* ]]; then
     say "Puntu already in GNOME input sources."
@@ -167,8 +182,47 @@ if command -v gsettings >/dev/null 2>&1 \
     gsettings set org.gnome.desktop.input-sources sources "$NEW" \
       || warn "could not edit input sources — add 'Puntu' via Settings → Keyboard → Input Sources."
   fi
+elif command -v gsettings >/dev/null 2>&1 \
+     && gsettings writable org.freedesktop.ibus.general preload-engines >/dev/null 2>&1; then
+  PRE="$(gsettings get org.freedesktop.ibus.general preload-engines 2>/dev/null || echo '[]')"
+  if [[ "$PRE" == *"'puntu'"* ]]; then
+    say "Puntu already in IBus preload-engines."
+  else
+    say "Adding Puntu to IBus preload-engines (this is what a non-GNOME session reads)…"
+    case "$PRE" in
+      "@as []"|"[]"|"") NEWPRE="['puntu']" ;;
+      *)                NEWPRE="${PRE%]}, 'puntu']" ;;
+    esac
+    gsettings set org.freedesktop.ibus.general preload-engines "$NEWPRE" \
+      || warn "could not set preload-engines — run \`puntu-ibus enable\` after each login."
+  fi
 fi
 ibus engine puntu >/dev/null 2>&1 || true
+
+# 6b. Non-GNOME sessions: print what the session itself has to provide --------
+# Nothing here can be done for the user: ibus-daemon autostart and the input-method
+# environment live in their compositor config, not in ours.
+if [[ "$IS_GNOME" -eq 0 ]]; then
+  say "Non-GNOME session detected (${XDG_CURRENT_DESKTOP:-unknown})."
+  cat <<'HINT'
+
+    Your session must start IBus and point apps at it. For Hyprland, add to hyprland.conf:
+
+      exec-once = ibus-daemon -drxR
+      env = GTK_IM_MODULE,ibus
+      env = QT_IM_MODULE,ibus
+      env = XMODIFIERS,@im=ibus
+
+    (sway/i3: the same three variables in your session env, plus the same exec.)
+
+    All three are needed here: IBus has no input-method-v2 implementation, so on wlroots
+    compositors apps reach it through these client-side IM modules rather than through the
+    compositor's text-input-v3 (which is how it works on GNOME, where nothing needs setting).
+
+    Then check the whole chain with:  puntu-ibus doctor
+
+HINT
+fi
 
 # 6c. Icons: the app icon + the three tray-status icons ----------------------
 # Installed into the user's hicolor theme so `Icon=puntu` (desktop files) and the tray's

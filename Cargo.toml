@@ -101,7 +101,11 @@ strip = true
 panic = "unwind"   # keep unwinding so the panic hook can release the keyboard grab
 
 [patch.crates-io]
-# Vendored librush 0.2.2 with one addition: the `ContentType` DBus property is delegated to
-# `IBusEngine::set_content_type`, so the engine can see the input purpose (terminal/password)
-# of the focused field and go transparent there. Drop when upstream exposes it.
+# Vendored librush 0.2.2. Additions, all of the same shape — DBus methods upstream stubs out,
+# delegated to the `IBusEngine` trait so the engine can see who it is talking to:
+#   * `ContentType`  → `set_content_type`: the input purpose (terminal/password) of the field.
+#   * `SetCapabilities` → `set_capabilities`: whether the client can render a preedit at all.
+#   * `FocusInId`/`FocusOutId` (+ `FocusId` = true) → `focus_in_id`/`focus_out_id`: the client's
+#     name, which is how a game (SDL) is told apart from a text field.
+# Drop each when upstream exposes it.
 librush = { path = "vendor/librush" }

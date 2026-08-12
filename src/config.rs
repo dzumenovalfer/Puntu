@@ -22,11 +22,16 @@ pub fn socket_path() -> PathBuf {
             return rt.join("puntu.sock");
         }
     }
-    std::env::temp_dir().join(format!("puntu-{}.sock", whoami_uid()))
+    std::env::temp_dir().join(format!("puntu-{}.sock", uid()))
 }
 
-fn whoami_uid() -> String {
-    std::env::var("UID").unwrap_or_else(|_| "user".into())
+/// The real user id. Read from the kernel, not from `$UID`: that is a shell *variable* and is
+/// not exported, so the fallback path collapsed to one shared `/tmp/puntu-user.sock` for
+/// everyone — and the second user on a machine could neither unlink it (sticky /tmp) nor bind
+/// it, leaving them with no control socket at all.
+fn uid() -> u32 {
+    // SAFETY: `getuid` is always successful and takes no arguments.
+    unsafe { libc::getuid() }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -55,6 +60,18 @@ pub struct Config {
     /// modifier tap to fire. Longer chains are held shortcuts (Ctrl+click, an app-consumed
     /// chord like Ctrl+Shift+V in a terminal) and are ignored. Default 500.
     pub tap_max_hold_ms: u64,
+    /// How long (ms) a finished word may stay uncommitted in the preedit, where the flip
+    /// hotkey can still re-render it, before the engine commits it on its own.
+    ///
+    /// The word lives only in the preedit, so it belongs to a caret position we stop
+    /// controlling as soon as the user reaches for the mouse: apps move the caret on a click
+    /// and only then reset the input context, which used to drop the word wherever the click
+    /// landed. Committing after a short idle keeps it where it was typed.
+    ///
+    /// The trade-off is the flip window: `Ctrl+` `` ` `` only re-renders a word that is still
+    /// held. Raise this if you flip words late; lower it if a click still moves a word.
+    /// `0` disables the timer entirely (the word waits indefinitely, as before).
+    pub hold_commit_ms: u64,
     pub detect: DetectConfig,
     /// Dictionary-learning behaviour (the repeat-conversion suggestion dialog etc.).
     pub learning: LearningConfig,
@@ -64,6 +81,8 @@ pub struct Config {
     /// separate section from [`Hotkeys`]. The flip/undo default is `"Ctrl+grave"` (present on
     /// every keyboard); `"Pause"`, `"F12"`, `"ScrollLock"`, `"Menu"`, `"Insert"` also work.
     pub ibus_hotkeys: IBusHotkeys,
+    /// Which clients the IBus engine leaves alone entirely (games, clients with no preedit).
+    pub ibus_clients: ClientPolicy,
 }
 
 /// IBus-side hotkey configuration. All values are xkb keysym names (case-insensitive;
@@ -118,6 +137,65 @@ impl Default for IBusHotkeys {
             remember_key: "Ctrl+Alt+d".to_string(),
             case_key: "Ctrl+Alt+u".to_string(),
         }
+    }
+}
+
+/// Which clients the IBus engine refuses to touch at all.
+///
+/// The engine shows every letter the user types through the IBus **preedit** and only commits
+/// it later, so a client that doesn't render preedit displays *nothing at all* while typing —
+/// the «перестал печатать» report. The same swallowing is what makes a game unplayable: WASD
+/// goes into the word buffer instead of to the game. Both are the same question — "is this
+/// client a text field we can work with?" — so both live here.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClientPolicy {
+    /// Go transparent in clients that don't advertise `IBUS_CAP_PREEDIT_TEXT`. On by default:
+    /// holding text in a preedit the client will never draw is strictly worse than not
+    /// correcting at all. Turn off only if some client under-reports its capabilities and you
+    /// would rather have corrections there.
+    pub require_preedit_capability: bool,
+    /// Client names (as passed to `CreateInputContext`) the engine stays transparent for.
+    /// Matched case-insensitively as a **substring**, so `"SDL"` covers `SDL2_Application`
+    /// and `SDL3_Application`. The engine logs `client=…` on every focus change, so an app
+    /// that misbehaves can be read straight out of the journal and added here.
+    pub passthrough_clients: Vec<String>,
+    /// Also stay transparent in every X11/XWayland client that comes through IBus's XIM
+    /// bridge (client name `xim`). Off by default — that would cover a lot of ordinary apps —
+    /// but it is the one switch that reliably silences Wine/Proton games, which reach IBus
+    /// through XIM rather than SDL.
+    pub passthrough_xim: bool,
+}
+
+impl Default for ClientPolicy {
+    fn default() -> Self {
+        ClientPolicy {
+            require_preedit_capability: true,
+            // SDL creates its IBus context as soon as text input is enabled — which older SDL2
+            // does at window creation — so a game's movement keys arrive here looking exactly
+            // like typing.
+            passthrough_clients: vec!["SDL".to_string()],
+            passthrough_xim: false,
+        }
+    }
+}
+
+impl ClientPolicy {
+    /// Is `client` on the passthrough list? Case-insensitive substring match; an empty client
+    /// name (IBus older than 1.5.27, which never sends one) matches nothing, and an empty
+    /// pattern is ignored rather than matching everything.
+    pub fn matches_client(&self, client: &str) -> bool {
+        if client.is_empty() {
+            return false;
+        }
+        let client = client.to_lowercase();
+        if self.passthrough_xim && client == "xim" {
+            return true;
+        }
+        self.passthrough_clients
+            .iter()
+            .filter(|p| !p.trim().is_empty())
+            .any(|p| client.contains(&p.trim().to_lowercase()))
     }
 }
 
@@ -196,10 +274,62 @@ impl Hotkey {
     }
 }
 
+/// A modifier-set gesture: press the set (any order), release it, with no other key in
+/// between. `Ctrl`, `Ctrl+Shift`, `Alt+Shift`, `Ctrl+Alt`, `Super` … — matched against the
+/// configured `mode_toggle` / `convert_last` bindings, like the system layout-switch options
+/// in GNOME Tweaks.
+///
+/// Lives here rather than in the IBus engine because BOTH front-ends have to honour the
+/// gesture the user picked, and the uinput daemon builds without the `ibus` feature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ModCombo {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub sup: bool,
+}
+
+impl ModCombo {
+    pub fn size(self) -> u32 {
+        self.ctrl as u32 + self.shift as u32 + self.alt as u32 + self.sup as u32
+    }
+}
+
+impl From<crate::keymap::Mods> for ModCombo {
+    fn from(m: crate::keymap::Mods) -> Self {
+        ModCombo { ctrl: m.ctrl, shift: m.shift, alt: m.alt, sup: m.meta }
+    }
+}
+
+/// Parse a tap-modifier combo from config (`"Ctrl"`, `"Alt+Shift"`, `"Ctrl+Alt"`, `"Super"`,
+/// `"none"`) into a [`ModCombo`]. Returns `None` for `"none"`/empty/unparseable input, and
+/// for a bare `"Shift"` — that gesture is an aborted capital letter, never a deliberate tap.
+pub fn parse_tap_combo(s: &str) -> Option<ModCombo> {
+    let mut combo = ModCombo::default();
+    for p in s.split('+') {
+        match p.trim().to_ascii_lowercase().as_str() {
+            "" => {}
+            "ctrl" | "control" => combo.ctrl = true,
+            "shift" => combo.shift = true,
+            "alt" => combo.alt = true,
+            "super" | "meta" | "win" => combo.sup = true,
+            _ => return None, // includes "none"
+        }
+    }
+    if combo.size() == 0 || combo == (ModCombo { shift: true, ..Default::default() }) {
+        return None;
+    }
+    Some(combo)
+}
+
 const KEY_PAUSE: u16 = 119;
 
 /// Default for `tap_max_hold_ms` — a deliberate modifier tap is well under half a second.
 pub const DEFAULT_TAP_MAX_HOLD_MS: u64 = 500;
+
+/// Default for `hold_commit_ms`. Long enough to notice a wrong word and reach for the flip
+/// hotkey, short enough that a word doesn't survive until the user clicks somewhere else.
+pub const DEFAULT_HOLD_COMMIT_MS: u64 = 1500;
 
 impl Default for Config {
     fn default() -> Self {
@@ -209,10 +339,12 @@ impl Default for Config {
             enable_modifier_taps: true,
             fix_case: true,
             tap_max_hold_ms: DEFAULT_TAP_MAX_HOLD_MS,
+            hold_commit_ms: DEFAULT_HOLD_COMMIT_MS,
             detect: DetectConfig::default(),
             learning: LearningConfig::default(),
             hotkeys: Hotkeys::default(),
             ibus_hotkeys: IBusHotkeys::default(),
+            ibus_clients: ClientPolicy::default(),
         }
     }
 }
@@ -321,5 +453,44 @@ mod tests {
         assert!(hk.matches(119, shift));
         assert!(!hk.matches(119, plain));
         assert!(!hk.matches(120, shift));
+    }
+
+    #[test]
+    fn client_policy_matches_sdl_by_substring() {
+        // The default `"SDL"` entry has to cover every SDL generation and casing, since that
+        // is the one client name a game reliably reports.
+        let p = ClientPolicy::default();
+        assert!(p.matches_client("SDL2_Application"));
+        assert!(p.matches_client("sdl3_application"));
+        assert!(!p.matches_client("gtk-im"));
+        assert!(!p.matches_client("QIBusPlatformInputContext"));
+    }
+
+    #[test]
+    fn client_policy_ignores_empty_names_and_patterns() {
+        // IBus older than 1.5.27 never sends a client name; an empty pattern (a stray comma in
+        // the config) must not turn into "match everything" and silently disable the engine.
+        let mut p = ClientPolicy::default();
+        assert!(!p.matches_client(""));
+        p.passthrough_clients = vec![String::new(), "  ".to_string()];
+        assert!(!p.matches_client("gtk-im"));
+    }
+
+    #[test]
+    fn client_policy_xim_is_opt_in() {
+        let mut p = ClientPolicy { passthrough_clients: Vec::new(), ..Default::default() };
+        assert!(!p.matches_client("xim"), "XIM apps stay corrected by default");
+        p.passthrough_xim = true;
+        assert!(p.matches_client("xim"));
+        assert!(!p.matches_client("gtk-im"), "the switch is XIM-only");
+    }
+
+    #[test]
+    fn client_policy_survives_old_config_files() {
+        // Config files written before the section existed must still load, with the protective
+        // default on — otherwise upgrading would silently keep the invisible-typing bug.
+        let old: Config = toml::from_str("dry_run = false\n").unwrap();
+        assert!(old.ibus_clients.require_preedit_capability);
+        assert!(old.ibus_clients.matches_client("SDL2_Application"));
     }
 }

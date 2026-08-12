@@ -156,6 +156,44 @@ pub trait IBusEngine: Send + Sync {
         Ok(())
     }
 
+    /// The client declared its capabilities (`SetCapabilities`). Bits, from `IBusCapabilite`:
+    /// 1 = PREEDIT_TEXT, 2 = AUXILIARY_TEXT, 4 = LOOKUP_TABLE, 8 = FOCUS, 16 = PROPERTY,
+    /// 32 = SURROUNDING_TEXT.
+    ///
+    /// An engine that renders through the preedit MUST honour `PREEDIT_TEXT`: a client without
+    /// that bit never displays `UpdatePreeditText`, so anything the engine parks there is
+    /// invisible to the user — which looks exactly like the keyboard having died.
+    fn set_capabilities(&mut self, _caps: u32) -> fdo::Result<()> {
+        Ok(())
+    }
+
+    /// Focus entered an input context, identified by its object path and the **client name**
+    /// the client passed to `CreateInputContext` (`"gtk-im"`, `"xim"`, `"SDL2_Application"`, …).
+    ///
+    /// Only delivered while the `FocusId` property reads `true` (see [`Engine::focus_id`]), and
+    /// IBus then sends `FocusInId` *instead of* `FocusIn` — so the default implementation
+    /// forwards to [`IBusEngine::focus_in`], and any override must do that work itself.
+    fn focus_in_id(
+        &mut self,
+        se: SignalEmitter<'_>,
+        server: &ObjectServer,
+        _object_path: String,
+        _client: String,
+    ) -> impl Future<Output = fdo::Result<()>> + Send {
+        self.focus_in(se, server)
+    }
+
+    /// Focus left the input context named by `object_path` — the counterpart of
+    /// [`IBusEngine::focus_in_id`], and likewise a replacement for [`IBusEngine::focus_out`].
+    fn focus_out_id(
+        &mut self,
+        se: SignalEmitter<'_>,
+        server: &ObjectServer,
+        _object_path: String,
+    ) -> impl Future<Output = fdo::Result<()>> + Send {
+        self.focus_out(se, server)
+    }
+
     /// The client updated the text around the caret (`SetSurroundingText`): `text` is the
     /// plain surrounding text, `cursor_pos`/`anchor_pos` are char offsets into it; when they
     /// differ, the span between them is the current selection.
@@ -426,9 +464,8 @@ impl<T: IBusEngine + 'static> Engine<T> {
         Ok(())
     }
 
-    // 忽略
-    fn set_capabilities(&mut self, _caps: u32) -> fdo::Result<()> {
-        Ok(())
+    fn set_capabilities(&mut self, caps: u32) -> fdo::Result<()> {
+        self.e.set_capabilities(caps)
     }
 
     // 忽略 (用户界面相关)
@@ -468,9 +505,14 @@ impl<T: IBusEngine + 'static> Engine<T> {
         self.e.focus_in(se, server).await
     }
 
-    fn focus_in_id(&mut self, _object_path: String, _client: String) -> fdo::Result<()> {
-        // TODO
-        Ok(())
+    async fn focus_in_id(
+        &mut self,
+        #[zbus(signal_emitter)] se: SignalEmitter<'_>,
+        #[zbus(object_server)] server: &ObjectServer,
+        object_path: String,
+        client: String,
+    ) -> fdo::Result<()> {
+        self.e.focus_in_id(se, server, object_path, client).await
     }
 
     async fn focus_out(
@@ -481,9 +523,13 @@ impl<T: IBusEngine + 'static> Engine<T> {
         self.e.focus_out(se, server).await
     }
 
-    fn focus_out_id(&mut self, _object_path: String) -> fdo::Result<()> {
-        // TODO
-        Ok(())
+    async fn focus_out_id(
+        &mut self,
+        #[zbus(signal_emitter)] se: SignalEmitter<'_>,
+        #[zbus(object_server)] server: &ObjectServer,
+        object_path: String,
+    ) -> fdo::Result<()> {
+        self.e.focus_out_id(se, server, object_path).await
     }
 
     async fn reset(
@@ -638,10 +684,14 @@ impl<T: IBusEngine + 'static> Engine<T> {
         self.e.set_content_type(t.0, t.1)
     }
 
+    /// `true` makes IBus deliver `FocusInId`/`FocusOutId` — which carry the input context's
+    /// object path and the client's name — instead of the bare `FocusIn`/`FocusOut`. Engines
+    /// that don't override the `_id` variants see no difference: their defaults forward to
+    /// `focus_in`/`focus_out`. IBus releases older than 1.5.27 don't read this property and
+    /// keep sending the bare calls.
     #[zbus(property)]
     fn focus_id(&self) -> bool {
-        // TODO
-        false
+        true
     }
 
     #[zbus(property)]

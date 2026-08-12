@@ -18,7 +18,9 @@ use tracing::info;
 use crate::config;
 use crate::detect::userdict::UserDict;
 use crate::detect::{Detector, Models};
-use crate::ibus::engine::{HotkeyBindings, PuntuEngine, PuntuFactory};
+use crate::ibus::engine::{
+    DetectorSlot, EngineOptions, HotkeyBindings, PuntuEngine, PuntuFactory,
+};
 
 /// Our DBus well-known name — also the component name in the registry XML.
 pub const BUS_NAME: &str = "org.freedesktop.IBus.Puntu";
@@ -40,16 +42,25 @@ pub async fn run() -> Result<()> {
     let cfg = config::Config::load().unwrap_or_default();
     let detector = Detector::new(models, cfg.detect.clone());
     let hotkeys = HotkeyBindings::from_config(&cfg);
-    // `dry_run` doubles as the auto-correct kill switch for the engine: detect-but-don't-touch
-    // means words are held exactly as typed and only convert on the manual flip hotkey.
-    let autocorrect = !cfg.dry_run;
+    let opts = EngineOptions::from_config(&cfg);
     info!(
-        "hotkeys: undo={:?} mode_toggle={:?} convert_last={:?} taps_enabled={} autocorrect={}",
+        "hotkeys: undo={:?} mode_toggle={:?} convert_last={:?} taps_enabled={} autocorrect={} \
+         hold_commit_ms={}",
         cfg.ibus_hotkeys.undo_key,
         cfg.ibus_hotkeys.mode_toggle,
         cfg.ibus_hotkeys.convert_last,
         cfg.enable_modifier_taps,
-        autocorrect,
+        opts.autocorrect,
+        cfg.hold_commit_ms,
+    );
+    // Logged on its own line because it is the first thing to check when the engine "does
+    // nothing" in one app but works everywhere else.
+    info!(
+        "client policy: require_preedit_capability={} passthrough_clients={:?} \
+         passthrough_xim={}",
+        opts.clients.require_preedit_capability,
+        opts.clients.passthrough_clients,
+        opts.clients.passthrough_xim,
     );
 
     // Share the dict between the engines and a hot-reload watcher, so `puntu dict add/learn`
@@ -57,18 +68,25 @@ pub async fn run() -> Result<()> {
     // The uinput daemon always had this; the IBus engine loading the dict once at startup is
     // why "puntu dict add … did nothing" until now.
     let dict = Arc::new(AsyncMutex::new(dict));
+    // Same for the detector: `words.{ru,en}.txt` feed the language models (and `russian.fst`
+    // is the big dictionary), so teaching a word has to rebuild those too — not just the
+    // dict's recognized set. Without this the engine kept the models it booted with.
+    let detector: DetectorSlot = Arc::new(std::sync::RwLock::new(Arc::new(detector)));
     // Tray pause flag: initial state from the marker file, then live via the watcher.
     let paused = Arc::new(std::sync::atomic::AtomicBool::new(paused_path().exists()));
-    spawn_dict_reload_watcher(Arc::clone(&dict), Arc::clone(&paused));
+    spawn_dict_reload_watcher(
+        Arc::clone(&dict),
+        Arc::clone(&detector),
+        cfg.detect.clone(),
+        Arc::clone(&paused),
+    );
 
     let factory = PuntuFactory::new(
-        detector,
+        Arc::clone(&detector),
         dict,
         hotkeys,
-        autocorrect,
-        cfg.fix_case,
+        opts,
         Arc::clone(&paused),
-        cfg.learning.suggest_after,
     );
 
     let _ibus = librush::ibus::IBus::<PuntuEngine, PuntuFactory>::new(
@@ -99,11 +117,13 @@ fn paused_path() -> std::path::PathBuf {
 
 fn spawn_dict_reload_watcher(
     dict: Arc<AsyncMutex<UserDict>>,
+    detector: DetectorSlot,
+    detect_cfg: crate::config::DetectConfig,
     paused: Arc<std::sync::atomic::AtomicBool>,
 ) {
     if let Err(e) = std::thread::Builder::new()
         .name("puntu-dict-reload".into())
-        .spawn(move || dict_reload_watcher(dict, paused))
+        .spawn(move || dict_reload_watcher(dict, detector, detect_cfg, paused))
     {
         tracing::warn!("dictionary hot-reload disabled (thread spawn failed): {e}");
     }
@@ -116,6 +136,8 @@ fn spawn_dict_reload_watcher(
 /// `reload_watcher` (`input/mod.rs`), minus the config/models parts the engine reads at boot.
 fn dict_reload_watcher(
     dict: Arc<AsyncMutex<UserDict>>,
+    detector: DetectorSlot,
+    detect_cfg: crate::config::DetectConfig,
     paused: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use notify::{RecursiveMode, Watcher};
@@ -142,6 +164,17 @@ fn dict_reload_watcher(
         )
     }
 
+    /// The files `Models::load` reads. `words.{ru,en}.txt` are in BOTH lists: they extend the
+    /// dict's recognized set *and* train the language models, so a taught word has to rebuild
+    /// both — that is what the uinput daemon's watcher has always done (`input/mod.rs`).
+    /// `russian.fst` was not watched at all, so `puntu build-dict` needed an engine restart.
+    fn is_model_file(p: &std::path::Path) -> bool {
+        matches!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some("words.ru.txt" | "words.en.txt" | "russian.fst")
+        )
+    }
+
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = match notify::recommended_watcher(tx) {
         Ok(w) => w,
@@ -158,6 +191,7 @@ fn dict_reload_watcher(
     info!("watching {} for dictionary edits", dir.display());
 
     let mut dirty = false;
+    let mut models_dirty = false;
     let mut deadline: Option<Instant> = None;
     loop {
         let timeout = match deadline {
@@ -176,6 +210,11 @@ fn dict_reload_watcher(
                 }
                 if ev.paths.iter().any(|p| is_dict_file(p)) {
                     dirty = true;
+                }
+                if ev.paths.iter().any(|p| is_model_file(p)) {
+                    models_dirty = true;
+                }
+                if dirty || models_dirty {
                     deadline = Some(Instant::now() + DEBOUNCE);
                 }
             }
@@ -187,6 +226,21 @@ fn dict_reload_watcher(
                         Err(e) => tracing::warn!("dictionary reload failed: {e}"),
                     }
                     dirty = false;
+                }
+                if models_dirty {
+                    // Train + read the FST OUTSIDE the lock: this takes hundreds of
+                    // milliseconds, and engines only ever hold the lock long enough to clone
+                    // the `Arc` out of it.
+                    let rebuilt =
+                        Arc::new(Detector::new(Models::load(&dir), detect_cfg.clone()));
+                    match detector.write() {
+                        Ok(mut slot) => {
+                            *slot = rebuilt;
+                            info!("language models rebuilt");
+                        }
+                        Err(e) => tracing::warn!("could not swap the detector: {e}"),
+                    }
+                    models_dirty = false;
                 }
                 deadline = None;
             }

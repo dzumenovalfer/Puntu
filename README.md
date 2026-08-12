@@ -31,6 +31,10 @@ Targets Ubuntu/Debian GNOME (Wayland or X11). Because Puntu is an IBus engine, t
 `/dev/input` access, uinput, `input` group, udev rule, systemd service, or re-login involved —
 ibus-daemon launches the engine on demand.
 
+> On **X11**, typing and auto-correction work as usual, but converting a *mouse selection*
+> does not: it reads the selection with `wl-paste`, which is Wayland-only. Everything that
+> acts on the word you just typed (auto-correct, the flip hotkey, case fixes) is unaffected.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dzumenovalfer/Puntu/main/install.sh | bash
 ```
@@ -47,9 +51,30 @@ Then switch to it with **Super+Space** (or the input-source icon) and pick **Pun
 
 ```sh
 puntu-ibus status      # is the engine registered + active?
+puntu-ibus doctor      # full check: session, IBus, IM env, helpers, config
 puntu-ibus enable      # make Puntu the active engine
 puntu-ibus disable     # back to the plain US layout (xkb:us::eng)
 ```
+
+### Hyprland, sway and other non-GNOME sessions
+
+Puntu works there, but the session has to provide two things GNOME provides for you: a running
+`ibus-daemon`, and the environment that points apps at it. The installer sets up everything on
+its side (including IBus's own `preload-engines`, which is what a non-GNOME session reads
+instead of the GNOME input-source list) and prints the rest. For Hyprland, in `hyprland.conf`:
+
+```
+exec-once = ibus-daemon -drxR
+env = GTK_IM_MODULE,ibus
+env = QT_IM_MODULE,ibus
+env = XMODIFIERS,@im=ibus
+```
+
+All three variables matter here. IBus ships no `input-method-v2` implementation, so on wlroots
+compositors apps reach it through these client-side IM modules — not through the compositor's
+`text-input-v3`, which is how it works on GNOME (where nothing needs setting at all).
+
+Then `puntu-ibus doctor` checks the whole chain and names anything still missing.
 
 ## Using it
 
@@ -92,6 +117,31 @@ VTE-based apps do), automatic conversions are off — a command line can never b
 correction. Manual use still works: tap **Ctrl** for RU-direct typing, `Ctrl+` `` ` `` to flip
 the last word. Selection conversion is disabled there (terminals don't replace a selection).
 **Password/PIN** fields make Puntu fully transparent — passwords never sit in a preedit.
+
+### Games, and apps where Puntu should keep out
+
+A word you're typing lives in the IBus **preedit** until Puntu commits it. That has one
+consequence worth knowing: a client that doesn't draw a preedit would show *nothing at all*
+while you type. Puntu refuses to work in such clients rather than swallow your text — and if
+DBus stops accepting text mid-session, it commits what it holds, turns itself off for that
+field, and lets you keep typing instead of going quiet until a restart.
+
+The same swallowing is what breaks games: SDL opens an IBus context for its text input, so
+**WASD arrives looking exactly like typing**. Clients named in `[ibus_clients]` are left
+completely alone; the default covers SDL:
+
+```toml
+[ibus_clients]
+require_preedit_capability = true       # no preedit → Puntu keeps out
+passthrough_clients = ["SDL"]           # case-insensitive substring match
+passthrough_xim = false                 # true also silences Wine/Proton (they come via XIM)
+```
+
+If a game still eats your keys, find its name in the engine log
+(`~/.local/state/puntu/engine.log`, look for `client=…`) and add it to the list — the config
+is hot-reloaded, no restart needed. Wine/Proton games reach IBus through the XIM bridge and
+report themselves as `xim`, so `passthrough_xim = true` is the switch for those; it also
+turns Puntu off in ordinary X11/XWayland apps, which is the trade-off.
 
 ### Hotkeys (defaults; configurable in `~/.config/puntu/config.toml`)
 
@@ -146,6 +196,8 @@ puntu dict learn <word>           # a real word (e.g. a service name) — its wr
                                   #   form will convert (ешлещл → tiktok)
 puntu dict rm <word>              # remove from every list
 puntu dict list [--manual|--learned|--force] [--ru|--en]
+puntu dict export [file]          # all your own words → one portable file (stdout if no path)
+puntu dict import <file>          # merge it back on another machine
 ```
 
 Single-letter words are handled too (`ш`→`i`, `b`→`и`). Dictionary edits are **hot-reloaded**:
