@@ -25,7 +25,28 @@ say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
 
 NO_SUDO=0
-[[ "${1:-}" == "--no-sudo" ]] && NO_SUDO=1
+UPDATE=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-sudo) NO_SUDO=1 ;;
+    --update)  UPDATE=1 ;;
+    -h|--help)
+      cat <<'USAGE'
+install.sh — install or update Puntu.
+
+  ./install.sh              full install: packages, binaries, IBus component, icons,
+                            menu entry, tray autostart, Electron flags
+  ./install.sh --update     update an existing install: pull, rebuild, reinstall the
+                            binaries, restart IBus. Skips everything one-time (packages,
+                            icons, .desktop files, Electron flags) and needs no sudo
+                            unless the engine's path changed. Run it from a checkout.
+  ./install.sh --no-sudo    skip apt and the system-wide component copy
+
+USAGE
+      exit 0 ;;
+    *) warn "unknown option: $arg (see ./install.sh --help)"; exit 1 ;;
+  esac
+done
 
 # Local mode = the script sits inside a source checkout. When piped via `curl | bash`,
 # BASH_SOURCE is unset/stdin and there is no Cargo.toml next to it → remote mode.
@@ -33,9 +54,37 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-/dev/null}")" 2>/dev/null && pwd ||
 LOCAL=0
 [[ -f "$REPO_DIR/Cargo.toml" ]] && LOCAL=1
 
+# --- Update mode -------------------------------------------------------------
+# Rebuilds from the checkout, so it needs one. A release tarball has no sources to update.
+if [[ "$UPDATE" -eq 1 && "$LOCAL" -eq 0 ]]; then
+  warn "--update rebuilds from source, so run it inside a checkout:"
+  warn "  git clone https://github.com/$PUNTU_REPO ~/puntu && cd ~/puntu && ./install.sh"
+  exit 1
+fi
+
+if [[ "$UPDATE" -eq 1 && -d "$REPO_DIR/.git" ]]; then
+  say "Updating the checkout…"
+  # This very file, so the re-exec below runs the script the user actually invoked.
+  SELF="${BASH_SOURCE[0]:-}"
+  BEFORE="$([[ -f "$SELF" ]] && cksum < "$SELF" || echo none)"
+  git -C "$REPO_DIR" pull --ff-only \
+    || warn "git pull failed — building whatever is checked out right now"
+  # The pull may have brought a NEWER version of this very script; the one already running
+  # is the old one. Hand over to the new one, once (PUNTU_REEXEC bounds it).
+  AFTER="$([[ -f "$SELF" ]] && cksum < "$SELF" || echo none)"
+  if [[ "$AFTER" != "$BEFORE" && "${PUNTU_REEXEC:-0}" -eq 0 ]]; then
+    say "install.sh itself changed — re-running the updated one…"
+    PUNTU_REEXEC=1 exec bash "$SELF" "$@"
+  fi
+fi
+
 # 1. System packages ----------------------------------------------------------
 # Remote mode only needs the runtime deps; a source build also needs a C toolchain.
-if [[ "$NO_SUDO" -eq 0 ]]; then
+# Updating never needs them again — and on a non-apt distro this whole section only ever
+# printed a warning anyway.
+if [[ "$UPDATE" -eq 1 ]]; then
+  :
+elif [[ "$NO_SUDO" -eq 0 ]]; then
   if command -v apt-get >/dev/null 2>&1; then
     PKGS=(ibus wl-clipboard curl)
     [[ "$LOCAL" -eq 1 ]] && PKGS+=(build-essential)
@@ -72,7 +121,10 @@ if [[ "$LOCAL" -eq 1 ]]; then
   cargo install --path "$REPO_DIR" --no-default-features --features ibus,app,gui --force
   BIN_DIR="$HOME/.cargo/bin"
 
-  if [[ -f "$REPO_DIR/dictionaries/russian.utf-8" ]]; then
+  # The FST is derived from a word list that changes about never, and building it takes
+  # ~1.5M words' worth of work — so on an update, keep the one already on disk.
+  if [[ -f "$REPO_DIR/dictionaries/russian.utf-8" ]] \
+     && ! { [[ "$UPDATE" -eq 1 ]] && [[ -f "$CONFIG_DIR/russian.fst" ]]; }; then
     say "Building the big Russian dictionary (≈1.5M words → ~2MB FST)…"
     "$BIN_DIR/puntu" build-dict "$REPO_DIR/dictionaries/russian.utf-8" \
       || warn "could not build the dictionary FST (engine still works without it)"
@@ -128,7 +180,9 @@ ENGINE_BIN="$BIN_DIR/puntu-ibus"
 # 3. Make sure the legacy uinput daemon is not also running -------------------
 # Two correctors writing to the same text field fight each other. The IBus engine is the only
 # one we want now, so stop+disable the old systemd service if a previous install enabled it.
-if systemctl --user list-unit-files 2>/dev/null | grep -q '^puntu\.service'; then
+# A one-time migration: if it was disabled once, it stays disabled.
+if [[ "$UPDATE" -eq 0 ]] \
+   && systemctl --user list-unit-files 2>/dev/null | grep -q '^puntu\.service'; then
   say "Disabling the legacy uinput daemon (IBus engine replaces it)…"
   systemctl --user disable --now puntu puntu-tray >/dev/null 2>&1 || true
 fi
@@ -139,10 +193,18 @@ fi
 say "Registering the IBus component…"
 "$ENGINE_BIN" install >/dev/null
 USER_XML="$HOME/.local/share/ibus/component/puntu.xml"
+SYS_XML="/usr/share/ibus/component/puntu.xml"
 if [[ "$NO_SUDO" -eq 0 && -f "$USER_XML" ]]; then
   # IBus reliably scans /usr/share/ibus/component/; copy there so the engine is always found.
-  sudo install -m 0644 "$USER_XML" /usr/share/ibus/component/puntu.xml \
-    || warn "could not copy component to /usr/share/ibus/component (user-local copy may suffice)"
+  # What matters in that file is <exec>: when it already points at the binary we just built,
+  # an update has nothing to change there and should not ask for a password. (The <version>
+  # in it is cosmetic.)
+  if [[ "$UPDATE" -eq 1 ]] && grep -qsF "<exec>$ENGINE_BIN</exec>" "$SYS_XML"; then
+    say "System component already points at $ENGINE_BIN — no sudo needed."
+  else
+    sudo install -m 0644 "$USER_XML" "$SYS_XML" \
+      || warn "could not copy component to /usr/share/ibus/component (user-local copy may suffice)"
+  fi
 fi
 
 # 5. Restart IBus so it discovers the (re)registered component ----------------
@@ -202,7 +264,7 @@ ibus engine puntu >/dev/null 2>&1 || true
 # 6b. Non-GNOME sessions: print what the session itself has to provide --------
 # Nothing here can be done for the user: ibus-daemon autostart and the input-method
 # environment live in their compositor config, not in ours.
-if [[ "$IS_GNOME" -eq 0 ]]; then
+if [[ "$IS_GNOME" -eq 0 && "$UPDATE" -eq 0 ]]; then
   say "Non-GNOME session detected (${XDG_CURRENT_DESKTOP:-unknown})."
   cat <<'HINT'
 
@@ -223,6 +285,12 @@ if [[ "$IS_GNOME" -eq 0 ]]; then
 
 HINT
 fi
+
+# 6c/7. Desktop integration: icons + the app-menu entry ----------------------
+# Everything from here to the "end of desktop integration" marker is one-time and unchanged
+# by a new build, so `--update` skips the lot. Guarded rather than re-indented, so the diff
+# against the installing path stays readable.
+if [[ "$UPDATE" -eq 0 ]]; then
 
 # 6c. Icons: the app icon + the three tray-status icons ----------------------
 # Installed into the user's hicolor theme so `Icon=puntu` (desktop files) and the tray's
@@ -310,6 +378,8 @@ Keywords=puntu;keyboard;layout;раскладка;настройки;слова�
 DESK
 update-desktop-database "$APPS_DIR" 2>/dev/null || true
 
+fi  # ---- end of desktop integration (skipped by --update) ----
+
 # 7b. Tray indicator: autostart + launch now ----------------------------------
 # Open the app / pause temporarily / disable the engine, with a status icon.
 if [[ -x "$BIN_DIR/puntu-gui" ]]; then
@@ -337,7 +407,10 @@ fi
 # 8. Electron/Chromium apps: enable the system input method -------------------
 # An IBus engine only sees keys from apps connected to the input-method framework. Electron
 # apps must run in native Wayland with IME enabled, or NO system input method works in them
-# (Puntu, Chinese, Japanese — alike). One-time and harmless when already set.
+# (Puntu, Chinese, Japanese — alike). One-time and harmless when already set — so, like the
+# desktop integration above, `--update` skips it. Guarded, not re-indented.
+if [[ "$UPDATE" -eq 0 ]]; then
+
 say "Configuring Electron apps for the system input method…"
 ENV_CONF="$HOME/.config/environment.d/90-puntu-electron.conf"
 if ! grep -qs "ELECTRON_OZONE_PLATFORM_HINT" "$ENV_CONF" 2>/dev/null; then
@@ -370,13 +443,27 @@ if command -v snap >/dev/null 2>&1 && snap list code >/dev/null 2>&1; then
   warn "  sudo apt install -y /tmp/code.deb    # settings and extensions are preserved"
 fi
 
+fi  # ---- end of Electron setup (skipped by --update) ----
+
+if [[ "$UPDATE" -eq 1 ]]; then
+  say "Updated to $("$BIN_DIR/puntu" --version 2>/dev/null || echo '?')."
+  cat <<EOF
+
+Your config and word lists were not touched. Next:
+  • Check everything is wired up:  puntu-ibus doctor
+  • Which build is running:        puntu --version
+  • Engine log:                    ~/.local/state/puntu/engine.log
+EOF
+else
 say "Done."
 cat <<EOF
 
 Next steps:
   • Switch to Puntu with Super+Space (or the input-source icon) and pick "Puntu".
   • Status / registration:   puntu-ibus status
+  • Diagnose anything odd:   puntu-ibus doctor
   • Turn the engine off:     puntu-ibus disable      (back to xkb:us::eng)
   • Manage words:            puntu dict learn <service> ; puntu dict add <word>
   • Engine logs:             PUNTU_LOG=puntu=debug ibus restart ; journalctl --user -f | grep puntu
 EOF
+fi

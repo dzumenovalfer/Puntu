@@ -45,7 +45,15 @@ the IBus component, restarts IBus, and adds **Puntu** to your GNOME input source
 time to update — it's idempotent and never rewrites your existing layouts.
 
 From a source checkout, `./install.sh` does the same but builds with cargo (installing rustup
-if needed).
+if needed). To move an existing install to a newer build, use the update path instead:
+
+```sh
+./install.sh --update
+```
+
+It pulls, rebuilds, reinstalls the binaries and restarts IBus — and skips everything that is
+one-time (system packages, icons, menu entry, Electron flags), so it needs no sudo unless the
+engine's path actually changed. Your config and word lists are never touched.
 
 Then switch to it with **Super+Space** (or the input-source icon) and pick **Puntu**.
 
