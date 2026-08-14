@@ -100,6 +100,18 @@ codegen-units = 1
 strip = true
 panic = "unwind"   # keep unwinding so the panic hook can release the keyboard grab
 
+# What `install.sh` builds with. Same code generation as `release`, minus the two settings
+# that cost minutes and buy nothing here: fat LTO re-optimizes the whole dependency graph
+# once per binary (there are five), and `codegen-units = 1` makes that work serial — measured
+# at 195 s and only 242% CPU on a 12-thread machine, i.e. mostly one core.
+#
+# The engine spends its life blocked on DBus, not in hot loops, so thin LTO is
+# indistinguishable in use. Release artifacts published by CI keep the `release` profile.
+[profile.quick]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 [patch.crates-io]
 # Vendored librush 0.2.2. Additions, all of the same shape — DBus methods upstream stubs out,
 # delegated to the `IBusEngine` trait so the engine can see who it is talking to:

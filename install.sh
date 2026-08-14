@@ -117,8 +117,31 @@ if [[ "$LOCAL" -eq 1 ]]; then
 
   # `--no-default-features --features ibus` builds only the engine and the pure-core CLI
   # (dict / config / build-dict). It skips evdev/uinput entirely — no device dependencies.
-  say "Building and installing puntu-ibus + puntu (release)…"
-  cargo install --path "$REPO_DIR" --no-default-features --features ibus,app,gui --force
+  #
+  # Three things keep this from eating the machine:
+  #
+  #   --profile quick  thin LTO and parallel codegen instead of `release`'s fat LTO at
+  #                    codegen-units = 1, which re-optimizes the whole dependency graph once
+  #                    per binary — five times — almost entirely on one core. Measured on a
+  #                    warm cache: 195 s at 242% CPU vs 49 s at 982%. The engine waits on
+  #                    DBus rather than running hot loops, so the two are indistinguishable in
+  #                    use; the binaries CI publishes still use the full `release` profile.
+  #   --locked         build exactly the versions in the committed Cargo.lock. Without it
+  #                    cargo re-resolves against the live index on every run, so an unrelated
+  #                    crate publishing an update silently triggers a large rebuild — and the
+  #                    installed binary stops matching what CI tested.
+  #   nice             a first build compiles ~450 crates across every core. Yielding to
+  #                    interactive work costs little wall time and keeps the desktop usable.
+  #
+  # The lock can legitimately be out of date in a working copy (someone edited Cargo.toml),
+  # and `--locked` fails rather than fixing it — so fall back instead of dying on it.
+  say "Building and installing puntu-ibus + puntu…"
+  CARGO_ARGS=(--path "$REPO_DIR" --no-default-features --features ibus,app,gui
+              --profile quick --force)
+  nice -n 10 cargo install "${CARGO_ARGS[@]}" --locked || {
+    warn "Cargo.lock is out of date for this checkout — rebuilding with a fresh resolve"
+    nice -n 10 cargo install "${CARGO_ARGS[@]}"
+  }
   BIN_DIR="$HOME/.cargo/bin"
 
   # The FST is derived from a word list that changes about never, and building it takes

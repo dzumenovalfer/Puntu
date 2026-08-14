@@ -55,6 +55,11 @@ It pulls, rebuilds, reinstalls the binaries and restarts IBus — and skips ever
 one-time (system packages, icons, menu entry, Electron flags), so it needs no sudo unless the
 engine's path actually changed. Your config and word lists are never touched.
 
+Both paths build under the `quick` profile (thin LTO, parallel codegen) with `--locked`, and
+run `cargo` under `nice`: a rebuild after a code change takes ~50 s instead of ~195 s, and the
+desktop stays usable while the first build compiles the dependency tree. Binaries published
+on the Releases page still use the full `release` profile.
+
 Then switch to it with **Super+Space** (or the input-source icon) and pick **Puntu**.
 
 ```sh
