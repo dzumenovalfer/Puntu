@@ -179,6 +179,7 @@ fn reload_watcher(targets: ReloadTargets, mut models: Models, mut cfg: crate::co
                     | "words.ru.txt"
                     | "words.en.txt"
                     | "commands.txt"
+                    | "replacements.txt"
             )
         )
     }

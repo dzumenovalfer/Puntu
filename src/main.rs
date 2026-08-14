@@ -127,6 +127,9 @@ enum DictOp {
         force: bool,
         #[arg(long)]
         commands: bool,
+        /// Show the replacement table (`ключ = значение`) instead of a word list.
+        #[arg(long)]
+        replacements: bool,
         #[arg(long)]
         ru: bool,
         #[arg(long)]
@@ -153,6 +156,18 @@ enum DictOp {
         ru: bool,
         #[arg(long)]
         en: bool,
+    },
+    /// Define a replacement or snippet: `puntu dict replace ривет привет`,
+    /// `puntu dict replace адр ул. Пушкина, д. 1`.
+    ///
+    /// Fires when the word is finished, before the layout decision, and matches BOTH readings
+    /// of the keys — so it works whether or not the layout was switched. Remove with
+    /// `puntu dict rm <ключ>`.
+    Replace {
+        key: String,
+        /// The replacement text. Everything after the key, so quoting is optional.
+        #[arg(required = true, num_args = 1..)]
+        value: Vec<String>,
     },
     /// Open a simple dictionary window (zenity): word pairs («привет / ghbdtn»), add, remove.
     Ui,
@@ -760,15 +775,38 @@ fn run_dict(op: DictOp) -> Result<()> {
     let mut dict = UserDict::load(dir)?;
 
     match op {
-        DictOp::List { manual, learned, force, commands, ru, en } => {
-            let kind = pick_kind(manual, learned, force, commands);
-            if kind == ListKind::Command {
-                print_list(&dict, ListKind::Command, Lang::En); // language-neutral
+        DictOp::List { manual, learned, force, commands, replacements, ru, en } => {
+            if replacements {
+                let rows = dict.replacements();
+                if rows.is_empty() {
+                    println!("(замен нет — добавить: puntu dict replace <ключ> <значение>)");
+                }
+                for (k, v) in rows {
+                    println!("{k} = {v}");
+                }
             } else {
-                for lang in langs(ru, en) {
-                    print_list(&dict, kind, lang);
+                let kind = pick_kind(manual, learned, force, commands);
+                if kind == ListKind::Command {
+                    print_list(&dict, ListKind::Command, Lang::En); // language-neutral
+                } else {
+                    for lang in langs(ru, en) {
+                        print_list(&dict, kind, lang);
+                    }
                 }
             }
+        }
+        DictOp::Replace { key, value } => {
+            // Joined rather than requiring quotes: `puntu dict replace адр ул. Пушкина, д. 1`
+            // is what anyone would type first.
+            let value = value.join(" ");
+            dict.set_replacement(&key, &value)?;
+            let key = key.trim().to_lowercase();
+            println!("замена: {key} = {value}");
+            println!(
+                "  Сработает на завершении слова, по обоим чтениям клавиш — набирать можно \
+                 в любой раскладке."
+            );
+            println!("  Убрать:  puntu dict rm {key}");
         }
         DictOp::Add { word, force, command, ru, en } => {
             let kind = if command {
@@ -839,7 +877,7 @@ fn run_dict(op: DictOp) -> Result<()> {
         DictOp::Ui => run_dict_ui(&mut dict)?,
         DictOp::Rm { word } => {
             dict.remove(&word)?;
-            println!("removed {word:?} from all lists");
+            println!("removed {word:?} from all lists (including any replacement keyed on it)");
         }
         DictOp::Forget { word, ru, en } => {
             let lang = pick_lang(&word, ru, en);

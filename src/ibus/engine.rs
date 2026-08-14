@@ -28,9 +28,8 @@ struct Held {
     shown: String,
     /// The other-layout rendering (+ separator) — the flip target.
     other: String,
-    /// True when `shown` started as the detector's auto-converted rendering — flipping it
-    /// back means the user rejected the conversion, which is worth learning.
-    auto_converted: bool,
+    /// Where `shown` came from, which decides what flipping it back *means*.
+    source: HeldSource,
     /// The word exactly as typed (no separator) — what gets added to the learned list when
     /// the user flips an auto-conversion back.
     typed: String,
@@ -47,6 +46,26 @@ struct Held {
     /// only commits while it still matches — so a timer left over from a word that has since
     /// been flushed, flipped or extended can never fire on the new one.
     generation: u64,
+}
+
+/// How the held rendering was arrived at. Flipping a word back with `Ctrl+` `` ` `` means
+/// something different in each case, and the engine has to tell them apart:
+///
+/// * `Typed` — the detector left the word alone, so flipping is the user converting it by
+///   hand; that feeds the "you keep converting this, remember it?" counter.
+/// * `AutoConverted` — the detector rewrote it and the user is rejecting that, which is worth
+///   learning (the typed form goes on the never-correct list).
+/// * `Replacement` — the user's own `replacements.txt` expanded it. Neither reaction applies:
+///   there is nothing to learn from undoing a rule they wrote themselves, and counting it as a
+///   manual conversion would offer to "remember" a word they never typed.
+///
+/// An enum rather than a pair of bools, so the impossible fourth state can't be written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HeldSource {
+    #[default]
+    Typed,
+    AutoConverted,
+    Replacement,
 }
 
 /// The held word, shared with the idle-commit timer ([`PuntuEngine::arm_hold_timer`]).
@@ -890,7 +909,7 @@ impl PuntuEngine {
             let mut guard = lock(&self.held);
             guard.as_mut().map(|h| {
                 std::mem::swap(&mut h.shown, &mut h.other);
-                let learn = if h.auto_converted && !h.learned {
+                let learn = if h.source == HeldSource::AutoConverted && !h.learned {
                     h.learned = true;
                     Some(h.typed.clone())
                 } else {
@@ -898,13 +917,17 @@ impl PuntuEngine {
                 };
                 // A forward flip (detector left the word as typed, the user converted it by
                 // hand) is a manual conversion — feed the repeat counter, once per held word.
-                let manual =
-                    if !h.auto_converted && !h.counted && starts_with_word(&h.shown, &h.converted) {
-                        h.counted = true;
-                        Some((h.typed.clone(), h.converted.clone()))
-                    } else {
-                        None
-                    };
+                // A Replacement is excluded: undoing a rule the user wrote themselves is not
+                // evidence they want that word remembered.
+                let manual = if h.source == HeldSource::Typed
+                    && !h.counted
+                    && starts_with_word(&h.shown, &h.converted)
+                {
+                    h.counted = true;
+                    Some((h.typed.clone(), h.converted.clone()))
+                } else {
+                    None
+                };
                 (h.shown.clone(), learn, manual)
             })
         }) else {
@@ -1122,13 +1145,17 @@ impl PuntuEngine {
     fn handle_remember(&mut self, se: &SignalEmitter<'_>) {
         let id = self.id;
         // Fallback when nothing is selected: whichever form of the held word is on screen.
-        let fallback = lock(&self.held).as_ref().map(|h| {
-            if starts_with_word(&h.shown, &h.converted) {
-                h.converted.clone()
-            } else {
-                h.typed.clone()
-            }
-        });
+        // A replacement is skipped — what's on screen there is the user's own snippet, and
+        // offering to "remember" it as a dictionary word makes no sense.
+        let fallback = lock(&self.held).as_ref().filter(|h| h.source != HeldSource::Replacement).map(
+            |h| {
+                if starts_with_word(&h.shown, &h.converted) {
+                    h.converted.clone()
+                } else {
+                    h.typed.clone()
+                }
+            },
+        );
         let detector = self.detector();
         let dict = Arc::clone(&self.dict);
         let hint_shown = Arc::clone(&self.hint_shown);
@@ -1253,23 +1280,40 @@ impl PuntuEngine {
         .await
     }
 
-    /// Pick the `(shown, other, auto_converted)` renderings for a finished word per the
-    /// current mode. `shown` is the default the engine holds; `other` is what `Ctrl+` `` ` ``
-    /// flips to; `auto_converted` marks a detector-driven conversion (so flipping it back
-    /// learns the typed form). Correcting runs the detector (trusted context, user dictionaries,
-    /// command guard, trigram scoring — see [`Detector::decide`]); DirectRussian defaults to
-    /// the Russian rendering unless the Latin reading is a real word/abbreviation and the
-    /// Russian one isn't.
-    async fn decide_renderings(&self, word: &CompletedWord) -> (String, String, bool) {
+    /// Pick the `(shown, other, source)` renderings for a finished word per the current mode.
+    /// `shown` is the default the engine holds; `other` is what `Ctrl+` `` ` `` flips to;
+    /// `source` says how `shown` was arrived at (see [`HeldSource`]).
+    ///
+    /// Order matters. The user's own replacement table wins over everything — it is explicit
+    /// configuration, not a guess. Failing that, Correcting runs the detector (trusted context,
+    /// user dictionaries, command guard, trigram scoring — see [`Detector::decide`]), and
+    /// DirectRussian defaults to the Russian rendering unless the Latin reading is a real
+    /// word/abbreviation and the Russian one isn't.
+    async fn decide_renderings(&self, word: &CompletedWord) -> (String, String, HeldSource) {
         let detector = self.detector();
         let settings = self.settings();
-        let (mut shown, other, auto_converted) = match self.mode {
+        // Anything that forbids rewriting the user's text forbids it for replacements too, so
+        // this guard comes first and covers both. In a terminal an auto-rewrite of what turns
+        // out to be a command/flag is never acceptable — «в терминале только вручную».
+        let rewrites_allowed = settings.opts.autocorrect && !self.in_terminal();
+        if rewrites_allowed {
+            let expanded = {
+                let dict = self.dict.lock().await;
+                expand_replacement(&dict, word, self.mode)
+            };
+            if let Some((value, typed)) = expanded {
+                debug!("[puntu-engine {}] replacement {typed:?} → {value:?}", self.id);
+                // `fix_case` deliberately skipped: the value is the user's text, not a word
+                // we watched them type, so there is no accidental-caps signature to fix.
+                return (value, typed, HeldSource::Replacement);
+            }
+        }
+        let (mut shown, other, source) = match self.mode {
             EngineMode::Correcting => {
-                if !settings.opts.autocorrect || self.in_terminal() {
+                if !rewrites_allowed {
                     // dry_run or a terminal: hold the word exactly as typed; conversion only
-                    // on the manual flip. In a terminal an auto-rewrite of what turns out to
-                    // be a command/flag is never acceptable — «в терминале только вручную».
-                    return (word.cur.clone(), word.alt.clone(), false);
+                    // on the manual flip.
+                    return (word.cur.clone(), word.alt.clone(), HeldSource::Typed);
                 }
                 let dict = self.dict.lock().await;
                 match detector.decide(word, &dict) {
@@ -1278,9 +1322,11 @@ impl PuntuEngine {
                             "[puntu-engine {}] auto-convert {:?} → {:?}",
                             self.id, word.cur, word.alt
                         );
-                        (word.alt.clone(), word.cur.clone(), true)
+                        (word.alt.clone(), word.cur.clone(), HeldSource::AutoConverted)
                     }
-                    Decision::Leave => (word.cur.clone(), word.alt.clone(), false),
+                    Decision::Leave => {
+                        (word.cur.clone(), word.alt.clone(), HeldSource::Typed)
+                    }
                 }
             }
             EngineMode::DirectRussian => {
@@ -1294,9 +1340,9 @@ impl PuntuEngine {
                 let alt_is_real_ru = detector.is_known_word(&word.alt, self.lang.other())
                     || dict.is_recognized(&word.alt, self.lang.other());
                 if cur_is_real_en && !alt_is_real_ru {
-                    (word.cur.clone(), word.alt.clone(), false)
+                    (word.cur.clone(), word.alt.clone(), HeldSource::Typed)
                 } else {
-                    (word.alt.clone(), word.cur.clone(), false)
+                    (word.alt.clone(), word.cur.clone(), HeldSource::Typed)
                 }
             }
         };
@@ -1318,7 +1364,7 @@ impl PuntuEngine {
                 shown = fixed;
             }
         }
-        (shown, other, auto_converted)
+        (shown, other, source)
     }
 }
 
@@ -1589,7 +1635,7 @@ impl IBusEngine for PuntuEngine {
                     _ => raw_sep,
                 };
                 if let Some(word) = self.buffer.finish(self.lang) {
-                    let (shown_word, other_word, auto_converted) =
+                    let (shown_word, other_word, source) =
                         self.decide_renderings(&word).await;
                     // Any previously held word is now final.
                     self.flush_held(&se).await;
@@ -1617,7 +1663,7 @@ impl IBusEngine for PuntuEngine {
                         let held = Held {
                             shown: format!("{shown_word}{sep}"),
                             other: format!("{other_word}{sep}"),
-                            auto_converted,
+                            source,
                             typed: word.cur.clone(),
                             converted: word.alt.clone(),
                             learned: false,
@@ -2200,6 +2246,40 @@ fn fix_case_word(word: &str, known: impl Fn(&str) -> bool) -> Option<String> {
     None
 }
 
+/// Look the finished word up in the user's replacement table and, on a hit, return
+/// `(value, what_was_typed)`.
+///
+/// **Both readings of the keys are tried**, which is the point: `ривет = привет` has to fire
+/// whether the user typed Russian letters or hit the same keys with a US layout active
+/// (`hbdtn`). Forgetting to switch layout is the situation Puntu exists for, and a replacement
+/// table that only worked in one of them would be the one feature that didn't help there.
+///
+/// The reading matching the current mode is tried first, so if two keys collide across layouts
+/// the outcome is predictable rather than dependent on hash order.
+///
+/// Case follows what was typed (`Ривет` → `Привет`), reusing [`match_case`] — but only for
+/// single-word values. In `адр = ул. Пушкина, д. 1` the capitalisation is part of the text the
+/// user wrote, and re-casing it would be vandalism.
+fn expand_replacement(
+    dict: &UserDict,
+    word: &CompletedWord,
+    mode: EngineMode,
+) -> Option<(String, String)> {
+    let (first, second) = match mode {
+        EngineMode::Correcting => (&word.cur, &word.alt),
+        EngineMode::DirectRussian => (&word.alt, &word.cur),
+    };
+    let (typed, value) = [first, second]
+        .into_iter()
+        .find_map(|reading| dict.replacement(reading).map(|v| (reading.clone(), v)))?;
+    let value = if value.chars().any(char::is_whitespace) {
+        value.to_string()
+    } else {
+        match_case(value, &typed)
+    };
+    Some((value, typed))
+}
+
 /// Re-case `word` the way `model` is cased: all-lower, Capitalized, or ALL-CAPS. Used to keep
 /// the flip target in step with the case-cycle hotkey.
 fn match_case(word: &str, model: &str) -> String {
@@ -2713,7 +2793,7 @@ mod tests {
             other: "ghbdtn ".into(),
             typed: "ghbdtn".into(),
             converted: "привет".into(),
-            auto_converted: true,
+            source: HeldSource::AutoConverted,
             learned: false,
             counted: false,
             generation,
@@ -2991,6 +3071,106 @@ mod tests {
             e.note_emit(false);
         }
         assert!(!e.is_passthrough());
+    }
+
+    /// A finished word as the engine sees it: `cur` is what the keys type in the active
+    /// layout, `alt` the same keys read through the other one.
+    fn word(cur: &str, alt: &str) -> CompletedWord {
+        CompletedWord {
+            keys: Vec::new(),
+            cur: cur.to_string(),
+            alt: alt.to_string(),
+            lang: Lang::En,
+            trusted: true,
+        }
+    }
+
+    fn dict_with_replacements(tag: &str, pairs: &[(&str, &str)]) -> UserDict {
+        let mut d = UserDict::empty(std::env::temp_dir().join(format!("puntu-test-{tag}")));
+        for (k, v) in pairs {
+            d.set_replacement(k, v).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn replacement_fires_on_either_reading_of_the_keys() {
+        // The point of matching both readings: forgetting to switch layout is the situation
+        // Puntu exists for, so `ривет = привет` has to work whether the user typed Russian
+        // letters or hit the same keys with US active (`hbdtn`).
+        let d = dict_with_replacements("repl-both", &[("ривет", "привет")]);
+
+        // Typed with the RU layout: the Cyrillic reading is `cur`.
+        let w = word("ривет", "hbdtn");
+        assert_eq!(
+            expand_replacement(&d, &w, EngineMode::Correcting),
+            Some(("привет".to_string(), "ривет".to_string()))
+        );
+        // Same keys, layout not switched: now the Cyrillic reading is `alt`.
+        let w = word("hbdtn", "ривет");
+        assert_eq!(
+            expand_replacement(&d, &w, EngineMode::Correcting),
+            Some(("привет".to_string(), "ривет".to_string()))
+        );
+        // A word with no rule is left alone.
+        assert_eq!(expand_replacement(&d, &word("привет", "ghbdtn"), EngineMode::Correcting), None);
+    }
+
+    #[test]
+    fn colliding_keys_resolve_by_the_current_mode() {
+        // Both readings have a rule. Which one wins must not depend on hash order: the reading
+        // the current mode renders by default is tried first.
+        let d = dict_with_replacements("repl-collide", &[("no", "number"), ("тщ", "точно")]);
+        let w = word("no", "тщ");
+        assert_eq!(
+            expand_replacement(&d, &w, EngineMode::Correcting).map(|(v, _)| v),
+            Some("number".to_string()),
+            "Correcting shows the Latin reading, so its rule wins"
+        );
+        assert_eq!(
+            expand_replacement(&d, &w, EngineMode::DirectRussian).map(|(v, _)| v),
+            Some("точно".to_string()),
+            "RU-direct shows the Cyrillic reading, so its rule wins"
+        );
+    }
+
+    #[test]
+    fn replacement_case_follows_the_typed_word_but_spares_snippets() {
+        let d = dict_with_replacements(
+            "repl-case",
+            &[("ривет", "привет"), ("адр", "ул. Пушкина, д. 1")],
+        );
+        let got = |typed: &str| {
+            expand_replacement(&d, &word(typed, "?"), EngineMode::Correcting).map(|(v, _)| v)
+        };
+        assert_eq!(got("ривет"), Some("привет".to_string()));
+        assert_eq!(got("Ривет"), Some("Привет".to_string()));
+        assert_eq!(got("РИВЕТ"), Some("ПРИВЕТ".to_string()));
+        // A multi-word value carries its own capitalisation — re-casing it would be vandalism.
+        assert_eq!(got("Адр"), Some("ул. Пушкина, д. 1".to_string()));
+        assert_eq!(got("АДР"), Some("ул. Пушкина, д. 1".to_string()));
+    }
+
+    #[test]
+    fn flipping_a_replacement_teaches_nothing() {
+        // A replacement is a rule the user wrote. Undoing it is not evidence that the word
+        // should go on the never-correct list, nor that they keep converting it by hand — the
+        // two reactions `handle_undo` has for the other sources.
+        let mut h = Held {
+            shown: "привет ".to_string(),
+            other: "ривет ".to_string(),
+            source: HeldSource::Replacement,
+            typed: "ривет".to_string(),
+            converted: "hbdtn".to_string(),
+            ..Held::default()
+        };
+        let learns = h.source == HeldSource::AutoConverted && !h.learned;
+        let counts = h.source == HeldSource::Typed && !h.counted;
+        assert!(!learns, "nothing to learn from undoing your own rule");
+        assert!(!counts, "and it is not a manual conversion either");
+        // The flip itself still works — that is what keeps a replacement undoable.
+        std::mem::swap(&mut h.shown, &mut h.other);
+        assert_eq!(h.shown, "ривет ");
     }
 
     #[test]

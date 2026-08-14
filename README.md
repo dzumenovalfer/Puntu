@@ -191,6 +191,30 @@ Rejecting an auto-conversion (flip it back with `Ctrl+` `` ` ``) still teaches t
 the word is added to the never-correct list. Every dictionary change fires a desktop
 notification and reaches the running engine within a second — no restart.
 
+### Replacements and snippets
+
+A separate table of `key = value` rules, applied when a word is finished and **before** any
+layout decision. Same mechanism for fixing a typo and for expanding an abbreviation — there is
+no difference between the two in code:
+
+```sh
+puntu dict replace ривет привет
+puntu dict replace адр ул. Пушкина, д. 1
+puntu dict replace brb be right back
+puntu dict list --replacements     # show the table
+puntu dict rm адр                  # remove a rule
+```
+
+The file is `~/.config/puntu/replacements.txt`, hand-editable and hot-reloaded like the word
+lists. A rule matches **both readings of the keys**, so `ривет = привет` fires whether you
+typed Russian letters or hit the same keys with a US layout active — forgetting to switch is
+the case Puntu is for. Case follows what you typed (`Ривет` → `Привет`), except for multi-word
+values, where the capitalisation is part of your text.
+
+Unlike a correction, a replacement is a rule you wrote, so undoing one with `Ctrl+` `` ` ``
+teaches nothing and never triggers the "remember this word?" offer. Replacements are off
+wherever rewriting is: in terminals and under `dry_run`.
+
 ### The Puntu app (settings + dictionary)
 
 `install.sh` adds a **Puntu** application to the menu (`puntu-app`): one window with two

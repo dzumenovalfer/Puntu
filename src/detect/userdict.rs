@@ -7,10 +7,13 @@
 //!   * `force.{ru,en}.txt`   — always convert these
 //!   * `commands.txt`        — English commands/utilities treated as exceptions
 //!
+//! Plus `replacements.txt` — `key = value` pairs rather than a word list, so it lives in its
+//! own field instead of the [`ListKind`] machinery. See [`UserDict::replacement`].
+//!
 //! Plus `is_command_context`, a heuristic that spots paths/flags/identifiers so we never
 //! mangle terminal or code input.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -56,7 +59,18 @@ pub struct UserDict {
     ru: LangLists,
     en: LangLists,
     commands: HashSet<String>,
+    /// `key → value` replacements, keys lowercased. Language-neutral like `commands`: the key
+    /// is matched against **both** readings of what was typed, so there is nothing to split by
+    /// language. See [`Self::replacement`].
+    replacements: HashMap<String, String>,
 }
+
+/// The file holding the replacement table.
+const REPLACEMENTS_FILE: &str = "replacements.txt";
+
+/// Shortest key we accept. A one-character key would fire on nearly every word — almost
+/// certainly a typo in the file rather than something anyone wants.
+const MIN_REPLACEMENT_KEY: usize = 2;
 
 /// A small built-in seed of common commands so the guard works before the user edits anything.
 const BUILTIN_COMMANDS: &[&str] = &[
@@ -87,7 +101,13 @@ impl UserDict {
             recognized: BUILTIN_RECOGNIZED_EN.iter().map(|s| s.to_string()).collect(),
             ..LangLists::default()
         };
-        UserDict { dir, ru: LangLists::default(), en, commands }
+        UserDict {
+            dir,
+            ru: LangLists::default(),
+            en,
+            commands,
+            replacements: HashMap::new(),
+        }
     }
 
     /// Load all lists from disk (missing files are treated as empty). Built-in commands are
@@ -109,7 +129,66 @@ impl UserDict {
             BUILTIN_COMMANDS.iter().map(|s| s.to_string()).collect();
         commands.extend(read_list(&self.dir.join("commands.txt"))?);
         self.commands = commands;
+        self.replacements = read_replacements(&self.dir.join(REPLACEMENTS_FILE))?;
         Ok(())
+    }
+
+    /// The replacement for `key`, if the user defined one. Keys are matched case-insensitively;
+    /// the value is returned exactly as written, so its own capitalisation survives
+    /// (`адр = ул. Пушкина, д. 1`).
+    pub fn replacement(&self, key: &str) -> Option<&str> {
+        self.replacements.get(&key.to_lowercase()).map(String::as_str)
+    }
+
+    /// Define (or redefine) a replacement and persist the whole table.
+    ///
+    /// Rewritten in full rather than appended, because unlike a word list this is a map: an
+    /// appended second line for the same key would leave the file with two answers and the
+    /// winner decided by parse order.
+    pub fn set_replacement(&mut self, key: &str, value: &str) -> Result<()> {
+        let k = key.trim().to_lowercase();
+        let v = value.trim().to_string();
+        if k.chars().count() < MIN_REPLACEMENT_KEY {
+            anyhow::bail!("replacement key {k:?} is too short (need at least {MIN_REPLACEMENT_KEY} characters)");
+        }
+        if v.is_empty() {
+            anyhow::bail!("replacement for {k:?} is empty — use `puntu dict rm {k}` to remove it");
+        }
+        self.replacements.insert(k, v);
+        self.write_replacements()
+    }
+
+    /// Drop a replacement. Returns whether there was one.
+    pub fn remove_replacement(&mut self, key: &str) -> Result<bool> {
+        if self.replacements.remove(&key.trim().to_lowercase()).is_none() {
+            return Ok(false);
+        }
+        self.write_replacements()?;
+        Ok(true)
+    }
+
+    /// Every replacement, sorted by key — for the CLI listing and for [`Self::export`].
+    pub fn replacements(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> =
+            self.replacements.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
+        v.sort();
+        v
+    }
+
+    fn write_replacements(&self) -> Result<()> {
+        let path = self.dir.join(REPLACEMENTS_FILE);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut body = String::from(
+            "# Замены и сниппеты: `ключ = значение`, по одной на строку.\n\
+             # Ключ ищется по обоим чтениям клавиш, поэтому `ривет = привет` сработает и\n\
+             # когда набрано русскими буквами, и когда теми же клавишами в EN-раскладке.\n",
+        );
+        for (k, v) in self.replacements() {
+            body.push_str(&format!("{k} = {v}\n"));
+        }
+        std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
     }
 
     fn load_lang(&self, lang: Lang) -> Result<LangLists> {
@@ -219,6 +298,10 @@ impl UserDict {
             let extra = self.user_words(ListKind::Command, Lang::En);
             write_list(&self.dir.join("commands.txt"), &extra)?;
         }
+        // `remove` is "forget this word, wherever it lives", so it covers a replacement keyed
+        // on it too — otherwise `puntu dict rm адр` would look like it worked and the snippet
+        // would keep firing.
+        self.remove_replacement(&w)?;
         Ok(())
     }
 
@@ -307,6 +390,14 @@ impl UserDict {
                 out.push('\n');
             }
         }
+        // `key = value`, not one word per line — the only section with a shape of its own.
+        let replacements = self.replacements();
+        if !replacements.is_empty() {
+            out.push_str("\n[replacements]\n");
+            for (k, v) in replacements {
+                out.push_str(&format!("{k} = {v}\n"));
+            }
+        }
         out
     }
 
@@ -315,7 +406,7 @@ impl UserDict {
     /// by hand. Returns how many words were actually new. Unknown section headers are skipped
     /// with a warning rather than failing the whole import — a partial restore beats none.
     pub fn import_str(&mut self, text: &str) -> Result<usize> {
-        let mut section: Option<(ListKind, Lang)> = None;
+        let mut section: Option<Section> = None;
         let mut added = 0usize;
         for (n, raw) in text.lines().enumerate() {
             let line = raw.trim();
@@ -329,15 +420,28 @@ impl UserDict {
                 }
                 continue;
             }
-            let Some((kind, lang)) = section else {
-                tracing::warn!("import: слово вне секции — пропущено (строка {})", n + 1);
-                continue;
-            };
-            let word = line.to_lowercase();
-            if !self.contains(&word, lang, kind) {
-                added += 1;
+            match section {
+                Some(Section::List(kind, lang)) => {
+                    let word = line.to_lowercase();
+                    if !self.contains(&word, lang, kind) {
+                        added += 1;
+                    }
+                    self.add(&word, lang, kind)?;
+                }
+                // Parsed by the same code that reads `replacements.txt`, so the exported
+                // section and the live file can never drift apart.
+                Some(Section::Replacements) => {
+                    for (k, v) in parse_replacements(line) {
+                        if self.replacement(&k) != Some(v.as_str()) {
+                            added += 1;
+                        }
+                        self.set_replacement(&k, &v)?;
+                    }
+                }
+                None => {
+                    tracing::warn!("import: строка вне секции — пропущена (строка {})", n + 1)
+                }
             }
-            self.add(&word, lang, kind)?;
         }
         Ok(added)
     }
@@ -400,16 +504,25 @@ fn section_name(kind: ListKind) -> &'static str {
     }
 }
 
-/// Parse a section header body (`recognized ru`, `commands`) back into a list + language.
-fn parse_section(header: &str) -> Option<(ListKind, Lang)> {
+/// Which section of an exported file we are reading. Replacements are `key = value` rather
+/// than one word per line, so they are not a [`ListKind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    List(ListKind, Lang),
+    Replacements,
+}
+
+/// Parse a section header body (`recognized ru`, `commands`, `replacements`).
+fn parse_section(header: &str) -> Option<Section> {
     let mut parts = header.split_whitespace();
     let kind = match parts.next()?.to_ascii_lowercase().as_str() {
         "recognized" => ListKind::Recognized,
         "manual" => ListKind::Manual,
         "learned" => ListKind::Learned,
         "force" => ListKind::Force,
-        // Language-neutral; any language tag on it is ignored.
-        "commands" => return Some((ListKind::Command, Lang::En)),
+        // Language-neutral; any language tag on these is ignored.
+        "commands" => return Some(Section::List(ListKind::Command, Lang::En)),
+        "replacements" => return Some(Section::Replacements),
         _ => return None,
     };
     let lang = match parts.next()?.to_ascii_lowercase().as_str() {
@@ -417,7 +530,7 @@ fn parse_section(header: &str) -> Option<(ListKind, Lang)> {
         "en" => Lang::En,
         _ => return None,
     };
-    parts.next().is_none().then_some((kind, lang))
+    parts.next().is_none().then_some(Section::List(kind, lang))
 }
 
 /// The subset of an in-memory set worth writing to the user's file: built-in seeds are merged
@@ -440,6 +553,50 @@ fn persistable(set: &HashSet<String>, lang: Lang, kind: ListKind) -> Vec<String>
 pub fn is_command_context(token: &str) -> bool {
     token.chars().any(|c| matches!(c, '/' | '\\' | '.' | '~' | '-' | '_' | '@' | ':' ))
         || token.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Parse `key = value` lines. Not `read_list`: that lowercases the whole line, and a
+/// replacement's value has to keep the capitalisation the user wrote (`ул. Пушкина`).
+///
+/// Split on the **first** `=` so a value may contain more of them (`eq = a = b`). Keys are
+/// lowercased for case-insensitive matching. Malformed lines are skipped with a warning rather
+/// than failing the load — one bad line must not cost the user the rest of their table.
+fn parse_replacements(text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            tracing::warn!("replacements: строка {} без `=` — пропущена: {line:?}", n + 1);
+            continue;
+        };
+        let key = key.trim().to_lowercase();
+        let value = value.trim();
+        if key.chars().count() < MIN_REPLACEMENT_KEY {
+            tracing::warn!(
+                "replacements: слишком короткий ключ {key:?} (строка {}) — пропущен",
+                n + 1
+            );
+            continue;
+        }
+        if value.is_empty() {
+            tracing::warn!("replacements: пустое значение для {key:?} (строка {})", n + 1);
+            continue;
+        }
+        out.insert(key, value.to_string());
+    }
+    out
+}
+
+fn read_replacements(path: &Path) -> Result<HashMap<String, String>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading replacements {}", path.display()))?;
+    Ok(parse_replacements(&text))
 }
 
 fn read_list(path: &Path) -> Result<HashSet<String>> {
@@ -631,5 +788,79 @@ mod tests {
         assert!(is_command_context("v0.1"));
         assert!(!is_command_context("привет"));
         assert!(!is_command_context("hello"));
+    }
+
+    #[test]
+    fn replacements_parse_keeps_value_case_and_splits_on_first_equals() {
+        let table = parse_replacements(
+            "# комментарий\n\
+             \n\
+             ривет = привет\n\
+             адр = ул. Пушкина, д. 1\n\
+             ADDR = Pushkin St.\n\
+             eq = a = b\n",
+        );
+        // The key is lowercased for matching; the value is whatever the user wrote.
+        assert_eq!(table.get("ривет").map(String::as_str), Some("привет"));
+        assert_eq!(table.get("адр").map(String::as_str), Some("ул. Пушкина, д. 1"));
+        assert_eq!(table.get("addr").map(String::as_str), Some("Pushkin St."));
+        // Split on the FIRST `=`, so a value may contain more of them.
+        assert_eq!(table.get("eq").map(String::as_str), Some("a = b"));
+        assert_eq!(table.len(), 4, "comments and blank lines are not entries");
+    }
+
+    #[test]
+    fn replacements_parse_skips_junk_rather_than_failing() {
+        // One bad line must not cost the user the rest of the table.
+        let table = parse_replacements(
+            "нет знака равенства\n\
+             я = слишком короткий ключ\n\
+             пусто = \n\
+             ок = значение\n",
+        );
+        assert_eq!(table.get("ок").map(String::as_str), Some("значение"));
+        assert_eq!(table.len(), 1);
+        assert!(!table.contains_key("я"), "a one-character key would fire on every word");
+    }
+
+    #[test]
+    fn replacement_roundtrips_through_disk_and_removal() {
+        let dir = tmp("replacements");
+        let mut d = UserDict::empty(dir.clone());
+        d.set_replacement("Ривет", "привет").unwrap();
+        d.set_replacement("адр", "ул. Пушкина, д. 1").unwrap();
+        // Redefining must not leave two answers for one key in the file.
+        d.set_replacement("ривет", "приветствую").unwrap();
+
+        let reread = UserDict::load(dir.clone()).unwrap();
+        assert_eq!(reread.replacement("РИВЕТ"), Some("приветствую"));
+        assert_eq!(reread.replacement("адр"), Some("ул. Пушкина, д. 1"));
+        assert_eq!(reread.replacements().len(), 2);
+
+        // `remove` is "forget this word wherever it lives" — a replacement key included.
+        let mut d = reread;
+        d.remove("адр").unwrap();
+        assert_eq!(d.replacement("адр"), None);
+        assert_eq!(UserDict::load(dir.clone()).unwrap().replacements().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replacements_survive_export_import() {
+        let src_dir = tmp("repl-export");
+        let mut src = UserDict::empty(src_dir.clone());
+        src.set_replacement("адр", "ул. Пушкина, д. 1").unwrap();
+        src.add("увы", Lang::Ru, ListKind::Recognized).unwrap();
+        let text = src.export();
+
+        let dst_dir = tmp("repl-import");
+        let mut dst = UserDict::empty(dst_dir.clone());
+        assert_eq!(dst.import_str(&text).unwrap(), 2, "one word + one replacement");
+        assert_eq!(dst.replacement("адр"), Some("ул. Пушкина, д. 1"));
+        assert!(dst.is_recognized("увы", Lang::Ru));
+        // Importing the same file twice adds nothing.
+        assert_eq!(dst.import_str(&text).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
     }
 }
