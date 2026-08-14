@@ -749,15 +749,18 @@ impl PuntuEngine {
         Ok(true)
     }
 
-    /// Log who the engine is talking to and what it decided about them.
+    /// Log who the engine is talking to and what it decided about them — **on the first key
+    /// pressed** in a context, not when the facts arrive.
     ///
-    /// IBus reports the client's name (`FocusInId`) and its capabilities (`SetCapabilities`)
-    /// as two separate calls, in either order, so this is called from both — whichever
-    /// arrives second completes the picture. De-duplicated on the pair, so the common case is
-    /// one line per focused field.
+    /// Logging on arrival looked obvious and was wrong. IBus reports the name (`FocusInId`)
+    /// and the capabilities (`SetCapabilities`) as separate calls in either order, and GNOME
+    /// Shell sends capabilities twice (`0x09`, then `0x29` once surrounding text is on), so
+    /// every focus change wrote three or four lines of half-built state — plus a set for the
+    /// `fake` context nobody ever types into. Waiting for a keystroke means the facts have
+    /// settled, and only fields the user actually uses say anything at all.
     ///
-    /// This is *the* line a user greps for: it says what their game calls itself, whether it
-    /// can render a preedit, and whether Puntu is staying out of it.
+    /// This is *the* line to grep for: what an app calls itself, whether it can render a
+    /// preedit, and whether Puntu is staying out of it.
     fn log_client_state(&mut self) {
         let now = (self.client.clone(), self.caps);
         if self.logged.as_ref() == Some(&now) {
@@ -1345,6 +1348,9 @@ impl IBusEngine for PuntuEngine {
             state.mod4(),
             released,
         );
+        // Now that a key has actually arrived, the client's name and capabilities have
+        // settled — say who this is and what we decided. No-op unless something changed.
+        self.log_client_state();
         // Password / PIN fields and the tray pause («выключить временно») make the engine
         // fully transparent: nothing below runs, every keystroke goes straight to the app.
         //
@@ -1734,8 +1740,10 @@ impl IBusEngine for PuntuEngine {
         client: String,
     ) -> fdo::Result<()> {
         self.client = client;
-        debug!("[puntu-engine {}] focus_in context={object_path}", self.id);
-        self.log_client_state();
+        debug!(
+            "[puntu-engine {}] focus_in client={:?} context={object_path}",
+            self.id, self.client
+        );
         self.focus_in(se, server).await
     }
 
@@ -1802,8 +1810,9 @@ impl IBusEngine for PuntuEngine {
     }
 
     fn set_capabilities(&mut self, caps: u32) -> fdo::Result<()> {
+        // Recorded silently; `log_client_state` reports it on the next keystroke, once the
+        // client has finished making up its mind (GNOME Shell sends this twice per focus).
         self.caps = Some(caps);
-        self.log_client_state();
         Ok(())
     }
 
