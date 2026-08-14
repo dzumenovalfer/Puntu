@@ -307,6 +307,9 @@ pub struct PuntuEngine {
     /// The focused client's name, as it passed it to `CreateInputContext` (`"gtk-im"`,
     /// `"xim"`, `"SDL2_Application"`, …). Empty until `FocusInId` reports one.
     client: String,
+    /// The `(client, caps)` pair last written to the log, so the line below is printed once
+    /// per distinct combination instead of on every report.
+    logged: Option<(String, Option<u32>)>,
     /// Consecutive failed/timed-out DBus emits. Reset by any success.
     emit_failures: u32,
     /// Latched once [`MAX_EMIT_FAILURES`] emits fail in a row: the engine gives up and goes
@@ -500,6 +503,7 @@ impl PuntuEngine {
             was_transparent: false,
             caps: None,
             client: String::new(),
+            logged: None,
             emit_failures: 0,
             degraded: false,
         }
@@ -743,6 +747,33 @@ impl PuntuEngine {
         self.buffer.invalidate();
         self.take_held();
         Ok(true)
+    }
+
+    /// Log who the engine is talking to and what it decided about them.
+    ///
+    /// IBus reports the client's name (`FocusInId`) and its capabilities (`SetCapabilities`)
+    /// as two separate calls, in either order, so this is called from both — whichever
+    /// arrives second completes the picture. De-duplicated on the pair, so the common case is
+    /// one line per focused field.
+    ///
+    /// This is *the* line a user greps for: it says what their game calls itself, whether it
+    /// can render a preedit, and whether Puntu is staying out of it.
+    fn log_client_state(&mut self) {
+        let now = (self.client.clone(), self.caps);
+        if self.logged.as_ref() == Some(&now) {
+            return;
+        }
+        self.logged = Some(now);
+        tracing::info!(
+            "[puntu-engine {}] client={:?} caps={} → {}",
+            self.id,
+            self.client,
+            self.caps.map(|c| format!("0x{c:02x}")).unwrap_or_else(|| "?".into()),
+            match self.passthrough_reason() {
+                Some(r) => format!("transparent ({r:?})"),
+                None => "active".to_string(),
+            }
+        );
     }
 
     /// Un-latch [`Self::degraded`] on a lifecycle event. Whatever wedged the DBus path
@@ -1703,23 +1734,9 @@ impl IBusEngine for PuntuEngine {
         client: String,
     ) -> fdo::Result<()> {
         self.client = client;
-        // info-level and on every focus change: this is the line the user reads out of the
-        // journal to learn what their game calls itself before adding it to
-        // `[ibus_clients] passthrough_clients`.
-        tracing::info!(
-            "[puntu-engine {}] focus_in client={:?} caps={} context={object_path}",
-            self.id,
-            self.client,
-            self.caps.map(|c| format!("0x{c:02x}")).unwrap_or_else(|| "?".into()),
-        );
-        self.focus_in(se, server).await?;
-        if let Some(reason) = self.passthrough_reason() {
-            tracing::info!(
-                "[puntu-engine {}] transparent in this client ({reason:?})",
-                self.id
-            );
-        }
-        Ok(())
+        debug!("[puntu-engine {}] focus_in context={object_path}", self.id);
+        self.log_client_state();
+        self.focus_in(se, server).await
     }
 
     async fn focus_out(
@@ -1771,35 +1788,22 @@ impl IBusEngine for PuntuEngine {
         cursor_pos: u32,
         anchor_pos: u32,
     ) -> fdo::Result<()> {
-        if cursor_pos != anchor_pos {
-            tracing::info!(
-                "[puntu-engine {}] surrounding selection: cursor={cursor_pos} anchor={anchor_pos}",
-                self.id
-            );
-        } else {
-            tracing::debug!(
-                "[puntu-engine {}] surrounding: caret={cursor_pos} len={}",
-                self.id,
-                text.chars().count()
-            );
-        }
+        // DEBUG, not INFO: clients re-report the surrounding text on **every** caret and
+        // selection change, so dragging a selection across a paragraph emits a line per
+        // character. At info level that buried everything else in the log — and the log is
+        // where a user is told to look when something misbehaves.
+        tracing::debug!(
+            "[puntu-engine {}] surrounding: caret={cursor_pos} anchor={anchor_pos} len={}",
+            self.id,
+            text.chars().count()
+        );
         self.surrounding = Some((text, cursor_pos, anchor_pos));
         Ok(())
     }
 
     fn set_capabilities(&mut self, caps: u32) -> fdo::Result<()> {
-        if self.caps != Some(caps) {
-            tracing::info!(
-                "[puntu-engine {}] capabilities: 0x{caps:02x}{}",
-                self.id,
-                if caps & CAP_PREEDIT_TEXT == 0 {
-                    " → no preedit support (engine transparent here)"
-                } else {
-                    ""
-                }
-            );
-        }
         self.caps = Some(caps);
+        self.log_client_state();
         Ok(())
     }
 
