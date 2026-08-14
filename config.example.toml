@@ -1,5 +1,9 @@
 # Example Puntu config. Copy to ~/.config/puntu/config.toml (the daemon also writes a default
-# there on first run). Hot-reloaded on save.
+# there on first run).
+#
+# Hot-reloaded on save: the IBus engine watches this file and swaps its settings within about
+# a second, so nothing here needs an `ibus restart` — including the hotkeys and the
+# [ibus_clients] list below.
 
 # Detect but never inject — safe validation mode. For the IBus engine this turns OFF
 # auto-conversion: words stay exactly as typed and convert only on the manual flip (Ctrl+`).

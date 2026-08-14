@@ -146,8 +146,8 @@ passthrough_xim = false                 # true also silences Wine/Proton (they c
 ```
 
 If a game still eats your keys, find its name in the engine log
-(`~/.local/state/puntu/engine.log`, look for `client=…`) and add it to the list, then
-`ibus restart` — unlike the word lists, `config.toml` is read once at engine start.
+(`~/.local/state/puntu/engine.log`, look for `client=…`) and add it to the list. Like every
+setting, it takes effect within about a second — `config.toml` is hot-reloaded, no restart.
 Wine/Proton games reach IBus through the XIM bridge and report themselves as `xim`, so
 `passthrough_xim = true` is the switch for those; it also turns Puntu off in ordinary
 X11/XWayland apps, which is the trade-off.

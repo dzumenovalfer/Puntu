@@ -24,7 +24,8 @@ puntu-ibus <команда>
 
 > **Если Puntu «перестал печатать» или мешает игре** — начните с `puntu-ibus doctor`, затем
 > найдите в логе строку `client=…` для этого приложения и добавьте это имя в
-> `[ibus_clients] passthrough_clients`.
+> `[ibus_clients] passthrough_clients`. Перезапускать движок не нужно: `config.toml`
+> перечитывается на лету, как и словари.
 
 ## Режимы движка
 

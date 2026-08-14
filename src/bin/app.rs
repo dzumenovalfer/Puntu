@@ -255,11 +255,7 @@ impl Action {
 enum Engine {
     /// Puntu is the active input source and running the settings on disk.
     Active,
-    /// Settings changed; the engine restart that applies them is queued.
-    Pending,
-    /// Restart in flight.
-    Restarting,
-    /// Puntu is not the active input source, or the restart failed.
+    /// Puntu is not the active input source.
     Off,
 }
 
@@ -268,16 +264,10 @@ impl Engine {
     fn look(self) -> (egui::Color32, &'static str) {
         match self {
             Engine::Active => (egui::Color32::from_rgb(0x2e, 0xc2, 0x7e), "активен"),
-            Engine::Pending => (egui::Color32::from_rgb(0xe5, 0xa5, 0x0a), "применяю…"),
-            Engine::Restarting => (egui::Color32::from_rgb(0xe5, 0xa5, 0x0a), "перезапуск…"),
             Engine::Off => (egui::Color32::from_rgb(0xe0, 0x1b, 0x24), "выключен"),
         }
     }
 }
-
-/// How long to wait after the last change before restarting the engine. Long enough that
-/// dragging a slider through twenty values is one restart, short enough to feel automatic.
-const AUTO_APPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(1200);
 
 struct App {
     cfg: Config,
@@ -286,8 +276,6 @@ struct App {
     capture: Option<Capture>,
     /// Engine state shown by the headerbar dot.
     engine: Engine,
-    /// When the queued auto-restart should fire (set on every saved change).
-    apply_at: Option<std::time::Instant>,
     /// Live "is Puntu the active input source?" polling, so the dot stays honest when the
     /// user switches input sources from outside this window.
     engine_rx: mpsc::Receiver<bool>,
@@ -296,8 +284,6 @@ struct App {
     status: String,
     /// remember_key value before it was switched off, to restore on re-enable.
     remember_prev: String,
-    /// Result channel of the engine-restart thread (None = no restart in flight).
-    restart_rx: Option<mpsc::Receiver<(bool, String)>>,
     /// Result channel of the file chooser: `Some((is_export, path))`, or `None` when the user
     /// cancelled. Runs off the UI thread — a modal dialog must not freeze the window.
     file_rx: Option<mpsc::Receiver<Option<(bool, std::path::PathBuf)>>>,
@@ -377,13 +363,11 @@ impl App {
             tab: Tab::Settings,
             capture: None,
             engine: Engine::Active,
-            apply_at: None,
             engine_rx,
             search: String::new(),
             new_word: String::new(),
             status: String::new(),
             remember_prev,
-            restart_rx: None,
             file_rx: None,
             capture_peak: egui::Modifiers::NONE,
             dict_refreshed: std::time::Instant::now(),
@@ -401,63 +385,17 @@ impl App {
         self.capture_peak = egui::Modifiers::NONE;
     }
 
-    /// Persist the config and queue the engine restart that applies it. The engine reads its
-    /// settings once at startup, so a saved change means nothing until it restarts — leaving
-    /// that to a button the user had to notice is why changed settings looked like they did
-    /// nothing.
+    /// Persist the config. That is the whole of applying it: the engine watches `config.toml`
+    /// and swaps its settings within ~300 ms, so what used to follow here — a debounced
+    /// `ibus restart` that dropped the engine out of every window for a couple of seconds and
+    /// lost the word held in preedit — is gone.
     fn save_cfg(&mut self) {
         match self.cfg.save_to(&Config::path()) {
-            Ok(()) => {
-                self.apply_at = Some(std::time::Instant::now() + AUTO_APPLY_DELAY);
-                self.engine = Engine::Pending;
-                self.status.clear();
-            }
+            Ok(()) => self.status = "Настройки применены".to_string(),
             Err(e) => {
-                self.engine = Engine::Off;
                 self.status = format!("Не удалось сохранить: {e}");
             }
         }
-    }
-
-    /// Restart the engine in a background thread and report the actual outcome — «движок
-    /// перезапускается…» that never resolves was unreadable.
-    fn restart_engine(&mut self) {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let ok = std::process::Command::new("ibus")
-                .arg("restart")
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            // ibus-daemon comes back asynchronously: setting the engine too early fails with
-            // «Не удалось настроить глобальный модуль», so wait, then retry a few times.
-            let mut active = false;
-            for _ in 0..6 {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                let _ = std::process::Command::new("ibus").args(["engine", "puntu"]).status();
-                active = std::process::Command::new("ibus")
-                    .arg("engine")
-                    .output()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "puntu")
-                    .unwrap_or(false);
-                if active {
-                    break;
-                }
-            }
-            let _ = tx.send(match (ok, active) {
-                (_, true) => (true, "Настройки применены".to_string()),
-                (true, false) => (
-                    false,
-                    "Движок перезапущен; выберите Puntu в переключателе раскладок".to_string(),
-                ),
-                (false, false) => {
-                    (false, "Не удалось перезапустить движок (ibus restart)".to_string())
-                }
-            });
-        });
-        self.restart_rx = Some(rx);
-        self.apply_at = None;
-        self.engine = Engine::Restarting;
     }
 
     /// Ask for a file with zenity, off the UI thread. `export` switches the dialog to save
@@ -568,18 +506,9 @@ impl App {
 
 
 /// The engine-state dot in the headerbar: a small coloured circle plus a word. Deliberately
-/// quiet — it is a status light, not a control. Pulses gently while a restart is in flight so
-/// the user can see that something is happening without a modal or a spinner.
+/// quiet — it is a status light, not a control.
 fn engine_indicator(ui: &mut egui::Ui, state: Engine) {
     let (color, label) = state.look();
-    let color = if state == Engine::Restarting {
-        // 0.45..1.0 sine — visible movement, no strobing.
-        let t = ui.input(|i| i.time) as f32;
-        ui.ctx().request_repaint();
-        color.gamma_multiply(0.45 + 0.55 * (0.5 + 0.5 * (t * 4.0).sin()))
-    } else {
-        color
-    };
     ui.horizontal(|ui| {
         let (rect, resp) =
             ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -587,8 +516,6 @@ fn engine_indicator(ui: &mut egui::Ui, state: Engine) {
         ui.label(egui::RichText::new(label).weak().size(11.0));
         resp.on_hover_text(match state {
             Engine::Active => "Puntu — активный источник ввода",
-            Engine::Pending => "Настройки сохранены, применяю…",
-            Engine::Restarting => "Перезапускаю движок…",
             Engine::Off => "Puntu не выбран в переключателе раскладок",
         });
     });
@@ -1511,22 +1438,10 @@ impl eframe::App for App {
             disable_ime(ui.ctx());
         }
 
-        // Is Puntu still the active input source? (Ignored while we are mid-restart, which
-        // owns the indicator until it reports back.)
+        // Is Puntu still the active input source? Polled in the background, so the dot stays
+        // honest when the user switches input sources from outside this window.
         while let Ok(active) = self.engine_rx.try_recv() {
-            if !matches!(self.engine, Engine::Pending | Engine::Restarting) {
-                self.engine = if active { Engine::Active } else { Engine::Off };
-            }
-        }
-
-        // Auto-apply: settings are saved immediately, and the engine restart that makes them
-        // real fires once the user stops changing things.
-        if let Some(at) = self.apply_at {
-            if self.restart_rx.is_none() && std::time::Instant::now() >= at {
-                self.restart_engine();
-            } else {
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
-            }
+            self.engine = if active { Engine::Active } else { Engine::Off };
         }
 
         // File chooser (export/import) finished?
@@ -1544,25 +1459,6 @@ impl eframe::App for App {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.file_rx = None,
-            }
-        }
-
-        // Engine-restart progress: poll the background thread's answer.
-        if let Some(rx) = &self.restart_rx {
-            match rx.try_recv() {
-                Ok((ok, msg)) => {
-                    self.engine = if ok { Engine::Active } else { Engine::Off };
-                    self.status = msg;
-                    self.restart_rx = None;
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.engine = Engine::Off;
-                    self.status = "Не удалось перезапустить движок".to_string();
-                    self.restart_rx = None;
-                }
             }
         }
 

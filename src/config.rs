@@ -215,7 +215,9 @@ impl Default for LearningConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+// `PartialEq` so the config watcher can tell a real threshold change from a save that only
+// touched something else: rebuilding the detector is the expensive part of a reload.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DetectConfig {
     /// Minimum word length considered for autocorrection (avoids `a`, `я`, …).

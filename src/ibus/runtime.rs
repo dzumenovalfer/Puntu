@@ -19,7 +19,7 @@ use crate::config;
 use crate::detect::userdict::UserDict;
 use crate::detect::{Detector, Models};
 use crate::ibus::engine::{
-    DetectorSlot, EngineOptions, HotkeyBindings, PuntuEngine, PuntuFactory,
+    DetectorSlot, EngineSettings, PuntuEngine, PuntuFactory, SettingsSlot,
 };
 
 /// Our DBus well-known name — also the component name in the registry XML.
@@ -40,28 +40,8 @@ pub async fn run() -> Result<()> {
         UserDict::empty(dir)
     });
     let cfg = config::Config::load().unwrap_or_default();
-    let detector = Detector::new(models, cfg.detect.clone());
-    let hotkeys = HotkeyBindings::from_config(&cfg);
-    let opts = EngineOptions::from_config(&cfg);
-    info!(
-        "hotkeys: undo={:?} mode_toggle={:?} convert_last={:?} taps_enabled={} autocorrect={} \
-         hold_commit_ms={}",
-        cfg.ibus_hotkeys.undo_key,
-        cfg.ibus_hotkeys.mode_toggle,
-        cfg.ibus_hotkeys.convert_last,
-        cfg.enable_modifier_taps,
-        opts.autocorrect,
-        cfg.hold_commit_ms,
-    );
-    // Logged on its own line because it is the first thing to check when the engine "does
-    // nothing" in one app but works everywhere else.
-    info!(
-        "client policy: require_preedit_capability={} passthrough_clients={:?} \
-         passthrough_xim={}",
-        opts.clients.require_preedit_capability,
-        opts.clients.passthrough_clients,
-        opts.clients.passthrough_xim,
-    );
+    let detector = Detector::new(models.clone(), cfg.detect.clone());
+    log_settings(&cfg);
 
     // Share the dict between the engines and a hot-reload watcher, so `puntu dict add/learn`
     // (and hand-edits of the list files) take effect within ~300 ms — no engine restart.
@@ -72,20 +52,29 @@ pub async fn run() -> Result<()> {
     // is the big dictionary), so teaching a word has to rebuild those too — not just the
     // dict's recognized set. Without this the engine kept the models it booted with.
     let detector: DetectorSlot = Arc::new(std::sync::RwLock::new(Arc::new(detector)));
+    // …and the same for the settings themselves, so editing `config.toml` (from the settings
+    // window, the CLI, or by hand) reaches every live engine on its next keystroke. Copying
+    // them into each engine at creation is what used to make a changed setting need an
+    // `ibus restart`, which drops the engine out of every window and loses the held word.
+    let settings: SettingsSlot =
+        Arc::new(std::sync::RwLock::new(Arc::new(EngineSettings::from_config(&cfg))));
     // Tray pause flag: initial state from the marker file, then live via the watcher.
     let paused = Arc::new(std::sync::atomic::AtomicBool::new(paused_path().exists()));
-    spawn_dict_reload_watcher(
-        Arc::clone(&dict),
-        Arc::clone(&detector),
-        cfg.detect.clone(),
-        Arc::clone(&paused),
+    spawn_reload_watcher(
+        ReloadTargets {
+            dict: Arc::clone(&dict),
+            detector: Arc::clone(&detector),
+            settings: Arc::clone(&settings),
+            paused: Arc::clone(&paused),
+        },
+        models,
+        cfg,
     );
 
     let factory = PuntuFactory::new(
         Arc::clone(&detector),
         dict,
-        hotkeys,
-        opts,
+        settings,
         Arc::clone(&paused),
     );
 
@@ -108,43 +97,73 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Spawn the dictionary hot-reload watcher on its own OS thread. `notify` delivers events on
-/// a std channel and the reload takes the dict mutex with `blocking_lock`, so this must live
-/// outside the tokio runtime.
 fn paused_path() -> std::path::PathBuf {
     config::config_dir().join("paused")
 }
 
-fn spawn_dict_reload_watcher(
+/// Print the settings actually in force. Called at startup and again after every successful
+/// config reload, so the journal always shows what the engine is running with — and, for a
+/// reload, proves the edit arrived without an `ibus restart`.
+fn log_settings(cfg: &crate::config::Config) {
+    info!(
+        "hotkeys: undo={:?} mode_toggle={:?} convert_last={:?} taps_enabled={} autocorrect={} \
+         hold_commit_ms={}",
+        cfg.ibus_hotkeys.undo_key,
+        cfg.ibus_hotkeys.mode_toggle,
+        cfg.ibus_hotkeys.convert_last,
+        cfg.enable_modifier_taps,
+        !cfg.dry_run,
+        cfg.hold_commit_ms,
+    );
+    // Logged on its own line because it is the first thing to check when the engine "does
+    // nothing" in one app but works everywhere else.
+    info!(
+        "client policy: require_preedit_capability={} passthrough_clients={:?} \
+         passthrough_xim={}",
+        cfg.ibus_clients.require_preedit_capability,
+        cfg.ibus_clients.passthrough_clients,
+        cfg.ibus_clients.passthrough_xim,
+    );
+}
+
+/// Everything the watcher can hot-swap into the running engines.
+struct ReloadTargets {
     dict: Arc<AsyncMutex<UserDict>>,
     detector: DetectorSlot,
-    detect_cfg: crate::config::DetectConfig,
+    settings: SettingsSlot,
     paused: Arc<std::sync::atomic::AtomicBool>,
-) {
+}
+
+/// Spawn the hot-reload watcher on its own OS thread. `notify` delivers events on a std
+/// channel and the reload takes the dict mutex with `blocking_lock`, so this must live
+/// outside the tokio runtime.
+fn spawn_reload_watcher(targets: ReloadTargets, models: Models, cfg: crate::config::Config) {
     if let Err(e) = std::thread::Builder::new()
-        .name("puntu-dict-reload".into())
-        .spawn(move || dict_reload_watcher(dict, detector, detect_cfg, paused))
+        .name("puntu-reload".into())
+        .spawn(move || reload_watcher(targets, models, cfg))
     {
-        tracing::warn!("dictionary hot-reload disabled (thread spawn failed): {e}");
+        tracing::warn!("hot-reload disabled (thread spawn failed): {e}");
     }
 }
 
-/// Watch `~/.config/puntu` and re-read the user word lists when they change. Events are
-/// debounced (300 ms trailing edge) — `notify` emits several events per logical save — and
-/// filtered to the dict files, so writes to `config.toml`, `russian.fst` or the control
-/// socket don't trigger pointless reloads. Same approach as the uinput daemon's
-/// `reload_watcher` (`input/mod.rs`), minus the config/models parts the engine reads at boot.
-fn dict_reload_watcher(
-    dict: Arc<AsyncMutex<UserDict>>,
-    detector: DetectorSlot,
-    detect_cfg: crate::config::DetectConfig,
-    paused: Arc<std::sync::atomic::AtomicBool>,
-) {
+/// Watch `~/.config/puntu` and re-read whatever changed: the user word lists, the language
+/// models, and `config.toml` itself. Events are debounced (300 ms trailing edge) — `notify`
+/// emits several per logical save — and classified by file, so an unrelated write doesn't
+/// trigger a pointless rebuild. Same approach as the uinput daemon's `reload_watcher`
+/// (`input/mod.rs`).
+///
+/// `models` and `cfg` are the watcher's own copies of the last known state: keeping `Models`
+/// here means a `config.toml` edit rebuilds the detector **without** re-reading the 2 MB FST,
+/// and keeping `cfg` lets us tell a real `[detect]` change from a save that touched something
+/// else entirely.
+fn reload_watcher(targets: ReloadTargets, mut models: Models, mut cfg: crate::config::Config) {
     use notify::{RecursiveMode, Watcher};
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
 
     const DEBOUNCE: Duration = Duration::from_millis(300);
+
+    let ReloadTargets { dict, detector, settings, paused } = targets;
 
     /// The files `UserDict::reload` reads (see `ListKind::file_name`).
     fn is_dict_file(p: &std::path::Path) -> bool {
@@ -175,23 +194,29 @@ fn dict_reload_watcher(
         )
     }
 
+    /// The engine has no `--config` flag, so there is exactly one file to compare against.
+    fn is_config_file(p: &std::path::Path) -> bool {
+        p == crate::config::Config::path()
+    }
+
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = match notify::recommended_watcher(tx) {
         Ok(w) => w,
         Err(e) => {
-            tracing::warn!("dictionary hot-reload disabled: {e}");
+            tracing::warn!("hot-reload disabled: {e}");
             return;
         }
     };
     let dir = config::config_dir();
     if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-        tracing::warn!("dictionary hot-reload disabled (cannot watch {}): {e}", dir.display());
+        tracing::warn!("hot-reload disabled (cannot watch {}): {e}", dir.display());
         return;
     }
-    info!("watching {} for dictionary edits", dir.display());
+    info!("watching {} for dictionary and settings edits", dir.display());
 
     let mut dirty = false;
     let mut models_dirty = false;
+    let mut config_dirty = false;
     let mut deadline: Option<Instant> = None;
     loop {
         let timeout = match deadline {
@@ -214,7 +239,10 @@ fn dict_reload_watcher(
                 if ev.paths.iter().any(|p| is_model_file(p)) {
                     models_dirty = true;
                 }
-                if dirty || models_dirty {
+                if ev.paths.iter().any(|p| is_config_file(p)) {
+                    config_dirty = true;
+                }
+                if dirty || models_dirty || config_dirty {
                     deadline = Some(Instant::now() + DEBOUNCE);
                 }
             }
@@ -227,16 +255,49 @@ fn dict_reload_watcher(
                     }
                     dirty = false;
                 }
-                if models_dirty {
+                // Re-read the config first: a `[detect]` change decides whether the detector
+                // has to be rebuilt below, and doing both in one pass keeps a single save from
+                // rebuilding twice.
+                let mut detect_changed = false;
+                if config_dirty {
+                    match crate::config::Config::load() {
+                        Ok(new_cfg) => {
+                            detect_changed = new_cfg.detect != cfg.detect;
+                            cfg = new_cfg;
+                            let resolved = Arc::new(EngineSettings::from_config(&cfg));
+                            match settings.write() {
+                                Ok(mut slot) => {
+                                    *slot = resolved;
+                                    log_settings(&cfg);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("could not swap the settings: {e}");
+                                }
+                            }
+                        }
+                        // A half-written file (editors save in several steps) must not take
+                        // the engine's settings down with it — keep the ones we have.
+                        Err(e) => tracing::warn!("config reload failed (keeping old): {e:#}"),
+                    }
+                    config_dirty = false;
+                }
+                if models_dirty || detect_changed {
                     // Train + read the FST OUTSIDE the lock: this takes hundreds of
                     // milliseconds, and engines only ever hold the lock long enough to clone
-                    // the `Arc` out of it.
-                    let rebuilt =
-                        Arc::new(Detector::new(Models::load(&dir), detect_cfg.clone()));
+                    // the `Arc` out of it. A settings-only change reuses the models we
+                    // already have, so retuning a threshold costs nothing.
+                    if models_dirty {
+                        models = Models::load(&dir);
+                    }
+                    let rebuilt = Arc::new(Detector::new(models.clone(), cfg.detect.clone()));
                     match detector.write() {
                         Ok(mut slot) => {
                             *slot = rebuilt;
-                            info!("language models rebuilt");
+                            if models_dirty {
+                                info!("language models rebuilt");
+                            } else {
+                                info!("detector rebuilt for the new [detect] thresholds");
+                            }
                         }
                         Err(e) => tracing::warn!("could not swap the detector: {e}"),
                     }
