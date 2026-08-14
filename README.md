@@ -195,15 +195,25 @@ notification and reaches the running engine within a second — no restart.
 
 A separate table of `key = value` rules, applied when a word is finished and **before** any
 layout decision. Same mechanism for fixing a typo and for expanding an abbreviation — there is
-no difference between the two in code:
+no difference between the two in code.
+
+**The key is what you type, the value is what you want instead** — in that order, both in the
+file and on the command line. Getting it backwards is the easy mistake: `порно = орно` makes
+Puntu turn a correctly typed word into the typo.
 
 ```sh
-puntu dict replace ривет привет
-puntu dict replace адр ул. Пушкина, д. 1
-puntu dict replace brb be right back
-puntu dict list --replacements     # show the table
-puntu dict rm адр                  # remove a rule
+puntu dict replace ривет привет            # you type "ривет"  → you get "привет"
+puntu dict replace портоилио портфолио     # a typo you make often
+puntu dict replace адр ул. Пушкина, д. 1   # an abbreviation to expand
+puntu dict list --replacements             # show the table
+puntu dict rm адр                          # remove a rule
 ```
+
+Matching is on the **whole word, exactly**. A rule for `портоилио` does nothing for
+`портоилиом` — each form you actually mistype needs its own line. Guessing corrections for
+words that aren't in the table is a different feature (dictionary-based typo correction) and is
+not built yet: today Puntu fixes the *layout* you typed in, not your spelling, so `какойто`
+stays `какойто`.
 
 The file is `~/.config/puntu/replacements.txt`, hand-editable and hot-reloaded like the word
 lists. A rule matches **both readings of the keys**, so `ривет = привет` fires whether you
