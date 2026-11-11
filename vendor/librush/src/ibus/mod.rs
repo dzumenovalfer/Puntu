@@ -12,6 +12,8 @@ mod lookup_table;
 
 pub use addr::get_ibus_addr;
 pub use bus::IBus;
+#[doc(hidden)]
+pub use engine::engine_handles_calls_in_order;
 pub use engine::{IBusEngine, IBusEngineBackend, IBusPreeditFocusMode};
 pub use error::IBusErr;
 pub use factory::IBusFactory;

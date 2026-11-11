@@ -14,6 +14,15 @@ dry_run = false
 # Toggle from the CLI with: `puntu config set paste_convert on`  (a future GUI uses the same file).
 paste_convert = false
 
+# Тап-жесты модификаторами (тап Ctrl = смена режима, тап Ctrl+Shift = перевод выделения).
+# false выключает оба сразу — если голый Ctrl уже занят системным переключателем раскладки.
+enable_modifier_taps = true
+
+# Тап — это нажал и отпустил, ничего не нажимая между, за столько миллисекунд. Дольше —
+# удержанный шорткат (Ctrl+клик), а не жест. Касается только одиночного модификатора:
+# комбинация из двух срабатывает при любом удержании.
+tap_max_hold_ms = 500
+
 # Исправление регистра: пРИВЕТ → Привет (CapsLock+Shift), ПРивет → Привет (поздний Shift,
 # по словарю). ВЕСЬ КАПС и iPhone/КамАЗ не трогаются. Откат — Ctrl+` как обычно.
 fix_case = true
@@ -21,14 +30,22 @@ fix_case = true
 # Сколько мс законченное слово ждёт в preedit, где его ещё можно перевернуть по Ctrl+`,
 # прежде чем движок закоммитит его сам.
 #
-# Слово существует ТОЛЬКО в preedit, то есть привязано к позиции курсора, которой мы перестаём
-# управлять, как только пользователь берётся за мышь: приложение сначала переносит каретку по
-# клику и лишь потом сбрасывает контекст ввода — и слово уезжало туда, куда кликнули. Коммит
-# по бездействию оставляет его там, где его набрали.
+# Слово существует ТОЛЬКО в preedit. Клик мышью или смена окна, пока оно там, коммитит его
+# сам тулкит — там, где его набрали (GTK делает это из обработчика клика, mutter для
+# Chromium/Electron/Firefox/Qt — ещё до того, как клик дойдёт до приложения); движок его
+# повторно не коммитит. Таймер остаётся страховкой: чем меньше, тем короче окно, в котором
+# слово вообще зависит от чужого поведения.
 #
-# Больше — больше времени на флип; меньше — меньше шансов, что слово уедет по клику.
-# 0 — держать бесконечно (прежнее поведение).
+# Больше — больше времени на флип; меньше — меньше времени в preedit.
+# 0 — держать бесконечно.
 hold_commit_ms = 1500
+
+# Подробный лог движка (каждое событие клавиши и каждое решение) в
+# ~/.local/state/puntu/engine.log. Применяется на лету — перезапуск не нужен. Включайте,
+# когда нужно показать, что именно произошло; PUNTU_LOG в окружении имеет приоритет.
+# В таком логе названа каждая нажатая клавиша — выключайте, когда закончили. Клавиши,
+# набранные в полях пароля и PIN, в лог не пишутся никогда.
+debug_log = false
 
 [detect]
 # Minimum word length considered for autocorrection.
@@ -40,12 +57,14 @@ alt_valid_min = -3.3
 
 [learning]
 # After this many MANUAL conversions of the same word (forward flip via Ctrl+`, or a
-# single-word selection conversion) Puntu shows a dialog offering to remember the word
-# in the dictionary. 0 disables the offer.
+# single-word selection conversion) Puntu shows a dialog. For a word the dictionaries don't
+# know it offers to remember it; for a known word the detector keeps declining it offers to
+# always convert the typed form (the force list). 0 disables the offer.
 suggest_after = 3
 
 # IBus engine hotkeys (the current, default front-end). Values are xkb keysym names
-# (case-insensitive); modifier taps are "Ctrl", "Shift", "Ctrl+Shift", …; "none" disables.
+# (case-insensitive); modifier taps are "Ctrl", "Ctrl+Shift", "Alt+Shift", …; "none" disables.
+# A bare "Shift" is not a tap (it is what an aborted capital letter looks like) and is refused.
 [ibus_hotkeys]
 # Undo the last commit (restore exactly what you typed).
 undo_key = "Ctrl+grave"

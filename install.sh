@@ -487,6 +487,6 @@ Next steps:
   • Diagnose anything odd:   puntu-ibus doctor
   • Turn the engine off:     puntu-ibus disable      (back to xkb:us::eng)
   • Manage words:            puntu dict learn <service> ; puntu dict add <word>
-  • Engine logs:             PUNTU_LOG=puntu=debug ibus restart ; journalctl --user -f | grep puntu
+  • Engine logs:             ~/.local/state/puntu/engine.log ; verbose: puntu config set debug_log true
 EOF
 fi

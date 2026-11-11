@@ -39,7 +39,15 @@ pub async fn run() -> Result<()> {
         tracing::warn!("could not load user dictionaries: {e}; using empty");
         UserDict::empty(dir)
     });
-    let cfg = config::Config::load().unwrap_or_default();
+    // A config that does not parse must not pass silently for "no config": every setting
+    // falls back to its default, and without a word in the log that looks like the engine
+    // ignoring the file. (A reload that fails is reported the same way and keeps the old
+    // settings; at startup there are none to keep.)
+    let cfg = config::Config::load().unwrap_or_else(|e| {
+        tracing::warn!("config.toml could not be read — running on defaults: {e:#}");
+        config::Config::default()
+    });
+    apply_log_level(cfg.debug_log);
     let detector = Detector::new(models.clone(), cfg.detect.clone());
     log_settings(&cfg);
 
@@ -78,7 +86,7 @@ pub async fn run() -> Result<()> {
         Arc::clone(&paused),
     );
 
-    let _ibus = librush::ibus::IBus::<PuntuEngine, PuntuFactory>::new(
+    let ibus = librush::ibus::IBus::<PuntuEngine, PuntuFactory>::new(
         addr,
         factory,
         BUS_NAME.to_string(),
@@ -87,18 +95,84 @@ pub async fn run() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("registering with IBus failed: {e}"))?;
     info!("registered IBus factory as {BUS_NAME}; engine ready");
 
-    // Block until SIGINT/SIGTERM. The DBus connection inside `_ibus` keeps serving on its
-    // own task; we just need to stay alive.
+    // Block until SIGINT/SIGTERM — or until ibus-daemon is gone. The DBus connection inside
+    // `ibus` keeps serving on its own task; we just need to stay alive for as long as there
+    // is someone to serve.
     tokio::select! {
         _ = signal::ctrl_c() => info!("SIGINT received, shutting down"),
         _ = sigterm() => info!("SIGTERM received, shutting down"),
+        _ = bus_gone(ibus.conn()) => info!(
+            "the connection to ibus-daemon closed — exiting (a restarted daemon launches \
+             its own engine)"
+        ),
     }
 
     Ok(())
 }
 
+/// Resolves once the connection to ibus-daemon is gone.
+///
+/// A daemon that exits cleanly SIGTERMs its engines, but one that crashes — or is killed —
+/// does not, and the engine used to live on: connected to nothing, holding its dictionaries
+/// in memory and its watcher on the config directory, while the next daemon started a second
+/// one. `puntu-ibus doctor` then counted two engines ("two engines fight over the same
+/// keystrokes"), and both wrote to the one log file.
+///
+/// zbus has no "closed" notification as such; what it does is end every message stream when
+/// the socket reader hits an error. So this subscribes to a signal that is never sent and
+/// waits for the stream to end.
+async fn bus_gone(conn: zbus::Connection) {
+    use zbus::export::futures_core::Stream;
+
+    let stream = async {
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface("org.freedesktop.DBus.Local")?
+            .member("Disconnected")?
+            .build();
+        zbus::MessageStream::for_match_rule(rule, &conn, Some(1)).await
+    };
+    let stream = match stream.await {
+        Ok(s) => s,
+        Err(e) => {
+            // Not worth failing the engine over: it just won't notice a dead daemon.
+            tracing::warn!("cannot watch the IBus connection for closure: {e}");
+            return std::future::pending().await;
+        }
+    };
+    let mut stream = std::pin::pin!(stream);
+    loop {
+        match std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+            // Nothing matches the rule, but a stray message is no reason to quit.
+            Some(Ok(_)) => continue,
+            Some(Err(_)) | None => return,
+        }
+    }
+}
+
 fn paused_path() -> std::path::PathBuf {
     config::config_dir().join("paused")
+}
+
+/// Switches the tracing filter between `info` and `puntu=debug`, installed by the binary's
+/// logging setup (`ibus_main::init_logging`) — absent when `PUNTU_LOG` was set explicitly,
+/// which then stays in force.
+type LogReload = Box<dyn Fn(bool) + Send + Sync>;
+static LOG_RELOAD: std::sync::OnceLock<LogReload> = std::sync::OnceLock::new();
+
+/// Register the filter switch. Called once, before [`run`].
+pub fn set_log_reload(f: impl Fn(bool) + Send + Sync + 'static) {
+    let _ = LOG_RELOAD.set(Box::new(f));
+}
+
+/// Apply `[config] debug_log` to the live log filter. The one setting that used to need an
+/// environment variable and a restart — and on GNOME the variable never arrived anyway.
+fn apply_log_level(verbose: bool) {
+    if let Some(reload) = LOG_RELOAD.get() {
+        reload(verbose);
+        let level = if verbose { "debug (config debug_log = true)" } else { "info" };
+        info!("log level: {level}");
+    }
 }
 
 /// Print the settings actually in force. Called at startup and again after every successful
@@ -107,13 +181,14 @@ fn paused_path() -> std::path::PathBuf {
 fn log_settings(cfg: &crate::config::Config) {
     info!(
         "hotkeys: undo={:?} mode_toggle={:?} convert_last={:?} taps_enabled={} autocorrect={} \
-         hold_commit_ms={}",
+         hold_commit_ms={} debug_log={}",
         cfg.ibus_hotkeys.undo_key,
         cfg.ibus_hotkeys.mode_toggle,
         cfg.ibus_hotkeys.convert_last,
         cfg.enable_modifier_taps,
         !cfg.dry_run,
         cfg.hold_commit_ms,
+        cfg.debug_log,
     );
     // Logged on its own line because it is the first thing to check when the engine "does
     // nothing" in one app but works everywhere else.
@@ -209,6 +284,13 @@ fn reload_watcher(targets: ReloadTargets, mut models: Models, mut cfg: crate::co
         }
     };
     let dir = config::config_dir();
+    // The directory may not exist yet (no config, no word lists, nothing taught so far), and
+    // a watch on a missing directory fails for good: the first `puntu dict add` would then
+    // create it and go unnoticed until the next restart — and so would the tray's pause
+    // marker, which lives in the same place.
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("cannot create {}: {e}", dir.display());
+    }
     if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
         tracing::warn!("hot-reload disabled (cannot watch {}): {e}", dir.display());
         return;
@@ -264,6 +346,9 @@ fn reload_watcher(targets: ReloadTargets, mut models: Models, mut cfg: crate::co
                     match crate::config::Config::load() {
                         Ok(new_cfg) => {
                             detect_changed = new_cfg.detect != cfg.detect;
+                            if new_cfg.debug_log != cfg.debug_log {
+                                apply_log_level(new_cfg.debug_log);
+                            }
                             cfg = new_cfg;
                             let resolved = Arc::new(EngineSettings::from_config(&cfg));
                             match settings.write() {

@@ -25,6 +25,12 @@ Auto-correction only fires in a **trusted context**: a word typed straight throu
 cursor at its end. Any navigation, mid-word edit, or focus change marks the buffer untrusted, so
 editing one letter in the middle of a word never corrupts it.
 
+The same goes for a word you are *finishing*: type `walkes `, backspace over the `s`, type
+`d ` — the `d` is the end of `walked`, not the Russian word «в». Puntu keeps track of what
+stands right before the caret (what it committed, what Backspace removed, and what the app
+reports), and letters typed straight after a letter or a digit are held exactly as typed:
+`5th` stays `5th`. Converting such a fragment by hand with `Ctrl+` `` ` `` still works.
+
 ## Install (one command)
 
 Targets Ubuntu/Debian GNOME (Wayland or X11). Because Puntu is an IBus engine, there's **no**
@@ -101,6 +107,15 @@ When **Puntu** is the active source you keep typing on a US keyboard. Two modes:
 Tap **Ctrl** again to toggle back. A small hint (`EN auto-correct` / `RU direct`) shows the
 current mode.
 
+Punctuation follows the word. A separator is a physical key, and when the word before it
+turns out to be Russian, the key is read the Russian way too: `ghbdtn/` becomes `привет.`
+and `rfr ltkf&` becomes `как дела?` — while `and/or` keeps its slash. Flipping the word back
+restores exactly what you typed.
+
+Two-letter words convert only when the Russian reading is one people actually type (не, мы,
+ты, вы, на, но, он, то, по, за, из …). `TV`, `UK`, `16 GB` and `10 km` are left alone; teach
+a rarer one with `puntu dict learn <слово>`.
+
 ### Electron/Chromium apps (VS Code, Claude, Chrome, Slack…)
 
 An IBus engine only sees keystrokes from apps connected to the input-method framework.
@@ -139,6 +154,13 @@ while you type. Puntu refuses to work in such clients rather than swallow your t
 DBus stops accepting text mid-session, it commits what it holds, turns itself off for that
 field, and lets you keep typing instead of going quiet until a restart.
 
+A *finished* word stays in the preedit for `hold_commit_ms` (default 1.5 s) so `Ctrl+` `` ` ``
+can still flip it; after that it commits itself. Click somewhere else or switch windows while
+it is still held and the toolkit commits it **where it was typed** (GTK does that from the
+click, mutter for Chromium/Electron/Firefox/Qt before the click even reaches the app) — Puntu
+never commits it a second time, which is what used to leave a copy of the word at the click.
+If some app still moves the word, lower `hold_commit_ms`.
+
 The same swallowing is what breaks games: SDL opens an IBus context for its text input, so
 **WASD arrives looking exactly like typing**. Clients named in `[ibus_clients]` are left
 completely alone; the default covers SDL:
@@ -151,7 +173,11 @@ passthrough_xim = false                 # true also silences Wine/Proton (they c
 ```
 
 If a game still eats your keys, find its name in the engine log
-(`~/.local/state/puntu/engine.log`, look for `client=…`) and add it to the list. Like every
+(`~/.local/state/puntu/engine.log`, look for `client=…`) and add it to the list. For a
+blow-by-blow log of every key and decision, `puntu config set debug_log true` — it applies to
+the running engine (an env variable can't reach an engine that ibus-daemon started from the
+session) and `false` turns it back off. That log names every key you press, so switch it off
+when you are done; keys typed into password and PIN fields are never written to it. Like every
 setting, it takes effect within about a second — `config.toml` is hot-reloaded, no restart.
 Wine/Proton games reach IBus through the XIM bridge and report themselves as `xim`, so
 `passthrough_xim = true` is the switch for those; it also turns Puntu off in ordinary
@@ -172,7 +198,9 @@ X11/XWayland apps, which is the trade-off.
 > dependable alternative. Override any binding in `config.toml` under `[ibus_hotkeys]`.
 > A tap only counts when the whole press→release fits in `tap_max_hold_ms` (default 500 ms), so
 > held shortcuts like Ctrl+click can't accidentally toggle the mode. When a selection conversion
-> does nothing, a hint near the caret says why (no selection / nothing to fix).
+> does nothing, a hint near the caret says why (no selection / nothing to fix). Converting back
+> works too: select the result and tap again. What is refused is only the *residue* — a tap
+> with nothing newly selected while PRIMARY still holds the text you already replaced.
 
 ### Teaching the dictionary
 
@@ -180,10 +208,19 @@ Three ways to add words, each can be turned off:
 
 1. **Repeat-conversion offer** — when you manually convert the *same* word for the third
    time (forward flip via `Ctrl+` `` ` `` or a single-word selection conversion), a dialog
-   offers to remember it; from then on its wrong-layout form converts automatically.
-   Configure with `puntu config set suggest_after <n>` (`0` disables).
+   makes an offer. For a word the dictionaries don't know: *remember it*, so its wrong-layout
+   form converts automatically from then on. For a word they already know but the detector
+   keeps declining (`vs` reads as English, so `vs` → `мы` never fires; or the typed form
+   landed on the never-correct list after an earlier undo): *always convert this typed form*
+   (the force list). Configure with `puntu config set suggest_after <n>` (`0` disables).
 2. **`Ctrl+Alt+D`** — remember the selected word (or the last typed one) right away. A hint
-   near the caret confirms it. Rebind via `puntu config set remember_key '...'`.
+   near the caret confirms it. Rebind via `puntu config set remember_key '...'`. The word is
+   taken from the selection the app reports, else from the word just typed, and only then from
+   the mouse selection buffer. If what you selected is a *wrong-layout form* of a known word
+   (`ghbdtn` for «привет»), it is not remembered as a word — that would stop it converting;
+   instead it goes on the always-convert list. Single letters are never remembered: the
+   engine also stopped adding them to the never-correct list when you undo `b` → «и», because
+   one such entry silently killed the one-letter word for good.
 3. **Dictionary window** — `puntu dict ui`: a list of «привет / ghbdtn» pairs across all
    your lists, with add and remove buttons (zenity).
 
@@ -231,7 +268,7 @@ wherever rewriting is: in terminals and under `dry_run`.
 tabs. *Настройки* — on/off switches for auto-correction, taps and each learning mechanism,
 hotkey bindings assigned by **pressing the keys**, thresholds. *Словарь* — your word pairs
 («привет / ghbdtn») with search, add and remove. Dictionary edits reach the running engine
-within a second; settings changes offer an engine restart button. (`puntu settings` and
+within a second, and so do settings — nothing needs restarting. (`puntu settings` and
 `puntu dict ui` remain as zenity-based CLI fallbacks.)
 
 ### Dictionaries (via the `puntu` CLI)
@@ -273,6 +310,17 @@ cargo run --no-default-features -- dict add превед   # never correct this 
 ```sh
 cargo test --no-default-features --lib     # pure-core unit tests (layout, buffer, detector)
 cargo test --no-default-features --features ibus   # also build the IBus engine
+```
+
+The key-event handler itself needs a D-Bus connection to emit on, so it has a harness of its
+own. It runs the engine against a **private** `dbus-daemon` (your session's IBus is never
+touched) while a script plays ibus-daemon and a text field, and compares what would be on
+screen with what should be:
+
+```sh
+cargo build --no-default-features --features ibus
+tests/e2e/run.sh                 # needs dbus-daemon and python3-gi
+tests/e2e/run.sh "$(command -v puntu-ibus)"   # the same checks against the installed build
 ```
 
 ## Implementation notes

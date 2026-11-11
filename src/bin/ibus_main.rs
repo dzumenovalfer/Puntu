@@ -376,7 +376,9 @@ fn print_help() {
     println!();
     println!("ENV:");
     println!("    PUNTU_FALLBACK_ENGINE   Engine to switch to on `disable` (default xkb:us::eng)");
-    println!("    PUNTU_LOG               Tracing filter (e.g. `puntu=debug`)");
+    println!("    PUNTU_LOG               Tracing filter (e.g. `puntu=debug`); overrides the");
+    println!("                            config's `debug_log`, which needs no restart:");
+    println!("                            puntu config set debug_log true");
     println!();
     println!("LOG:");
     match log_path() {
@@ -403,20 +405,51 @@ fn log_path() -> Option<std::path::PathBuf> {
     Some(state.join("engine.log"))
 }
 
+/// Create (or truncate) the log file readable by its owner only. With `debug_log` on it
+/// records every key and every word typed, which is nobody else's to read — and it used to
+/// be created with the default mode, world-readable under a permissive umask.
+fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode` only applies when the file is created; tighten one left by an older version.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
 fn init_logging() {
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let from_env = std::env::var_os("PUNTU_LOG").is_some();
     let filter = EnvFilter::try_from_env("PUNTU_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    // The filter sits behind a reload handle so `debug_log` in config.toml can switch it on
+    // the running engine. `PUNTU_LOG` used to be the only way, and on GNOME it is no way at
+    // all: ibus-daemon is a child of gnome-shell and `ibus restart` re-execs it with the
+    // session's environment, so a variable set in a terminal never reaches the engine.
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
     // ibus-daemon swallows the engine's stderr, so diagnosing anything used to require a
     // wrapper script. Log to a file instead (truncated on every start — one session's worth):
     // it is the first thing to look at when something misbehaves.
-    match log_path().and_then(|p| std::fs::File::create(p).ok()) {
-        Some(file) => {
-            fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(file))
-                .init();
-        }
-        None => fmt().with_env_filter(filter).with_target(false).init(),
+    let writer = match log_path().and_then(|p| create_private(&p).ok()) {
+        Some(file) => BoxMakeWriter::new(std::sync::Mutex::new(file)),
+        None => BoxMakeWriter::new(std::io::stderr),
+    };
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_target(false).with_ansi(false).with_writer(writer))
+        .init();
+    if !from_env {
+        puntu::ibus::runtime::set_log_reload(move |debug| {
+            let filter = EnvFilter::new(if debug { "puntu=debug" } else { "info" });
+            if let Err(e) = handle.reload(filter) {
+                eprintln!("could not switch the log level: {e}");
+            }
+        });
     }
 }

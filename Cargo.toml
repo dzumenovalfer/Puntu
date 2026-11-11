@@ -120,4 +120,11 @@ codegen-units = 16
 #   * `FocusInId`/`FocusOutId` (+ `FocusId` = true) → `focus_in_id`/`focus_out_id`: the client's
 #     name, which is how a game (SDL) is told apart from a text field.
 # Drop each when upstream exposes it.
+#
+# And two that are not additions but fixes — carry them over when re-vendoring, both have
+# cost real bugs (see "Аудит всего проекта" in PLAN.md):
+#   * `spawn = false` on the engine interface: calls are handled in the order they arrive.
+#     Pinned by the test `engine_calls_are_handled_in_the_order_they_arrive`.
+#   * `ContentType` is write-only (no getter), as in IBus itself; the setter passes the D-Bus
+#     serial of the write on to `set_content_type`.
 librush = { path = "vendor/librush" }

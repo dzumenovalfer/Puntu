@@ -106,11 +106,12 @@ enum ModeTarget {
 enum ConfigOp {
     /// Print the current effective config as TOML.
     Show,
-    /// Set a boolean flag and persist it. Known keys: `dry_run`, `paste_convert`.
+    /// Set a config value and persist it; the running engine applies it within a second.
+    /// An unknown key prints the list of keys that can be set.
     Set {
-        /// Flag name (e.g. `paste_convert`).
+        /// Key name (e.g. `debug_log`, `hold_commit_ms`, `undo_key`).
         key: String,
-        /// New value: true/false/on/off/1/0.
+        /// New value: true/false/on/off/1/0 for switches, a number, or a key binding.
         value: String,
     },
 }
@@ -191,13 +192,15 @@ enum DictOp {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = load_config(cli.config.as_deref())?;
+    // Loaded by the commands that use it, not up front: a config.toml with a typo in it must
+    // not take `puntu dict …` and `puntu mode …` down with it — they never look at it.
+    let cfg = || load_config(cli.config.as_deref());
 
     match cli.cmd.unwrap_or(Cmd::Run { dry_run: false, device: None }) {
         Cmd::Run { dry_run, device } => {
-            run_daemon(cfg, dry_run, device, cli.config.clone())
+            run_daemon(cfg()?, dry_run, device, cli.config.clone())
         }
-        Cmd::Stdin => run_stdin(cfg),
+        Cmd::Stdin => run_stdin(cfg()?),
         Cmd::Dict { op } => run_dict(op),
         Cmd::Config { op } => run_config(op, cli.config.as_deref()),
         Cmd::Settings => run_settings_ui(cli.config.as_deref()),
@@ -206,7 +209,7 @@ fn main() -> Result<()> {
         Cmd::Status => send("status"),
         Cmd::TestPaste => test_paste(),
         Cmd::TestCorrect => test_correct(),
-        Cmd::TestType { text } => test_type(cfg, text),
+        Cmd::TestType { text } => test_type(cfg()?, text),
         Cmd::TestSwitch => test_switch(),
         Cmd::BuildDict { input, output } => build_dict(input, output),
         Cmd::Mode { target } => run_mode(target),
@@ -361,7 +364,11 @@ fn build_dict(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
     std::fs::write(&out, &bytes)?;
-    eprintln!("Wrote {} ({:.1} MB). Restart the daemon to use it.", out.display(), bytes.len() as f64 / 1e6);
+    eprintln!(
+        "Wrote {} ({:.1} MB). A running engine picks it up within a second.",
+        out.display(),
+        bytes.len() as f64 / 1e6
+    );
     Ok(())
 }
 
@@ -693,7 +700,8 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
         ConfigOp::Set { key, value } => {
             let mut cfg = load_config(path)?;
             // Boolean flags — value parsed as on/off/true/false/1/0.
-            let bool_keys = ["dry_run", "paste_convert", "enable_modifier_taps", "fix_case"];
+            let bool_keys =
+                ["dry_run", "paste_convert", "enable_modifier_taps", "fix_case", "debug_log"];
             // Numeric flags — durations in ms and counts.
             let number_keys = ["tap_max_hold_ms", "hold_commit_ms", "suggest_after"];
             // String flags — IBus hotkey names. `undo_key` / `mode_toggle_key` / `case_key` /
@@ -714,6 +722,7 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
                 "paste_convert" => { cfg.paste_convert = parse_bool(&value)?; format!("{}", cfg.paste_convert) }
                 "enable_modifier_taps" => { cfg.enable_modifier_taps = parse_bool(&value)?; format!("{}", cfg.enable_modifier_taps) }
                 "fix_case" => { cfg.fix_case = parse_bool(&value)?; format!("{}", cfg.fix_case) }
+                "debug_log" => { cfg.debug_log = parse_bool(&value)?; format!("{}", cfg.debug_log) }
                 "tap_max_hold_ms" => {
                     cfg.tap_max_hold_ms = value.trim().parse().context("expected milliseconds (e.g. 500)")?;
                     format!("{}", cfg.tap_max_hold_ms)
@@ -730,13 +739,13 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
                         value.trim().parse().context("expected a count (e.g. 3; 0 disables)")?;
                     format!("{}", cfg.learning.suggest_after)
                 }
-                "remember_key" => { cfg.ibus_hotkeys.remember_key = value.clone(); value.clone() }
-                "mode_toggle_key" => { cfg.ibus_hotkeys.mode_toggle_key = value.clone(); value.clone() }
-                "case_key" => { cfg.ibus_hotkeys.case_key = value.clone(); value.clone() }
-                "undo_key" => { cfg.ibus_hotkeys.undo_key = value.clone(); value.clone() }
-                "mode_toggle" => { cfg.ibus_hotkeys.mode_toggle = value.clone(); value.clone() }
-                "convert_last" => { cfg.ibus_hotkeys.convert_last = value.clone(); value.clone() }
-                "convert_selection_key" => { cfg.ibus_hotkeys.convert_selection_key = value.clone(); value.clone() }
+                "remember_key" => { check_hotkey(&value)?; cfg.ibus_hotkeys.remember_key = value.clone(); value.clone() }
+                "mode_toggle_key" => { check_hotkey(&value)?; cfg.ibus_hotkeys.mode_toggle_key = value.clone(); value.clone() }
+                "case_key" => { check_hotkey(&value)?; cfg.ibus_hotkeys.case_key = value.clone(); value.clone() }
+                "undo_key" => { check_hotkey(&value)?; cfg.ibus_hotkeys.undo_key = value.clone(); value.clone() }
+                "mode_toggle" => { check_tap(&value)?; cfg.ibus_hotkeys.mode_toggle = value.clone(); value.clone() }
+                "convert_last" => { check_tap(&value)?; cfg.ibus_hotkeys.convert_last = value.clone(); value.clone() }
+                "convert_selection_key" => { check_hotkey(&value)?; cfg.ibus_hotkeys.convert_selection_key = value.clone(); value.clone() }
                 other => anyhow::bail!(
                     "unknown config key {other:?}\n\
                      boolean keys: {bool_keys:?}\n\
@@ -751,11 +760,39 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
             };
             cfg.save_to(&cfg_path)?;
             println!(
-                "set {key} = {display} in {} (restart puntu-ibus or run `puntu mode ibus` to apply)",
+                "set {key} = {display} in {} (the running engine applies it within a second)",
                 cfg_path.display()
             );
         }
     }
+    Ok(())
+}
+
+/// Refuse a modifier-tap binding the engine would not understand. An unparseable value is not
+/// an error there — it silently disables the gesture — so the typo has to be caught here.
+fn check_tap(v: &str) -> Result<()> {
+    let t = v.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") || config::parse_tap_combo(t).is_some() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{v:?} is not a modifier tap. Use a combination of Ctrl, Shift, Alt, Super joined \
+         with `+` (Ctrl, Ctrl+Shift, Alt+Shift …) or `none`. A bare Shift is not accepted: \
+         it is what an aborted capital letter looks like."
+    )
+}
+
+/// Same for a key binding (`Ctrl+grave`, `F12`, `Ctrl+Alt+d`, `none`). Only a build that
+/// contains the engine knows its key names; the others take the value as given.
+fn check_hotkey(v: &str) -> Result<()> {
+    #[cfg(feature = "ibus")]
+    if !puntu::ibus::is_valid_hotkey(v) {
+        anyhow::bail!(
+            "{v:?} is not a key binding the engine understands. Examples: Ctrl+grave, F12, \
+             Pause, Ctrl+Alt+d, Super+space — or `none` to disable."
+        );
+    }
+    let _ = v;
     Ok(())
 }
 
@@ -895,8 +932,8 @@ fn run_dict(op: DictOp) -> Result<()> {
 /// The zenity-based settings window (`puntu settings`): parameters with their current
 /// values; pick one to toggle or edit it. Booleans flip in place, everything else opens an
 /// entry dialog pre-filled with the current value. Writes go through the same
-/// `Config::save_to` as the CLI; since the engine reads the config at startup, a restart is
-/// offered when anything changed.
+/// `Config::save_to` as the CLI, and the running engine applies them within a second — there
+/// is nothing to restart.
 fn run_settings_ui(path: Option<&std::path::Path>) -> Result<()> {
     use std::process::Command;
 
@@ -905,7 +942,6 @@ fn run_settings_ui(path: Option<&std::path::Path>) -> Result<()> {
     }
     let cfg_path = path.map(|p| p.to_path_buf()).unwrap_or_else(Config::path);
     let onoff = |b: bool| if b { "вкл".to_string() } else { "выкл".to_string() };
-    let mut changed = false;
 
     loop {
         let mut cfg = load_config(path)?;
@@ -917,7 +953,7 @@ fn run_settings_ui(path: Option<&std::path::Path>) -> Result<()> {
             ("enable_modifier_taps", "Тапы модификаторов", onoff(cfg.enable_modifier_taps),
              "тап Ctrl = смена режима; тап Ctrl+Shift = перевод выделения"),
             ("mode_toggle", "Тап смены режима EN↔RU", cfg.ibus_hotkeys.mode_toggle.clone(),
-             "Ctrl, Shift, Ctrl+Shift или none"),
+             "Ctrl, Alt+Shift, Ctrl+Shift или none"),
             ("convert_last", "Тап перевода выделения", cfg.ibus_hotkeys.convert_last.clone(),
              "Ctrl+Shift, Ctrl или none"),
             ("undo_key", "Флип последнего слова", cfg.ibus_hotkeys.undo_key.clone(),
@@ -927,7 +963,7 @@ fn run_settings_ui(path: Option<&std::path::Path>) -> Result<()> {
              "надёжная альтернатива тапу"),
             ("remember_key", "Запомнить слово (клавиша)", cfg.ibus_hotkeys.remember_key.clone(),
              "запоминает выделенное/последнее слово; none = выключить"),
-            ("suggest_after", "Предлагать запомнить после N переводов",
+            ("suggest_after", "Предлагать запомнить / всегда переводить после N переводов",
              cfg.learning.suggest_after.to_string(),
              "окно-вопрос после N ручных переводов слова; 0 = не предлагать"),
             ("tap_max_hold_ms", "Макс. длительность тапа, мс", cfg.tap_max_hold_ms.to_string(),
@@ -995,23 +1031,43 @@ fn run_settings_ui(path: Option<&std::path::Path>) -> Result<()> {
                 cfg.enable_modifier_taps = !cfg.enable_modifier_taps;
             }
             "mode_toggle" => {
-                let Some(v) = ask("Тап смены режима (Ctrl, Shift, Ctrl+Shift, none):", &cfg.ibus_hotkeys.mode_toggle) else { continue };
+                let Some(v) = ask("Тап смены режима (Ctrl, Alt+Shift, Ctrl+Shift, none):", &cfg.ibus_hotkeys.mode_toggle) else { continue };
+                if let Err(e) = check_tap(&v) {
+                    complain(&e.to_string());
+                    continue;
+                }
                 cfg.ibus_hotkeys.mode_toggle = v;
             }
             "convert_last" => {
                 let Some(v) = ask("Тап перевода выделения (Ctrl+Shift, Ctrl, none):", &cfg.ibus_hotkeys.convert_last) else { continue };
+                if let Err(e) = check_tap(&v) {
+                    complain(&e.to_string());
+                    continue;
+                }
                 cfg.ibus_hotkeys.convert_last = v;
             }
             "undo_key" => {
                 let Some(v) = ask("Клавиша флипа последнего слова:", &cfg.ibus_hotkeys.undo_key) else { continue };
+                if let Err(e) = check_hotkey(&v) {
+                    complain(&e.to_string());
+                    continue;
+                }
                 cfg.ibus_hotkeys.undo_key = v;
             }
             "convert_selection_key" => {
                 let Some(v) = ask("Клавиша перевода выделения:", &cfg.ibus_hotkeys.convert_selection_key) else { continue };
+                if let Err(e) = check_hotkey(&v) {
+                    complain(&e.to_string());
+                    continue;
+                }
                 cfg.ibus_hotkeys.convert_selection_key = v;
             }
             "remember_key" => {
                 let Some(v) = ask("Клавиша «запомнить слово» (none = выключить):", &cfg.ibus_hotkeys.remember_key) else { continue };
+                if let Err(e) = check_hotkey(&v) {
+                    complain(&e.to_string());
+                    continue;
+                }
                 cfg.ibus_hotkeys.remember_key = v;
             }
             "suggest_after" => {
@@ -1044,27 +1100,12 @@ fn run_settings_ui(path: Option<&std::path::Path>) -> Result<()> {
             _ => continue,
         }
         cfg.save_to(&cfg_path)?;
-        changed = true;
     }
 
-    if changed {
-        let apply = Command::new("zenity")
-            .args([
-                "--question",
-                "--title=Настройки Puntu",
-                "--text=Настройки сохранены. Перезапустить движок, чтобы применить?",
-                "--ok-label=Перезапустить",
-                "--cancel-label=Позже",
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if apply {
-            let _ = Command::new("ibus").arg("restart").status();
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let _ = Command::new("ibus").args(["engine", "puntu"]).status();
-        }
-    }
+    // Nothing to apply: every save above already reached the running engine, which watches
+    // config.toml. This used to offer an `ibus restart` — which drops the engine out of every
+    // window for a couple of seconds and loses the word held in the preedit — for a change
+    // that had taken effect before the dialog even appeared.
     Ok(())
 }
 

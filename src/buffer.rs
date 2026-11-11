@@ -42,12 +42,19 @@ impl CompletedWord {
 #[derive(Debug, Default)]
 pub struct WordBuffer {
     keys: Vec<(u16, bool)>,
+    /// The shift level to read each key at in the *other* layout — parallel to `keys`, and
+    /// equal to its `bool` except under CapsLock (see [`KeyEvent::Letter`]).
+    alt_shifts: Vec<bool>,
     trusted: bool,
 }
 
 impl WordBuffer {
     pub fn new() -> Self {
-        WordBuffer { keys: Vec::with_capacity(32), trusted: true }
+        WordBuffer {
+            keys: Vec::with_capacity(32),
+            alt_shifts: Vec::with_capacity(32),
+            trusted: true,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -62,23 +69,32 @@ impl WordBuffer {
     /// changes, inactivity timeouts, and any editing/navigation key.
     pub fn invalidate(&mut self) {
         self.keys.clear();
+        self.alt_shifts.clear();
         self.trusted = false;
     }
 
     /// Feed one classified key. Separators are handled by the caller (which calls [`finish`]).
     pub fn push(&mut self, ev: KeyEvent) {
         match ev {
-            KeyEvent::Letter { code, shift, .. } => {
+            KeyEvent::Letter { code, shift, alt_shift, .. } => {
                 // A new word (first letter on an empty buffer) starts trusted: it's typed
                 // contiguously, so the chars before the cursor are exactly this word.
+                //
+                // "Exactly this word" is an assumption about what sits BEFORE the first
+                // letter, and the buffer cannot check it — it only sees keys. A front-end
+                // that knows better (the caret is right after a letter: the user backspaced
+                // into a word and is retyping its ending) must mark the finished word
+                // untrusted itself; the IBus engine does, see `PuntuEngine::suspect`.
                 if self.keys.is_empty() {
                     self.trusted = true;
                 }
                 self.keys.push((code, shift));
+                self.alt_shifts.push(alt_shift);
             }
             KeyEvent::Backspace => {
                 // Deleting from the tail keeps the cursor at the word end → still trusted.
                 self.keys.pop();
+                self.alt_shifts.pop();
             }
             KeyEvent::Invalidate => self.invalidate(),
             KeyEvent::Separator | KeyEvent::Ignore => {}
@@ -93,9 +109,10 @@ impl WordBuffer {
             return None;
         }
         let keys = std::mem::take(&mut self.keys);
+        let alt_shifts = std::mem::take(&mut self.alt_shifts);
         let trusted = self.trusted;
         self.trusted = true;
-        Some(build_word(&keys, lang, trusted))
+        Some(build_word_with(&keys, &alt_shifts, lang, trusted))
     }
 
     /// A read-only snapshot of the current (unfinished) word in `lang`, for a manual-convert
@@ -104,13 +121,31 @@ impl WordBuffer {
         if self.keys.is_empty() {
             return None;
         }
-        Some(build_word(&self.keys, lang, self.trusted))
+        Some(build_word_with(&self.keys, &self.alt_shifts, lang, self.trusted))
     }
 }
 
 fn build_word(keys: &[(u16, bool)], lang: Lang, trusted: bool) -> CompletedWord {
     let cur = render(keys, lang);
     let alt = render(keys, lang.other());
+    CompletedWord { keys: keys.to_vec(), cur, alt, lang, trusted }
+}
+
+/// [`build_word`] for keys whose other-layout reading has its own shift levels (`alt_shifts`,
+/// parallel to `keys`). `CompletedWord::keys` keeps the current-layout levels: that is what
+/// the uinput daemon replays, and what `cur` is rendered from.
+fn build_word_with(
+    keys: &[(u16, bool)],
+    alt_shifts: &[bool],
+    lang: Lang,
+    trusted: bool,
+) -> CompletedWord {
+    let cur = render(keys, lang);
+    let alt: String = keys
+        .iter()
+        .zip(alt_shifts)
+        .filter_map(|(&(code, _), &shift)| char_for(code, shift, lang.other()))
+        .collect();
     CompletedWord { keys: keys.to_vec(), cur, alt, lang, trusted }
 }
 
@@ -171,6 +206,27 @@ mod tests {
         type_keys(&mut buf, &[32, 20]); // fresh contiguous word
         let w = buf.finish(Lang::En).unwrap();
         assert!(w.trusted, "a fresh word after a cursor move is trusted");
+    }
+
+    #[test]
+    fn other_layout_reading_can_sit_at_its_own_shift_level() {
+        // CapsLock + the `;` key: `;` in US-QWERTY (punctuation ignores CapsLock), `Ж` in
+        // ЙЦУКЕН. One key press, two levels — the buffer has to keep both.
+        let mut buf = WordBuffer::new();
+        buf.push(KeyEvent::Letter { code: 32, shift: true, alt_shift: true, cur: 'D', alt: 'В' });
+        buf.push(KeyEvent::Letter { code: 33, shift: true, alt_shift: true, cur: 'F', alt: 'А' });
+        buf.push(KeyEvent::Letter { code: 39, shift: false, alt_shift: true, cur: ';', alt: 'Ж' });
+        let snap = buf.snapshot(Lang::En).unwrap();
+        assert_eq!((snap.cur.as_str(), snap.alt.as_str()), ("DF;", "ВАЖ"));
+        // Backspace drops the key from both readings together.
+        buf.push(KeyEvent::Backspace);
+        buf.push(KeyEvent::Letter { code: 39, shift: true, alt_shift: false, cur: ':', alt: 'ж' });
+        let w = buf.finish(Lang::En).unwrap();
+        assert_eq!((w.cur.as_str(), w.alt.as_str()), ("DF:", "ВАж"));
+        // …and nothing is left behind for the next word.
+        buf.push(KeyEvent::Letter { code: 34, shift: false, alt_shift: false, cur: 'g', alt: 'п' });
+        let w = buf.finish(Lang::En).unwrap();
+        assert_eq!((w.cur.as_str(), w.alt.as_str()), ("g", "п"));
     }
 
     #[test]

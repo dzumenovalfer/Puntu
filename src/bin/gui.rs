@@ -26,6 +26,10 @@ fn is_paused() -> bool {
 
 fn set_paused(p: bool) {
     if p {
+        // The marker lives in the config directory, which need not exist yet on an install
+        // where nothing has been configured or taught — and then the write failed silently
+        // and the pause switch did nothing.
+        let _ = std::fs::create_dir_all(puntu::config::config_dir());
         let _ = std::fs::write(paused_path(), b"paused by tray\n");
     } else {
         let _ = std::fs::remove_file(paused_path());

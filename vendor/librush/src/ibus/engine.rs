@@ -152,7 +152,20 @@ pub trait IBusEngine: Send + Sync {
     ///
     /// `purpose` matches `IBusInputPurpose` (`GtkInputPurpose`): 8 = PASSWORD, 9 = PIN,
     /// 10 = TERMINAL (what VTE-based terminals set). `hints` matches `IBusInputHints`.
-    fn set_content_type(&mut self, _purpose: u32, _hints: u32) -> fdo::Result<()> {
+    ///
+    /// `serial` is the D-Bus serial of the `Properties.Set` call that carried the value, when
+    /// there is one. It is the only way to order two of these calls: unlike every method of
+    /// the engine interface (handled strictly in arrival order, see `spawn = false` on the
+    /// interface below), a property write goes through zbus's built-in `Properties` interface,
+    /// which runs each call in a task of its own. Two writes sent back to back — a password
+    /// prompt closing is `(PASSWORD, …)` immediately followed by `(FREE_FORM, …)` — can
+    /// therefore arrive swapped, and the engine must let the **later-sent** one win.
+    fn set_content_type(
+        &mut self,
+        _purpose: u32,
+        _hints: u32,
+        _serial: Option<u32>,
+    ) -> fdo::Result<()> {
         Ok(())
     }
 
@@ -419,7 +432,21 @@ pub(crate) struct Engine<T: IBusEngine + 'static> {
 //     <property name='ActiveSurroundingText' type='(b)' access='read' />
 //   </interface>
 // </node>
-#[interface(name = "org.freedesktop.IBus.Engine")]
+//
+// `spawn = false`: handle every call in the order it was received.
+//
+// zbus's default is one task per incoming call, and the tasks then race for the interface
+// lock — its own docs warn that this "can lead to methods being handled out of their received
+// order". For an input method the order IS the protocol. ibus-daemon sends `FocusOutId(old)`,
+// `FocusInId(new)`, `SetCapabilities`, … back to back without waiting for replies, and they
+// were regularly processed swapped: the late `FocusOut` then wiped the name and capabilities
+// of the field that had just been focused (`client=""` in the engine log), and two keys
+// landing in one batch could be handled in reverse. With `false` the object server awaits each
+// handler before reading the next message.
+//
+// The documented caveat — don't make D-Bus *method calls* from a handler — does not bite: the
+// engine only ever emits signals.
+#[interface(name = "org.freedesktop.IBus.Engine", spawn = false)]
 impl<T: IBusEngine + 'static> Engine<T> {
     async fn process_key_event(
         &mut self,
@@ -673,15 +700,25 @@ impl<T: IBusEngine + 'static> Engine<T> {
     #[zbus(signal)]
     async fn panel_extension(se: &SignalEmitter<'_>, data: Value<'_>) -> zbus::Result<()>;
 
+    /// `ContentType` is **write-only**, exactly as in IBus's own engine interface
+    /// (`access='write'` in the XML above) — there is deliberately no getter.
+    ///
+    /// Upstream had one that always answered `(0, 0)`. That looked harmless and was not:
+    /// zbus follows every property write with a `PropertiesChanged` signal carrying the
+    /// getter's value, and ibus-daemon keeps a cache of this property so that it only sends
+    /// a content type that *differs* from the last one. The bogus signal reset that cache to
+    /// `(0, 0)` after every write, so the daemon never again told the engine "back to
+    /// `(0, 0)`" — the engine stayed in terminal / password mode in every app that followed.
+    /// A write-only property emits no signal, which leaves the daemon's cache holding what it
+    /// actually sent: the reference behaviour it was written against.
     #[zbus(property)]
-    fn content_type(&self) -> (u32, u32) {
-        // TODO
-        (0, 0)
-    }
-
-    #[zbus(property)]
-    fn set_content_type(&mut self, t: (u32, u32)) -> fdo::Result<()> {
-        self.e.set_content_type(t.0, t.1)
+    fn set_content_type(
+        &mut self,
+        t: (u32, u32),
+        #[zbus(header)] header: Option<zbus::message::Header<'_>>,
+    ) -> fdo::Result<()> {
+        let serial = header.as_ref().map(|h| h.primary().serial_num().get());
+        self.e.set_content_type(t.0, t.1, serial)
     }
 
     /// `true` makes IBus deliver `FocusInId`/`FocusOutId` — which carry the input context's
@@ -698,6 +735,21 @@ impl<T: IBusEngine + 'static> Engine<T> {
     fn active_surrounding_text(&self) -> bool {
         true
     }
+}
+
+/// Does the D-Bus object wrapping `engine` handle its calls strictly in the order they were
+/// received? It must — see `spawn = false` on the interface above. Exposed so the crate that
+/// vendors this one can pin that contract in a test: the attribute is one word, and losing it
+/// (say, when re-applying these patches to a newer upstream) brings back bugs that only show
+/// up as a rare, unreproducible "the engine forgot which app it was in".
+#[doc(hidden)]
+pub fn engine_handles_calls_in_order<T: IBusEngine + 'static>(engine: T) -> bool {
+    use zbus::object_server::Interface;
+    let object = Engine {
+        e: engine,
+        _op: String::new(),
+    };
+    !object.spawn_tasks_for_methods()
 }
 
 impl<T: IBusEngine + 'static> Engine<T> {

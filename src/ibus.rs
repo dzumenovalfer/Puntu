@@ -25,3 +25,13 @@ mod engine;
 pub mod runtime;
 
 pub use runtime::run;
+
+/// Would the engine accept `binding` as a hotkey (`Ctrl+grave`, `F12`, `Ctrl+Alt+d`)?
+/// `"none"` and the empty string are valid too — they mean "disabled".
+///
+/// For front-ends that write the config: a binding the engine cannot parse does not produce
+/// an error anywhere, it just turns the hotkey off, so it has to be refused at the door.
+pub fn is_valid_hotkey(binding: &str) -> bool {
+    let b = binding.trim();
+    b.is_empty() || b.eq_ignore_ascii_case("none") || engine::parse_hotkey(b).is_some()
+}

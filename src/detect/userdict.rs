@@ -91,6 +91,8 @@ const BUILTIN_RECOGNIZED_EN: &[&str] = &[
     "vps", "dns", "tcp", "udp", "ssl", "tls", "ftp", "smtp", "http", "https", "ssh", "url",
     "ram", "cpu", "gpu", "ssd", "hdd", "usb", "pdf", "png", "jpg", "jpeg", "svg", "gif", "exe",
     "dll", "env", "auth", "admin", "url", "src", "img", "btn", "nav", "config", "cfg", "len",
+    // Their Russian readings («азы», «тас») are in the big dictionary, so they converted.
+    "fps", "nfc",
 ];
 
 impl UserDict {
@@ -194,7 +196,10 @@ impl UserDict {
     fn load_lang(&self, lang: Lang) -> Result<LangLists> {
         Ok(LangLists {
             manual: read_list(&self.dir.join(ListKind::Manual.file_name(lang)))?,
-            learned: read_list(&self.dir.join(ListKind::Learned.file_name(lang)))?,
+            learned: without_single_letters(
+                read_list(&self.dir.join(ListKind::Learned.file_name(lang)))?,
+                lang,
+            ),
             force: read_list(&self.dir.join(ListKind::Force.file_name(lang)))?,
             recognized: read_list(&self.dir.join(ListKind::Recognized.file_name(lang)))?,
         })
@@ -232,7 +237,10 @@ impl UserDict {
     ///   (exceptions are checked before recognized words in `Detector::decide`);
     /// * adding an exception (flip-back auto-learning) removes the counterpart from the
     ///   recognized list, so the dictionary doesn't show both «переводить» and
-    ///   «не исправлять» rows for one pair.
+    ///   «не исправлять» rows for one pair — and removes the same word from the force list,
+    ///   which `decide` consults *first* and would otherwise override the new exception;
+    /// * forcing a word (the repeat-conversion offer) removes it from the exception lists for
+    ///   the same reason in reverse: the two lists contradict each other by definition.
     pub fn add(&mut self, word: &str, lang: Lang, kind: ListKind) -> Result<()> {
         let w = word.to_lowercase();
         match kind {
@@ -243,8 +251,12 @@ impl UserDict {
             ListKind::Manual | ListKind::Learned => {
                 let counterpart = crate::detect::translit::convert(&w, lang, lang.other());
                 self.drop_from(&counterpart, lang.other(), &[ListKind::Recognized])?;
+                self.drop_from(&w, lang, &[ListKind::Force])?;
             }
-            _ => {}
+            ListKind::Force => {
+                self.drop_from(&w, lang, &[ListKind::Manual, ListKind::Learned])?;
+            }
+            ListKind::Command => {}
         }
         let is_new = match (kind, lang) {
             (ListKind::Command, _) => self.commands.insert(w.clone()),
@@ -286,10 +298,17 @@ impl UserDict {
             for kind in
                 [ListKind::Manual, ListKind::Learned, ListKind::Force, ListKind::Recognized]
             {
+                let path = self.dir.join(kind.file_name(lang));
+                // A single-letter entry of a learned list is ignored on load (see
+                // `without_single_letters`), so it is not in memory to be removed — but it is
+                // still in the file, and "remove this word" has to mean the file too. The
+                // engine's own log tells the user to run exactly this command, and it did
+                // nothing: the entry, and the log line about it, came back on every start.
+                let only_on_disk = kind == ListKind::Learned && on_disk(&path, &w);
                 let set = self.set_mut(lang, kind);
-                if set.remove(&w) {
+                if set.remove(&w) || only_on_disk {
                     let snapshot = persistable(set, lang, kind);
-                    write_list(&self.dir.join(kind.file_name(lang)), &snapshot)?;
+                    write_list(&path, &snapshot)?;
                 }
             }
         }
@@ -308,10 +327,13 @@ impl UserDict {
     /// Remove a single learned word for `lang` (the `dict forget` command).
     pub fn forget(&mut self, word: &str, lang: Lang) -> Result<()> {
         let w = word.to_lowercase();
+        let path = self.dir.join(ListKind::Learned.file_name(lang));
+        // Same as in `remove`: an entry ignored on load is still in the file.
+        let only_on_disk = on_disk(&path, &w);
         let set = self.set_mut(lang, ListKind::Learned);
-        if set.remove(&w) {
+        if set.remove(&w) || only_on_disk {
             let snapshot: Vec<String> = set.iter().cloned().collect();
-            write_list(&self.dir.join(ListKind::Learned.file_name(lang)), &snapshot)?;
+            write_list(&path, &snapshot)?;
         }
         Ok(())
     }
@@ -599,6 +621,31 @@ fn read_replacements(path: &Path) -> Result<HashMap<String, String>> {
     Ok(parse_replacements(&text))
 }
 
+/// Drop single-letter entries from a *learned* list. The engine used to add one whenever an
+/// auto-converted letter was flipped back (`b` → «и» → undo), and such an entry silently kills
+/// a one-letter word for good — «и», «у», «а» never converted again for a user whose list held
+/// `b`, `e`, `f`. The engine no longer writes them; entries from before are ignored on load
+/// (and vanish from the file the next time it is rewritten). `manual` lists are the user's own
+/// words and are honoured as written.
+fn without_single_letters(list: HashSet<String>, lang: Lang) -> HashSet<String> {
+    let (keep, dropped): (HashSet<String>, HashSet<String>) =
+        list.into_iter().partition(|w| w.chars().count() >= 2);
+    if !dropped.is_empty() {
+        let mut dropped: Vec<String> = dropped.into_iter().collect();
+        dropped.sort();
+        tracing::info!(
+            "learned.{lang}.txt: ignoring single-letter entries {dropped:?} — they block \
+             one-letter words; `puntu dict rm <буква>` removes them for good"
+        );
+    }
+    keep
+}
+
+/// Is `word` a line of the list file at `path`, whatever the loader makes of it?
+fn on_disk(path: &Path, word: &str) -> bool {
+    read_list(path).is_ok_and(|list| list.contains(word))
+}
+
 fn read_list(path: &Path) -> Result<HashSet<String>> {
     if !path.exists() {
         return Ok(HashSet::new());
@@ -637,6 +684,77 @@ fn append_line(path: &Path, word: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_letter_learned_entries_are_ignored_on_load() {
+        let dir = std::env::temp_dir().join(format!("puntu-test-1char-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("learned.en.txt"), "b\ne\nvs\n").unwrap();
+        std::fs::write(dir.join("manual.en.txt"), "b\n").unwrap();
+        let d = UserDict::load(dir.clone()).unwrap();
+        // `vs` stays an exception; `b` from the learned list no longer blocks «и»…
+        assert!(d.is_exception("vs", Lang::En));
+        assert!(!d.lists(Lang::En).learned.contains("b"));
+        // …but the user's own manual entry is honoured as written.
+        assert!(d.is_exception("b", Lang::En));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_a_single_letter_cleans_the_learned_file_too() {
+        // The loader ignores `b` in learned.en.txt and the log says "`puntu dict rm b`
+        // removes it for good" — which did nothing, because `b` was not in memory to remove.
+        let dir = std::env::temp_dir().join(format!("puntu-test-rm1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("learned.en.txt"), "b\ne\nvs\n").unwrap();
+
+        let mut d = UserDict::load(dir.clone()).unwrap();
+        d.remove("b").unwrap();
+        let left = std::fs::read_to_string(dir.join("learned.en.txt")).unwrap();
+        // The rewrite drops every ignored entry, not only the one named — none of them
+        // meant anything — and keeps the real ones.
+        assert_eq!(left.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>(), vec!["vs"]);
+
+        // `dict forget` goes through the same file.
+        std::fs::write(dir.join("learned.en.txt"), "f\nvs\n").unwrap();
+        let mut d = UserDict::load(dir.clone()).unwrap();
+        d.forget("f", Lang::En).unwrap();
+        let left = std::fs::read_to_string(dir.join("learned.en.txt")).unwrap();
+        assert_eq!(left.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>(), vec!["vs"]);
+
+        // Removing a word that is nowhere must not create or touch any file.
+        d.remove("нет-такого").unwrap();
+        assert!(!dir.join("learned.ru.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn force_and_exception_lists_never_hold_the_same_word() {
+        // `decide` checks the force list before the exceptions, so a word on both would
+        // always convert no matter how recently the user asked for it to be left alone —
+        // and the dictionary window would show two contradicting rows for it.
+        let dir = std::env::temp_dir().join(format!("puntu-test-force-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut d = UserDict::empty(dir.clone());
+
+        d.add("vs", Lang::En, ListKind::Learned).unwrap();
+        assert!(d.is_exception("vs", Lang::En));
+        d.add("vs", Lang::En, ListKind::Force).unwrap();
+        assert!(d.is_force("vs", Lang::En), "the newer action wins");
+        assert!(!d.is_exception("vs", Lang::En), "…and the older one is gone");
+
+        d.add("vs", Lang::En, ListKind::Manual).unwrap();
+        assert!(d.is_exception("vs", Lang::En));
+        assert!(!d.is_force("vs", Lang::En), "an exception added later drops the force entry");
+
+        // The files agree with memory once reloaded.
+        let reloaded = UserDict::load(dir.clone()).unwrap();
+        assert!(reloaded.is_exception("vs", Lang::En));
+        assert!(!reloaded.is_force("vs", Lang::En));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Per-test directory: tests in one binary share a pid and run in parallel, so the dir
     /// must be tagged per test or one test's `remove_dir_all` races another's file writes

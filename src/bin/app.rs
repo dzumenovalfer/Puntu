@@ -302,6 +302,11 @@ struct App {
     convert_prev: (String, String), // (tap combo, key)
     undo_prev: String,
     case_prev: String,
+    /// Why config.toml could not be read at startup, if it could not. While this is set the
+    /// window shows defaults and **saves nothing**: writing them out would replace a file the
+    /// user edited by hand — one typo in it, and the first switch flipped here used to wipe
+    /// every other setting it held.
+    cfg_error: Option<String>,
 }
 
 impl App {
@@ -309,7 +314,10 @@ impl App {
         let dir = config::config_dir();
         std::fs::create_dir_all(&dir).ok();
         let dict = UserDict::load(dir.clone()).unwrap_or_else(|_| UserDict::empty(dir));
-        let cfg = Config::load().unwrap_or_default();
+        let (cfg, cfg_error) = match Config::load() {
+            Ok(cfg) => (cfg, None),
+            Err(e) => (Config::default(), Some(format!("{e:#}"))),
+        };
         let or_default = |v: &str, def: &str| {
             if v.trim().is_empty() || v.eq_ignore_ascii_case("none") {
                 def.to_string()
@@ -366,7 +374,11 @@ impl App {
             engine_rx,
             search: String::new(),
             new_word: String::new(),
-            status: String::new(),
+            status: match &cfg_error {
+                Some(e) => format!("config.toml не читается, настройки не сохраняются: {e}"),
+                None => String::new(),
+            },
+            cfg_error,
             remember_prev,
             file_rx: None,
             capture_peak: egui::Modifiers::NONE,
@@ -390,6 +402,12 @@ impl App {
     /// `ibus restart` that dropped the engine out of every window for a couple of seconds and
     /// lost the word held in preedit — is gone.
     fn save_cfg(&mut self) {
+        if let Some(e) = &self.cfg_error {
+            self.status = format!(
+                "Не сохранено: config.toml не читается ({e}). Исправьте файл и откройте окно заново."
+            );
+            return;
+        }
         match self.cfg.save_to(&Config::path()) {
             Ok(()) => self.status = "Настройки применены".to_string(),
             Err(e) => {
@@ -997,6 +1015,16 @@ impl App {
                                 save = true;
                             }
                         });
+                        ui.label(
+                            egui::RichText::new(
+                                "Считаются переводы вручную (флип Ctrl+` и перевод \
+                                 выделения). Незнакомое слово — предложит запомнить; \
+                                 знакомое, которое автозамена пропускает, — предложит \
+                                 всегда переводить.",
+                            )
+                            .weak()
+                            .size(11.0),
+                        );
                     }) {
                         cfg.learning.suggest_after = if suggest_on { 3 } else { 0 };
                         save = true;

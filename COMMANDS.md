@@ -19,8 +19,10 @@ puntu-ibus <команда>
 | `puntu-ibus` (без аргументов) | запуск как движок — это вызывает сам `ibus-daemon` через поле `<exec>` |
 
 > Переключаться на движок удобнее через **Super+Space** или значок источника ввода → «Puntu».
-> Логи движка: `PUNTU_LOG=puntu=debug ibus restart`, затем `journalctl --user -f | grep puntu`.
-> Свой файл лога: `~/.local/state/puntu/engine.log` (перезаписывается при каждом старте).
+> Логи движка: `~/.local/state/puntu/engine.log` (перезаписывается при каждом старте).
+> Подробный уровень без перезапуска: `puntu config set debug_log true` (обратно — `false`).
+> `PUNTU_LOG=puntu=debug` тоже работает, но только если переменная доходит до движка — на
+> GNOME `ibus restart` из терминала её не передаёт.
 
 > **Если Puntu «перестал печатать» или мешает игре** — начните с `puntu-ibus doctor`, затем
 > найдите в логе строку `client=…` для этого приложения и добавьте это имя в
@@ -66,7 +68,7 @@ puntu [--config <ПУТЬ>] <команда>
 | `puntu build-dict <вход> [<выход>]` | собрать большой словарь RU в FST (по умолчанию `~/.config/puntu/russian.fst`) |
 | `puntu settings` | **окно настроек** (zenity): автокоррекция, тапы, хоткеи, пороги обучения |
 | `puntu config show` | показать текущий конфиг (TOML) |
-| `puntu config set <ключ> <значение>` | изменить настройку и записать в `config.toml`: флаги (`dry_run`, `paste_convert`, `enable_modifier_taps`), числа (`tap_max_hold_ms`, `suggest_after` — 0 отключает предложение запомнить), хоткеи (`undo_key`, `convert_selection_key`, `remember_key`, `mode_toggle`, `convert_last`) |
+| `puntu config set <ключ> <значение>` | изменить настройку и записать в `config.toml`: флаги (`dry_run`, `paste_convert`, `enable_modifier_taps`), флаг `debug_log` (подробный лог движка, без перезапуска), числа (`tap_max_hold_ms`, `hold_commit_ms`, `suggest_after` — после скольких ручных переводов предлагать запомнить слово или всегда переводить набранную форму; 0 отключает), хоткеи (`undo_key`, `convert_selection_key`, `remember_key`, `mode_toggle`, `convert_last`). Привязку, которую движок не разберёт (`Ctrl+foo`, голый `Shift` как тап), команда отклоняет — раньше такая опечатка молча выключала хоткей. |
 | `puntu --version` / `puntu --help` | версия / помощь (работает и для подкоманд: `puntu dict --help`) |
 
 ### Словарь (`puntu dict …`)

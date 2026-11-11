@@ -72,6 +72,12 @@ pub struct Config {
     /// held. Raise this if you flip words late; lower it if a click still moves a word.
     /// `0` disables the timer entirely (the word waits indefinitely, as before).
     pub hold_commit_ms: u64,
+    /// Log the IBus engine at debug level (every key event, every decision) instead of info.
+    /// Hot-reloaded like everything else, so `puntu config set debug_log true` takes effect
+    /// on the running engine — unlike `PUNTU_LOG`, which never reaches an engine that
+    /// ibus-daemon (a child of gnome-shell) spawns with the session's environment. An
+    /// explicit `PUNTU_LOG` still wins when it is set.
+    pub debug_log: bool,
     pub detect: DetectConfig,
     /// Dictionary-learning behaviour (the repeat-conversion suggestion dialog etc.).
     pub learning: LearningConfig,
@@ -342,6 +348,7 @@ impl Default for Config {
             fix_case: true,
             tap_max_hold_ms: DEFAULT_TAP_MAX_HOLD_MS,
             hold_commit_ms: DEFAULT_HOLD_COMMIT_MS,
+            debug_log: false,
             detect: DetectConfig::default(),
             learning: LearningConfig::default(),
             hotkeys: Hotkeys::default(),

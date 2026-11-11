@@ -197,12 +197,20 @@ impl Mods {
 pub enum KeyEvent {
     /// A letter that extends the current word.
     ///
-    /// Only `code` and `shift` reach [`crate::buffer::WordBuffer`]; the word is re-rendered
-    /// from that pair at finish time, so **`shift` alone decides the case** and `cur`/`alt`
+    /// Only `code`, `shift` and `alt_shift` reach [`crate::buffer::WordBuffer`]; the word is
+    /// re-rendered from them at finish time, so **they alone decide the case** and `cur`/`alt`
     /// are informational (they document the mapping and are asserted in tests). Feeding a
     /// `shift` that disagrees with `cur` silently inverts the case of the committed text —
     /// which is exactly what the IBus front-end used to do under CapsLock.
-    Letter { code: u16, shift: bool, cur: char, alt: char },
+    ///
+    /// `shift` is the level the key was typed at in the **current** layout; `alt_shift` is
+    /// the level to read it at in the **other** one. They differ in exactly one situation:
+    /// CapsLock, on a key that is a letter in only one of the two layouts. `;` with CapsLock
+    /// on is still `;` in US-QWERTY (punctuation ignores CapsLock) but `Ж` in ЙЦУКЕН — one
+    /// physical key press, two different levels. With a single shared flag every all-caps
+    /// Russian word containing б/ю/ж/э/х/ъ/ё came out with that letter in lower case
+    /// (`ВАжНО`).
+    Letter { code: u16, shift: bool, alt_shift: bool, cur: char, alt: char },
     /// Whitespace or punctuation that ends the current word.
     Separator,
     /// Backspace — trims the last char while keeping the cursor at the word end.
@@ -238,7 +246,15 @@ pub fn classify(code: u16, mods: Mods, lang: Lang) -> KeyEvent {
                     // letters that sit on English-punctuation keys (б,ж,э,ю,х,ъ,ё) when EN is
                     // active, so words like "будем"/"ужин" can be detected and converted.
                     if cur.is_alphabetic() || alt.is_some_and(|a| a.is_alphabetic()) {
-                        KeyEvent::Letter { code, shift: mods.shift, cur, alt: alt.unwrap_or(cur) }
+                        // The evdev path has no CapsLock state to consult, so both layouts
+                        // are read at the same level.
+                        KeyEvent::Letter {
+                            code,
+                            shift: mods.shift,
+                            alt_shift: mods.shift,
+                            cur,
+                            alt: alt.unwrap_or(cur),
+                        }
                     } else {
                         // Punctuation/digit in both layouts → ends the word.
                         KeyEvent::Separator

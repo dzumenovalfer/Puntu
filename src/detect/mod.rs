@@ -31,9 +31,25 @@ pub struct Models {
     pub en: Model,
     ru_words: HashSet<String>,
     en_words: HashSet<String>,
+    /// The two-letter words of each language that people actually type — see
+    /// [`Models::is_common_short`].
+    ru_short: HashSet<String>,
+    en_short: HashSet<String>,
     /// Large optional Russian dictionary (1M+ word forms) as a compact FST for exact match.
     ru_big: Option<Arc<fst::Set<Vec<u8>>>>,
 }
+
+/// How deep into the Russian word list a two-letter entry may sit and still count as a word.
+///
+/// The list is ordered by frequency, and for two-letter entries that order is the whole
+/// story: the real ones (не, ты, на, он, мы, вы, да, но, за, бы, же, из, ну, по, то, от, их,
+/// её, до, со, ли, ни, об, ей, во, им, уж, ко, те …) all sit in the first few hundred lines,
+/// and what follows is interjections and debris from the corpus it was built from (ть, дл,
+/// чт, нм, лш, еы …) — 244 "words" out of 1089 possible letter pairs. The big dictionary adds
+/// 418 more (аб, ав, вг, гг …). Taken at face value they made every second two-letter Latin
+/// token "the wrong-layout form of a Russian word": `TV` → «ЕМ», `16 GB` → «16 ПИ», `10 km` →
+/// «10 ль», `UK` → «ГЛ», and the `st`/`nd`/`rd`/`th` of every ordinal.
+const COMMON_SHORT_RANK: usize = 1000;
 
 impl Models {
     pub fn model(&self, lang: Lang) -> &Model {
@@ -61,6 +77,21 @@ impl Models {
         false
     }
 
+    /// Is `word` one of the two-letter words of `lang` that people actually type?
+    ///
+    /// Two letters are too few for anything but a list: the trigram model sees three
+    /// trigrams, two of them padding, and "is in a dictionary" is true of a third of all
+    /// letter pairs (see [`COMMON_SHORT_RANK`]). So a two-letter word converts only when its
+    /// other-layout reading is on this list — the same idea as the hand-written whitelist
+    /// for single letters, built from the word lists instead.
+    pub fn is_common_short(&self, word: &str, lang: Lang) -> bool {
+        let w = word.to_lowercase();
+        match lang {
+            Lang::Ru => self.ru_short.contains(&w),
+            Lang::En => self.en_short.contains(&w),
+        }
+    }
+
     pub fn from_words<I, S>(ru: I, en: I) -> Models
     where
         I: IntoIterator<Item = S>,
@@ -68,9 +99,15 @@ impl Models {
     {
         let ru: Vec<String> = ru.into_iter().map(|s| s.as_ref().to_lowercase()).collect();
         let en: Vec<String> = en.into_iter().map(|s| s.as_ref().to_lowercase()).collect();
+        let two_letters = |w: &&String| w.chars().count() == 2;
         Models {
             ru: Model::from_words(&ru),
             en: Model::from_words(&en),
+            // The Russian list is frequency-ordered, so rank separates words from debris.
+            ru_short: ru.iter().take(COMMON_SHORT_RANK).filter(two_letters).cloned().collect(),
+            // The English one is alphabetical — rank says nothing — but its two-letter
+            // entries are few and all real (am, an, as, at, be, by, do, go …).
+            en_short: en.iter().filter(two_letters).cloned().collect(),
             ru_words: ru.into_iter().collect(),
             en_words: en.into_iter().collect(),
             ru_big: None,
@@ -204,18 +241,27 @@ impl Detector {
         {
             return Decision::Leave;
         }
-        if self.models.is_word(&word.alt, other)
-            || (!alt_letters.is_empty() && alt_letters != word.alt && self.models.is_word(&alt_letters, other))
-        {
-            return Decision::Convert { to: other };
-        }
-
         let len = word.cur.chars().count();
         // Single-letter words: the n-gram model is unreliable on one char, so use a tiny
         // whitelist of real one-letter words per language. Convert only when the typed letter
         // isn't a word in the current language but its counterpart is in the other.
         if len == 1 {
             return decide_single(word, cur_lang, other, &self.models);
+        }
+        // Two-letter words: a list again, for the same reason — see `is_common_short`. This
+        // comes BEFORE the dictionary match below on purpose: for two letters, "the other
+        // reading is in a dictionary" is true of half of everything one can type.
+        if len == 2 {
+            return if self.models.is_common_short(&word.alt, other) {
+                Decision::Convert { to: other }
+            } else {
+                Decision::Leave
+            };
+        }
+        if self.models.is_word(&word.alt, other)
+            || (!alt_letters.is_empty() && alt_letters != word.alt && self.models.is_word(&alt_letters, other))
+        {
+            return Decision::Convert { to: other };
         }
         if len < self.cfg.min_word_len {
             return Decision::Leave;
@@ -546,6 +592,51 @@ mod tests {
         for s in ["puntu.", "alfer.", "serde.", "evdev.", "myword."] {
             assert_eq!(det.decide(&typed_en(s), &dict), Decision::Leave, "{s} must be left alone");
         }
+    }
+
+    #[test]
+    fn two_letter_words_convert_only_when_they_are_common() {
+        let det = Detector::new(Models::builtin(), DetectConfig::default());
+        let dict = UserDict::empty("/tmp/x-short".into());
+        let decide = |s: &str| det.decide(&typed_en(s), &dict);
+
+        // The Russian words people really do type with the layout not switched: не, мы, ты,
+        // вы, на, но, он, то, по, за, из, до, от, да…
+        for s in ["yt", "vs", "ns", "ds", "yf", "yj", "jy", "nj", "gj", "pf", "bp", "lj", "jn", "lf"] {
+            assert_eq!(decide(s), Decision::Convert { to: Lang::Ru }, "{s} must still convert");
+        }
+        // …including the ones with a letter on a punctuation key: бы, же, об, уж.
+        for s in [",s", ";t", "j,", "e;"] {
+            assert_eq!(decide(s), Decision::Convert { to: Lang::Ru }, "{s} must still convert");
+        }
+
+        // Everything else that merely happens to be "in a dictionary" is left alone: the
+        // lists hold a third of all possible letter pairs, which made TV «ЕМ», CV «СМ», a
+        // `dr` «вк» and the ending of every ordinal (`1st`, `2nd`, `3rd`, `4th`) Cyrillic.
+        for s in ["tv", "cv", "dr", "jr", "uk", "eu", "st", "nd", "rd", "th", "ed", "er", "ly", "km", "cm", "gb", "tb", "hz", "lb"] {
+            assert_eq!(decide(s), Decision::Leave, "{s} must be left alone");
+        }
+        // A real two-letter English word was never touched and still is not.
+        for s in ["am", "by", "do", "it", "we"] {
+            assert_eq!(decide(s), Decision::Leave, "{s} is English");
+        }
+    }
+
+    #[test]
+    fn common_short_words_come_from_the_top_of_the_list() {
+        // Rank is what separates a word from corpus debris, so a two-letter entry deep in a
+        // (frequency-ordered) Russian list does not count — while every two-letter entry of
+        // the alphabetical English list does.
+        let mut ru: Vec<String> = vec!["не".into()];
+        ru.extend((0..COMMON_SHORT_RANK).map(|i| format!("слово{i}")));
+        ru.push("ть".into());
+        let m = Models::from_words(ru, vec!["zoo".to_string(), "we".to_string()]);
+        assert!(m.is_common_short("не", Lang::Ru));
+        assert!(m.is_common_short("НЕ", Lang::Ru), "case-insensitive like every lookup");
+        assert!(!m.is_common_short("ть", Lang::Ru), "in the list, but far too deep to be a word");
+        assert!(m.is_word("ть", Lang::Ru), "…though still a dictionary entry");
+        assert!(m.is_common_short("we", Lang::En));
+        assert!(!m.is_common_short("zoo", Lang::En), "not two letters");
     }
 
     #[test]
