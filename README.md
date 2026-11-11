@@ -66,6 +66,25 @@ run `cargo` under `nice`: a rebuild after a code change takes ~50 s instead of ~
 desktop stays usable while the first build compiles the dependency tree. Binaries published
 on the Releases page still use the full `release` profile.
 
+### Another machine, without a network or a toolchain
+
+```sh
+./package.sh          # → dist/puntu-x86_64-linux.tar.gz (binaries + dictionary + install.sh)
+```
+
+Copy that one file over and run:
+
+```sh
+tar xzf puntu-x86_64-linux.tar.gz && ./puntu/install.sh
+```
+
+The installer sees the binaries next to it and installs exactly those — nothing is downloaded
+and nothing is compiled. (An archive from the Releases page works the same way; it has the
+same layout.) Prebuilt binaries need a C library at least as new as the one they were built
+against: `package.sh` prints that floor, and on the target the installer checks it **before**
+replacing anything — if the engine cannot run there it stops and tells you to build from
+source; if only the settings window cannot, it installs the rest.
+
 Then switch to it with **Super+Space** (or the input-source icon) and pick **Puntu**.
 
 ```sh

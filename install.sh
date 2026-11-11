@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# Puntu installer — one command, two modes.
+# Puntu installer — one command, three modes.
 #
 #   Remote (recommended):   curl -fsSL https://raw.githubusercontent.com/dzumenovalfer/Puntu/main/install.sh | bash
 #     Downloads the latest GitHub release (prebuilt x86_64 binaries + the big Russian
 #     dictionary) — no Rust toolchain needed. Falls back to a source build when there is no
 #     matching release for your architecture.
 #
+#   Bundle (offline, another machine):   tar xzf puntu-x86_64-linux.tar.gz && ./puntu/install.sh
+#     The script sits next to prebuilt binaries — a release archive, or one made here with
+#     ./package.sh — and installs exactly those. No network, no Rust toolchain.
+#
 #   Local (inside a git checkout):   ./install.sh
 #     Builds from source with cargo (installs rustup if missing).
 #
-# Both modes then: register the IBus component, restart IBus, add Puntu to GNOME input
+# All modes then: register the IBus component, restart IBus, add Puntu to GNOME input
 # sources. Puntu is an IBus engine, so there is **no** /dev/input access, uinput, `input`
 # group, udev rule, systemd service, or re-login involved — ibus-daemon launches the engine
 # on demand via the component's <exec> path.
@@ -39,8 +43,13 @@ install.sh — install or update Puntu.
   ./install.sh --update     update an existing install: pull, rebuild, reinstall the
                             binaries, restart IBus. Skips everything one-time (packages,
                             icons, .desktop files, Electron flags) and needs no sudo
-                            unless the engine's path changed. Run it from a checkout.
+                            unless the engine's path changed. Run it from a checkout —
+                            or from an unpacked archive, to move to the build inside it.
   ./install.sh --no-sudo    skip apt and the system-wide component copy
+
+Run from an unpacked release archive (the script next to the binaries), it installs those
+binaries as they are: no download, no Rust toolchain. Make such an archive from a checkout
+with ./package.sh.
 
 USAGE
       exit 0 ;;
@@ -54,9 +63,17 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-/dev/null}")" 2>/dev/null && pwd ||
 LOCAL=0
 [[ -f "$REPO_DIR/Cargo.toml" ]] && LOCAL=1
 
+# Bundle mode = the script sits next to prebuilt binaries: an unpacked release archive (CI
+# puts install.sh into it) or one made with ./package.sh. Those binaries are what gets
+# installed. This used to fall through to remote mode, which ignored the files lying right
+# there and downloaded the latest release instead — a different build than the archive the
+# user had deliberately carried over, and no install at all without a network.
+BUNDLE=0
+[[ "$LOCAL" -eq 0 && -f "$REPO_DIR/puntu-ibus" && -f "$REPO_DIR/puntu" ]] && BUNDLE=1
+
 # --- Update mode -------------------------------------------------------------
-# Rebuilds from the checkout, so it needs one. A release tarball has no sources to update.
-if [[ "$UPDATE" -eq 1 && "$LOCAL" -eq 0 ]]; then
+# Needs something to update FROM: a checkout to rebuild, or an archive to install.
+if [[ "$UPDATE" -eq 1 && "$LOCAL" -eq 0 && "$BUNDLE" -eq 0 ]]; then
   warn "--update rebuilds from source, so run it inside a checkout:"
   warn "  git clone https://github.com/$PUNTU_REPO ~/puntu && cd ~/puntu && ./install.sh"
   exit 1
@@ -86,7 +103,9 @@ if [[ "$UPDATE" -eq 1 ]]; then
   :
 elif [[ "$NO_SUDO" -eq 0 ]]; then
   if command -v apt-get >/dev/null 2>&1; then
-    PKGS=(ibus wl-clipboard curl)
+    PKGS=(ibus wl-clipboard)
+    # curl is only for fetching things: the release (remote mode) or rustup (local mode).
+    [[ "$BUNDLE" -eq 0 ]] && PKGS+=(curl)
     [[ "$LOCAL" -eq 1 ]] && PKGS+=(build-essential)
     say "Installing system packages (${PKGS[*]})…"
     sudo apt-get update -qq || warn "apt-get update failed (continuing)"
@@ -103,8 +122,71 @@ command -v ibus >/dev/null 2>&1 || warn "ibus not on PATH — Puntu needs IBus r
 CONFIG_DIR="$HOME/.config/puntu"
 mkdir -p "$CONFIG_DIR"
 
+# Can the dynamic loader start binary $1 on this system? Asked of `ldd`, i.e. WITHOUT running
+# the program: the settings window and the tray take no arguments, so "run it with --version"
+# would simply open them (and hang the installer until the window is closed).
+#
+# The answer is read from ldd's OUTPUT, never from its exit status: ldd fails when it has
+# something to report, and under `pipefail` a failed ldd made "| grep -q" look like "no
+# match" — the one case this exists for came out as "loads fine".
+why_not_loadable() {   # prints the loader's complaints about $1; nothing when it is fine
+  command -v ldd >/dev/null 2>&1 || return 0   # cannot tell — assume it loads
+  { ldd "$1" 2>&1 || true; } | { grep "not found" || true; }
+}
+loads_here() {
+  [[ -z "$(why_not_loadable "$1")" ]]
+}
+
+# Install prebuilt binaries from directory $1 (an unpacked release archive) into ~/.local/bin,
+# and the big dictionary next to the config. Shared by the remote and the bundle mode.
+install_prebuilt() {
+  local src="$1"
+  # Prebuilt binaries are tied to the C library they were linked against. On an older
+  # system they fail at start with "version `GLIBC_2.xx' not found" — and for an input
+  # method that means the keyboard layout silently stops existing after `ibus restart`.
+  # So check them HERE, before anything is replaced.
+  if ! loads_here "$src/puntu-ibus" || ! loads_here "$src/puntu"; then
+    warn "These binaries do not run on this system:"
+    { why_not_loadable "$src/puntu-ibus"; why_not_loadable "$src/puntu"; } \
+      | sort -u | head -n 4 | sed 's/^/     /' || true
+    warn "They were built on a newer system than this one ($(ldd --version 2>/dev/null | head -n1 || true))."
+    warn "Build from source instead — that works on any distribution:"
+    warn "  git clone https://github.com/$PUNTU_REPO ~/puntu && cd ~/puntu && ./install.sh"
+    exit 1
+  fi
+  BIN_DIR="$HOME/.local/bin"
+  mkdir -p "$BIN_DIR"
+  install -m 0755 "$src/puntu" "$src/puntu-ibus" "$BIN_DIR/"
+  # The settings window (absent from pre-0.4 releases) and the tray (pre-0.7) are optional,
+  # and may need a newer C library than the engine does: skip one that will not start
+  # rather than install a menu entry that opens nothing.
+  local extra
+  for extra in puntu-app puntu-gui; do
+    [[ -f "$src/$extra" ]] || continue
+    if loads_here "$src/$extra"; then
+      install -m 0755 "$src/$extra" "$BIN_DIR/"
+    else
+      warn "$extra does not run on this system — skipped:"
+      why_not_loadable "$src/$extra" | head -n 2 | sed 's/^/     /' || true
+      warn "  The engine and the \`puntu\` CLI are unaffected (settings: \`puntu config set …\`)."
+    fi
+  done
+  if [[ -f "$src/russian.fst" ]]; then
+    say "Installing the big Russian dictionary → $CONFIG_DIR/russian.fst"
+    install -m 0644 "$src/russian.fst" "$CONFIG_DIR/russian.fst"
+  fi
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *) warn "$BIN_DIR is not on PATH — the engine still works (IBus uses absolute paths), but add it to use the \`puntu\` CLI." ;;
+  esac
+}
+
 # 2. Obtain the binaries ------------------------------------------------------
-if [[ "$LOCAL" -eq 1 ]]; then
+if [[ "$BUNDLE" -eq 1 ]]; then
+  # ---- prebuilt bundle: the binaries are right next to this script ----
+  say "Installing the prebuilt binaries shipped with this installer ($("$REPO_DIR/puntu" --version 2>/dev/null || echo 'version unknown'))…"
+  install_prebuilt "$REPO_DIR"
+elif [[ "$LOCAL" -eq 1 ]]; then
   # ---- source build (original flow) ----
   if ! command -v cargo >/dev/null 2>&1; then
     say "Installing Rust toolchain (rustup)…"
@@ -168,21 +250,7 @@ else
     trap 'rm -rf "$TMP"' EXIT
     curl -fsSL "$ASSET_URL" -o "$TMP/puntu.tar.gz"
     tar -xzf "$TMP/puntu.tar.gz" -C "$TMP"
-    BIN_DIR="$HOME/.local/bin"
-    mkdir -p "$BIN_DIR"
-    install -m 0755 "$TMP/puntu/puntu" "$TMP/puntu/puntu-ibus" "$BIN_DIR/"
-    # The unified settings+dictionary window (absent from pre-0.4 releases).
-    [[ -f "$TMP/puntu/puntu-app" ]] && install -m 0755 "$TMP/puntu/puntu-app" "$BIN_DIR/"
-    # The tray indicator (absent from pre-0.7 releases).
-    [[ -f "$TMP/puntu/puntu-gui" ]] && install -m 0755 "$TMP/puntu/puntu-gui" "$BIN_DIR/"
-    if [[ -f "$TMP/puntu/russian.fst" ]]; then
-      say "Installing the big Russian dictionary → $CONFIG_DIR/russian.fst"
-      install -m 0644 "$TMP/puntu/russian.fst" "$CONFIG_DIR/russian.fst"
-    fi
-    case ":$PATH:" in
-      *":$BIN_DIR:"*) ;;
-      *) warn "$BIN_DIR is not on PATH — the engine still works (IBus uses absolute paths), but add it to use the \`puntu\` CLI." ;;
-    esac
+    install_prebuilt "$TMP/puntu"
   else
     # No release / non-x86_64 → clone and hand over to the local (source-build) flow.
     warn "No prebuilt release found for $ARCH — building from source instead."
@@ -384,7 +452,9 @@ APPS_DIR="$HOME/.local/share/applications"
 mkdir -p "$APPS_DIR"
 # Drop the two split entries earlier versions installed.
 rm -f "$APPS_DIR/puntu-settings.desktop" "$APPS_DIR/puntu-dictionary.desktop"
-cat > "$APPS_DIR/puntu.desktop" <<DESK
+# …but only when there is an app to open: a bundle may have had to leave it out (see
+# `install_prebuilt`), and an entry that launches nothing is worse than no entry.
+[[ -x "$BIN_DIR/puntu-app" ]] && cat > "$APPS_DIR/puntu.desktop" <<DESK
 [Desktop Entry]
 Name=Puntu
 Comment=Настройки и словарь автопереключения раскладки

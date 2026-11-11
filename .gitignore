@@ -1,3 +1,5 @@
 /target
 *.swp
 .claude/
+# installer archives made by ./package.sh
+/dist
