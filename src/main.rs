@@ -662,7 +662,7 @@ fn run_stdin(cfg: Config) -> Result<()> {
             }
             let word = CompletedWord::from_keys(keys, lang, true);
             let decision = det.decide(&word, &dict);
-            let verdict = match decision {
+            let mut verdict = match decision {
                 Decision::Convert { to } => format!("CONVERT → {} ({:?})", word.alt, to),
                 Decision::Leave => {
                     if is_command_context(&word.cur) {
@@ -672,6 +672,15 @@ fn run_stdin(cfg: Config) -> Result<()> {
                     }
                 }
             };
+            // What the typo corrector (`fix_typos`) would then make of the text on screen.
+            // A capital is taken for a sentence start here; the engine knows better.
+            let shown = match decision {
+                Decision::Convert { .. } => &word.alt,
+                Decision::Leave => &word.cur,
+            };
+            if let Some(fixed) = det.typo_fix(shown, true, &dict) {
+                verdict.push_str(&format!("; TYPO → {fixed}"));
+            }
             println!("{:<16} [{}]  {}", word.cur, lang, verdict);
         }
     }
@@ -701,7 +710,7 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
             let mut cfg = load_config(path)?;
             // Boolean flags — value parsed as on/off/true/false/1/0.
             let bool_keys =
-                ["dry_run", "paste_convert", "enable_modifier_taps", "fix_case", "debug_log"];
+                ["dry_run", "paste_convert", "enable_modifier_taps", "fix_case", "fix_typos", "debug_log"];
             // Numeric flags — durations in ms and counts.
             let number_keys = ["tap_max_hold_ms", "hold_commit_ms", "suggest_after"];
             // String flags — IBus hotkey names. `undo_key` / `mode_toggle_key` / `case_key` /
@@ -722,6 +731,7 @@ fn run_config(op: ConfigOp, path: Option<&std::path::Path>) -> Result<()> {
                 "paste_convert" => { cfg.paste_convert = parse_bool(&value)?; format!("{}", cfg.paste_convert) }
                 "enable_modifier_taps" => { cfg.enable_modifier_taps = parse_bool(&value)?; format!("{}", cfg.enable_modifier_taps) }
                 "fix_case" => { cfg.fix_case = parse_bool(&value)?; format!("{}", cfg.fix_case) }
+                "fix_typos" => { cfg.fix_typos = parse_bool(&value)?; format!("{}", cfg.fix_typos) }
                 "debug_log" => { cfg.debug_log = parse_bool(&value)?; format!("{}", cfg.debug_log) }
                 "tap_max_hold_ms" => {
                     cfg.tap_max_hold_ms = value.trim().parse().context("expected milliseconds (e.g. 500)")?;
@@ -950,6 +960,8 @@ fn run_settings_ui(path: Option<&std::path::Path>) -> Result<()> {
         let rows: Vec<(&str, &str, String, &str)> = vec![
             ("autocorrect", "Автокоррекция", onoff(!cfg.dry_run),
              "исправлять слова, набранные не в той раскладке"),
+            ("fix_typos", "Исправление опечаток", onoff(cfg.fix_typos),
+             "првиет → привет (только русские слова; откат — флипом)"),
             ("enable_modifier_taps", "Тапы модификаторов", onoff(cfg.enable_modifier_taps),
              "тап Ctrl = смена режима; тап Ctrl+Shift = перевод выделения"),
             ("mode_toggle", "Тап смены режима EN↔RU", cfg.ibus_hotkeys.mode_toggle.clone(),
@@ -1026,6 +1038,9 @@ fn run_settings_ui(path: Option<&std::path::Path>) -> Result<()> {
         match key.as_str() {
             "autocorrect" => {
                 cfg.dry_run = !cfg.dry_run;
+            }
+            "fix_typos" => {
+                cfg.fix_typos = !cfg.fix_typos;
             }
             "enable_modifier_taps" => {
                 cfg.enable_modifier_taps = !cfg.enable_modifier_taps;

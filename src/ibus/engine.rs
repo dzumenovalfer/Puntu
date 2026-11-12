@@ -38,6 +38,19 @@ struct Held {
     /// becomes `привет.` and not `привет/`, while flipping it back restores the `/`.
     shown_sep: Lang,
     other_sep: Lang,
+    /// A third rendering the flip goes on to after `other`, with its separator layout. Only
+    /// there when a typo was fixed: `shown` is then the corrected word, `other` the word
+    /// without the correction, and this the remaining layout reading — so the first flip
+    /// takes back the typo fix and the second one still reaches the other layout.
+    spare: Option<(String, Lang)>,
+    /// The word a typo fix replaced (lower case), when one was made — what goes on the
+    /// never-correct list if the user flips the fix back.
+    typo: Option<String>,
+    /// Set once that rejection has been recorded.
+    typo_learned: bool,
+    /// How many separator characters follow the word in each rendering (one per separator
+    /// key, the same number in all of them) — see [`Held::shown_word`].
+    seps: usize,
     /// The word exactly as typed (no separator) — what gets added to the learned list when
     /// the user flips an auto-conversion back.
     typed: String,
@@ -86,12 +99,90 @@ impl Default for Held {
             source: HeldSource::default(),
             shown_sep: Lang::En,
             other_sep: Lang::Ru,
+            spare: None,
+            typo: None,
+            typo_learned: false,
+            seps: 0,
             typed: String::new(),
             converted: String::new(),
             learned: false,
             counted: false,
             generation: 0,
         }
+    }
+}
+
+/// What one flip of the held word amounted to, besides changing what is shown — decided by
+/// [`Held::flip`], acted on by `handle_undo`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Flipped {
+    /// The user took an automatic layout conversion back: this typed form goes on the
+    /// never-correct list.
+    refused_conversion: Option<String>,
+    /// The user took a typo fix back: this word is left alone from now on.
+    refused_typo_fix: Option<String>,
+    /// `(typed, converted)` — a word the detector left alone and the user converted by hand,
+    /// for the "you keep converting this, remember it?" counter.
+    manual: Option<(String, String)>,
+}
+
+impl Held {
+    /// The word now shown, without the separators typed after it.
+    fn shown_word(&self) -> String {
+        let n = self.shown.chars().count().saturating_sub(self.seps);
+        self.shown.chars().take(n).collect()
+    }
+
+    /// Move on to the next rendering — `shown` → `other` (→ `spare`) → back — and say what
+    /// that step means. Each of the three things it can mean is reported once per word, so
+    /// going round and round teaches nothing twice.
+    fn flip(&mut self) -> Flipped {
+        match self.spare.take() {
+            Some((spare, spare_sep)) => {
+                let shown = std::mem::replace(&mut self.shown, std::mem::replace(&mut self.other, spare));
+                let shown_sep =
+                    std::mem::replace(&mut self.shown_sep, std::mem::replace(&mut self.other_sep, spare_sep));
+                self.spare = Some((shown, shown_sep));
+            }
+            None => {
+                std::mem::swap(&mut self.shown, &mut self.other);
+                std::mem::swap(&mut self.shown_sep, &mut self.other_sep);
+            }
+        }
+        let now = self.shown_word().to_lowercase();
+        let mut flipped = Flipped::default();
+        // Back to the word as it was before the typo fix: the fix was wrong.
+        if !self.typo_learned && self.typo.as_deref() == Some(now.as_str()) {
+            self.typo_learned = true;
+            flipped.refused_typo_fix = self.typo.clone();
+        }
+        // Back to exactly what was typed after an automatic conversion: that was wrong.
+        if self.source == HeldSource::AutoConverted
+            && !self.learned
+            && now == self.typed.to_lowercase()
+        {
+            self.learned = true;
+            // A single letter is never worth a permanent exception: `b` → «и» is undone with
+            // one keystroke, but `b` on the never-correct list silently kills the one-letter
+            // word «и» for good (the user's `b`/`e`/`f` entries blocked и/у/а). `learnable`
+            // refuses single letters for the same reason.
+            flipped.refused_conversion =
+                (self.typed.chars().count() >= 2).then(|| self.typed.clone());
+        }
+        // A forward flip (detector left the word as typed, the user converted it by hand) is
+        // a manual conversion — feed the repeat counter, once per held word. A Replacement
+        // is excluded: undoing a rule the user wrote themselves is not evidence they want
+        // that word remembered. So is a typo-fixed word: its first flip takes the fix back,
+        // which says nothing about layouts.
+        if self.source == HeldSource::Typed
+            && self.typo.is_none()
+            && !self.counted
+            && starts_with_word(&self.shown, &self.converted)
+        {
+            self.counted = true;
+            flipped.manual = Some((self.typed.clone(), self.converted.clone()));
+        }
+        flipped
     }
 }
 
@@ -224,6 +315,24 @@ fn starts_mid_word(tail: &Tail, reported: Option<Option<char>>) -> bool {
     match reported {
         Some(before) => before.is_some_and(continues_word),
         None => tail.backspaced,
+    }
+}
+
+/// Does the word about to be typed start a sentence — so that a capital letter on it is
+/// ordinary, and not the mark of a name?
+///
+/// Known only from what precedes the caret: the end of a sentence (`.`, `!`, `?`, `…`), a new
+/// line, or the very start of the field. Anything the engine cannot see counts as "no": a
+/// capitalised word is then taken for a name and left exactly as typed.
+fn starts_sentence(tail: &Tail, reported: Option<Option<char>>) -> bool {
+    match tail.known.as_deref() {
+        Some(known) => matches!(
+            known.trim_end_matches([' ', '\t']).chars().last(),
+            Some('.' | '!' | '?' | '…' | '\n')
+        ),
+        // Nothing of our own to go by; the client saying "the caret is at position 0" is
+        // the one other thing that settles it.
+        None => reported == Some(None),
     }
 }
 
@@ -523,6 +632,10 @@ pub struct PuntuEngine {
     /// fragment of a longer word and must not be judged — or rewritten — as a word of its
     /// own. Decided on its first letter ([`starts_mid_word`]), applied when it is finished.
     suspect: bool,
+    /// The word now in the buffer starts a sentence, as far as the engine can tell — so a
+    /// capital letter on it is ordinary, not the mark of a name. Decided with `suspect`, on
+    /// the first letter; only the typo corrector cares ([`starts_sentence`]).
+    sentence_start: bool,
     /// D-Bus serial of the `ContentType` write applied last. Property writes are the one kind
     /// of call that can still reach the engine out of order (see `set_content_type`), and
     /// the serial is what says which of two was sent later.
@@ -679,6 +792,8 @@ pub struct EngineOptions {
     pub autocorrect: bool,
     /// Fix accidental-caps signatures (`пРИВЕТ`, `ПРивет`) on finished words.
     pub fix_case: bool,
+    /// Fix one-slip typos in Russian words (`првиет`) — see `detect::typo`.
+    pub fix_typos: bool,
     /// `[learning] suggest_after`; 0 disables the "remember this word?" offer.
     pub suggest_after: u32,
     /// How long a finished word may sit in preedit before it commits itself; 0 disables.
@@ -695,6 +810,7 @@ impl EngineOptions {
         EngineOptions {
             autocorrect: !cfg.dry_run,
             fix_case: cfg.fix_case,
+            fix_typos: cfg.fix_typos,
             suggest_after: cfg.learning.suggest_after,
             hold_commit_ms: cfg.hold_commit_ms,
             clients: cfg.ibus_clients.clone(),
@@ -788,6 +904,7 @@ impl PuntuEngine {
             convert_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tail: Arc::new(std::sync::Mutex::new(Tail::default())),
             suspect: false,
+            sentence_start: false,
             content_serial: None,
             context: String::new(),
         }
@@ -1183,40 +1300,17 @@ impl PuntuEngine {
     /// typed form is added to the learned list (once) and won't be auto-converted again.
     async fn handle_undo(&mut self, se: &SignalEmitter<'_>) {
         // Scoped so the (non-Send) lock guard is gone before the first `.await` below.
-        let Some((shown, learn, manual)) = ({
+        let Some((shown, flipped)) = ({
             let mut guard = lock(&self.held);
             guard.as_mut().map(|h| {
-                std::mem::swap(&mut h.shown, &mut h.other);
-                std::mem::swap(&mut h.shown_sep, &mut h.other_sep);
-                let learn = if h.source == HeldSource::AutoConverted && !h.learned {
-                    h.learned = true;
-                    // A single letter is never worth a permanent exception: `b` → «и» is
-                    // undone with one keystroke, but `b` on the never-correct list silently
-                    // kills the one-letter word «и» for good (the user's `b`/`e`/`f` entries
-                    // blocked и/у/а). `learnable` refuses single letters for the same reason.
-                    (h.typed.chars().count() >= 2).then(|| h.typed.clone())
-                } else {
-                    None
-                };
-                // A forward flip (detector left the word as typed, the user converted it by
-                // hand) is a manual conversion — feed the repeat counter, once per held word.
-                // A Replacement is excluded: undoing a rule the user wrote themselves is not
-                // evidence they want that word remembered.
-                let manual = if h.source == HeldSource::Typed
-                    && !h.counted
-                    && starts_with_word(&h.shown, &h.converted)
-                {
-                    h.counted = true;
-                    Some((h.typed.clone(), h.converted.clone()))
-                } else {
-                    None
-                };
-                (h.shown.clone(), learn, manual)
+                let flipped = h.flip();
+                (h.shown.clone(), flipped)
             })
         }) else {
             debug!("[puntu-engine {}] flip: nothing held", self.id);
             return;
         };
+        let Flipped { refused_conversion: learn, refused_typo_fix, manual } = flipped;
         // The user is working on this word — restart its idle countdown.
         self.touch_hold(se);
         debug!("[puntu-engine {}] flip: held → {:?}", self.id, shown);
@@ -1252,6 +1346,27 @@ impl PuntuEngine {
                 }
                 Err(e) => tracing::warn!(
                     "[puntu-engine {}] could not persist learned word {typed:?}: {e}",
+                    self.id
+                ),
+            }
+        }
+        if let Some(word) = refused_typo_fix {
+            // The same never-correct list, in the word's own language: the typo corrector
+            // asks it before touching a word (`Detector::typo_fix`).
+            let mut dict = self.dict.lock().await;
+            match dict.add(&word, Lang::Ru, ListKind::Learned) {
+                Ok(()) => {
+                    tracing::info!(
+                        "[puntu-engine {}] learned {word:?} (undone typo fix)",
+                        self.id
+                    );
+                    notify(&format!(
+                        "Больше не исправляю «{word}» (вы откатили исправление опечатки).\n\
+                         Вернуть: puntu dict rm {word}"
+                    ));
+                }
+                Err(e) => tracing::warn!(
+                    "[puntu-engine {}] could not persist refused typo fix {word:?}: {e}",
                     self.id
                 ),
             }
@@ -1446,6 +1561,9 @@ impl PuntuEngine {
                 // Carry the new case over to the flip target too, or flipping the layout
                 // afterwards silently threw the case away (`Слово ` → `ckjdj `).
                 h.other = match_case(&h.other, &h.shown);
+                if let Some((spare, _)) = h.spare.as_mut() {
+                    *spare = match_case(spare, &h.shown);
+                }
                 h.shown.clone()
             })
         }) else {
@@ -1473,15 +1591,10 @@ impl PuntuEngine {
         // The word just typed, in whichever form is on screen. A replacement is skipped —
         // what's on screen there is the user's own snippet, and offering to "remember" it as
         // a dictionary word makes no sense.
-        let held = lock(&self.held).as_ref().filter(|h| h.source != HeldSource::Replacement).map(
-            |h| {
-                if starts_with_word(&h.shown, &h.converted) {
-                    h.converted.clone()
-                } else {
-                    h.typed.clone()
-                }
-            },
-        );
+        let held = lock(&self.held)
+            .as_ref()
+            .filter(|h| h.source != HeldSource::Replacement)
+            .map(Held::shown_word);
         let detector = self.detector();
         let dict = Arc::clone(&self.dict);
         let hint_shown = Arc::clone(&self.hint_shown);
@@ -1816,6 +1929,8 @@ impl PuntuEngine {
                     source: HeldSource::Replacement,
                     shown_sep: sep,
                     other_sep: sep,
+                    spare: None,
+                    typo: None,
                 };
             }
         }
@@ -1838,6 +1953,8 @@ impl PuntuEngine {
                         source: HeldSource::AutoConverted,
                         shown_sep: other_in,
                         other_sep: typed_in,
+                        spare: None,
+                        typo: None,
                     }
                 } else {
                     Rendering {
@@ -1846,6 +1963,8 @@ impl PuntuEngine {
                         source: HeldSource::Typed,
                         shown_sep: typed_in,
                         other_sep: other_in,
+                        spare: None,
+                        typo: None,
                     }
                 }
             }
@@ -1881,6 +2000,8 @@ impl PuntuEngine {
                     source: HeldSource::Typed,
                     shown_sep: Lang::Ru,
                     other_sep: Lang::Ru,
+                    spare: None,
+                    typo: None,
                 }
             }
         };
@@ -1905,6 +2026,27 @@ impl PuntuEngine {
                 rendering.shown = fixed;
             }
         }
+        // Typos — last, on the word as it would otherwise be shown, whichever way it got to
+        // be Russian (typed in RU-direct, or converted from the wrong layout just above:
+        // `ghbdnt` → `привте` → `привет`). The corrector itself declines everything that is
+        // not an unknown Russian word one obvious slip away from a common one.
+        if settings.opts.fix_typos && rewrites_allowed && whole_word {
+            let dict = self.dict.lock().await;
+            if let Some(fixed) = detector.typo_fix(&rendering.shown, self.sentence_start, &dict) {
+                debug!(
+                    "[puntu-engine {}] typo fix {:?} -> {:?}",
+                    self.id, rendering.shown, fixed
+                );
+                // The flip goes: fixed → as it was → the other layout. Taking the fix back
+                // comes first because that is what a wrong fix needs; the other layout is
+                // still one more flip away.
+                let unfixed = std::mem::replace(&mut rendering.shown, fixed);
+                let other_layout = std::mem::replace(&mut rendering.other, unfixed.clone());
+                rendering.spare = Some((other_layout, rendering.other_sep));
+                rendering.other_sep = rendering.shown_sep;
+                rendering.typo = Some(unfixed.to_lowercase());
+            }
+        }
         rendering
     }
 }
@@ -1922,6 +2064,10 @@ struct Rendering {
     /// what a separator after the word is rendered through (see [`Held::shown_sep`]).
     shown_sep: Lang,
     other_sep: Lang,
+    /// A third rendering, when a typo was fixed — see [`Held::spare`].
+    spare: Option<(String, Lang)>,
+    /// The word the typo fix replaced, lower case — see [`Held::typo`].
+    typo: Option<String>,
 }
 
 impl IBusEngine for PuntuEngine {
@@ -2134,6 +2280,7 @@ impl IBusEngine for PuntuEngine {
                     // First letter of a word: is it a word of its own, or the continuation
                     // of whatever already stands before the caret?
                     self.suspect = starts_mid_word(&lock(&self.tail), reported_before);
+                    self.sentence_start = starts_sentence(&lock(&self.tail), reported_before);
                     if self.suspect {
                         debug!(
                             "[puntu-engine {}] the word starts mid-word — it will be held as \
@@ -2239,6 +2386,12 @@ impl IBusEngine for PuntuEngine {
                             source: rendering.source,
                             shown_sep: rendering.shown_sep,
                             other_sep: rendering.other_sep,
+                            spare: rendering.spare.map(|(text, lang)| {
+                                (format!("{text}{}", separator_in(raw_sep, lang, numpad)), lang)
+                            }),
+                            typo: rendering.typo,
+                            typo_learned: false,
+                            seps: 1,
                             typed: word.cur.clone(),
                             converted: word.alt.clone(),
                             learned: false,
@@ -2266,6 +2419,10 @@ impl IBusEngine for PuntuEngine {
                                 .map(|h| {
                                     h.shown.push(separator_in(raw_sep, h.shown_sep, numpad));
                                     h.other.push(separator_in(raw_sep, h.other_sep, numpad));
+                                    if let Some((spare, lang)) = h.spare.as_mut() {
+                                        spare.push(separator_in(raw_sep, *lang, numpad));
+                                    }
+                                    h.seps += 1;
                                     h.shown.clone()
                                 })
                                 .unwrap_or_default()
@@ -3672,9 +3829,8 @@ mod tests {
             source: HeldSource::AutoConverted,
             shown_sep: Lang::Ru,
             other_sep: Lang::En,
-            learned: false,
-            counted: false,
             generation,
+            ..Held::default()
         };
         let slot: HeldSlot = Arc::new(std::sync::Mutex::new(Some(held(7))));
 
@@ -4161,13 +4317,13 @@ mod tests {
             converted: "hbdtn".to_string(),
             ..Held::default()
         };
-        let learns = h.source == HeldSource::AutoConverted && !h.learned;
-        let counts = h.source == HeldSource::Typed && !h.counted;
-        assert!(!learns, "nothing to learn from undoing your own rule");
-        assert!(!counts, "and it is not a manual conversion either");
-        // The flip itself still works — that is what keeps a replacement undoable.
-        std::mem::swap(&mut h.shown, &mut h.other);
+        h.seps = 1;
+        // The flip itself still works — that is what keeps a replacement undoable — and it
+        // means nothing beyond that: not a refused conversion, not a manual one.
+        assert_eq!(h.flip(), Flipped::default());
         assert_eq!(h.shown, "ривет ");
+        assert_eq!(h.flip(), Flipped::default());
+        assert_eq!(h.shown, "привет ");
     }
 
     #[test]
@@ -4740,5 +4896,248 @@ mod tests {
         assert!(!hk.matches(Keysym::space, &none));
         assert!(modifier_was_down(Mod::Super, &sup) && modifier_was_down(Mod::Super, &mod4));
         assert!(!modifier_was_down(Mod::Super, &none));
+    }
+    // ---- Flipping a held word ---------------------------------------------------------------
+
+    /// A held word as the separator arm builds it: each rendering followed by one space.
+    fn held(source: HeldSource, shown: &str, other: &str, typed: &str, converted: &str) -> Held {
+        Held {
+            shown: format!("{shown} "),
+            other: format!("{other} "),
+            source,
+            seps: 1,
+            typed: typed.to_string(),
+            converted: converted.to_string(),
+            ..Held::default()
+        }
+    }
+
+    #[test]
+    fn taking_back_a_conversion_is_remembered_once() {
+        let mut h = held(HeldSource::AutoConverted, "привет", "ghbdtn", "ghbdtn", "привет");
+        let first = h.flip();
+        assert_eq!(h.shown, "ghbdtn ");
+        assert_eq!(first.refused_conversion.as_deref(), Some("ghbdtn"));
+        assert_eq!((first.refused_typo_fix, first.manual), (None, None));
+        // Back and forth again: nothing more to learn.
+        assert_eq!(h.flip(), Flipped::default());
+        assert_eq!(h.shown, "привет ");
+        assert_eq!(h.flip(), Flipped::default());
+
+        // A single letter is never worth a permanent exception.
+        let mut h = held(HeldSource::AutoConverted, "и", "b", "b", "и");
+        assert_eq!(h.flip().refused_conversion, None);
+    }
+
+    #[test]
+    fn converting_by_hand_is_counted_once() {
+        let mut h = held(HeldSource::Typed, "ghbdtn", "привет", "ghbdtn", "привет");
+        assert_eq!(
+            h.flip().manual,
+            Some(("ghbdtn".to_string(), "привет".to_string())),
+            "the detector left it alone and the user converted it"
+        );
+        assert_eq!(h.flip(), Flipped::default(), "flipping it back is not a conversion");
+        assert_eq!(h.flip(), Flipped::default(), "and the same word is not counted twice");
+        // In RU-direct the word is Russian to begin with; flipping it to Latin is not what
+        // the counter is about.
+        let mut h = held(HeldSource::Typed, "привет", "ghbdtn", "ghbdtn", "привет");
+        assert_eq!(h.flip(), Flipped::default());
+    }
+
+    #[test]
+    fn a_typo_fix_is_the_first_thing_a_flip_takes_back() {
+        // `ghdbtn` typed with the layout not switched: converted to «првиет», then fixed.
+        let mut h = Held {
+            spare: Some(("ghdbtn ".to_string(), Lang::En)),
+            typo: Some("првиет".to_string()),
+            other_sep: Lang::Ru,
+            shown_sep: Lang::Ru,
+            ..held(HeldSource::AutoConverted, "привет", "првиет", "ghdbtn", "првиет")
+        };
+        // 1st flip: the word without the fix. That is a refused typo fix, and only that.
+        let f = h.flip();
+        assert_eq!(h.shown, "првиет ");
+        assert_eq!(f.refused_typo_fix.as_deref(), Some("првиет"));
+        assert_eq!((f.refused_conversion, f.manual), (None, None));
+        // 2nd flip: exactly what was typed — now the conversion itself is refused.
+        let f = h.flip();
+        assert_eq!((h.shown.as_str(), h.shown_sep), ("ghdbtn ", Lang::En));
+        assert_eq!(f.refused_conversion.as_deref(), Some("ghdbtn"));
+        assert_eq!(f.refused_typo_fix, None);
+        // 3rd flip: round to the fixed word again, and from here on nothing is new.
+        assert_eq!(h.flip(), Flipped::default());
+        assert_eq!(h.shown, "привет ");
+        for expected in ["првиет ", "ghdbtn ", "привет "] {
+            assert_eq!(h.flip(), Flipped::default());
+            assert_eq!(h.shown, expected);
+        }
+    }
+
+    #[test]
+    fn a_typo_fix_taken_back_in_ru_direct_is_not_a_manual_conversion() {
+        // RU-direct: the word was Russian all along, only the typo fix is in question. The
+        // word without the fix happens to equal the "conversion target" the counter looks
+        // for — it must not be mistaken for a conversion made by hand.
+        let mut h = Held {
+            spare: Some(("ghdbtn ".to_string(), Lang::Ru)),
+            typo: Some("првиет".to_string()),
+            shown_sep: Lang::Ru,
+            other_sep: Lang::Ru,
+            ..held(HeldSource::Typed, "привет", "првиет", "ghdbtn", "првиет")
+        };
+        let f = h.flip();
+        assert_eq!(f.refused_typo_fix.as_deref(), Some("првиет"));
+        assert_eq!(f.manual, None);
+        // The Latin reading is still reachable — one more flip.
+        assert_eq!(h.flip(), Flipped::default());
+        assert_eq!(h.shown, "ghdbtn ");
+    }
+
+    #[test]
+    fn the_shown_word_is_the_text_without_its_separators() {
+        let mut h = held(HeldSource::Typed, "hello", "руддщ", "hello", "руддщ");
+        assert_eq!(h.shown_word(), "hello");
+        // Two more separators typed after it (`!` and a space).
+        h.shown.push_str("! ");
+        h.other.push_str("! ");
+        h.seps += 2;
+        assert_eq!(h.shown_word(), "hello");
+        // A word may itself end in a punctuation key (`hello.` — the `.` key is «ю»):
+        // counting separators, not guessing by character class, keeps it whole.
+        let h = held(HeldSource::Typed, "hello.", "руддщю", "hello.", "руддщю");
+        assert_eq!(h.shown_word(), "hello.");
+    }
+
+    // ---- Typos ----------------------------------------------------------------------------
+
+    /// An engine with `fix_typos` on and a big dictionary — which the corrector insists on.
+    fn engine_fixing_typos(common_ru: &[&str], also_known: &[&str]) -> PuntuEngine {
+        let models = crate::detect::Models::from_words(common_ru.to_vec(), Vec::<&str>::new())
+            .with_big_dictionary(common_ru.iter().chain(also_known));
+        let cfg = crate::config::Config { fix_typos: true, ..Default::default() };
+        let (mut e, _slot) = test_engine(&cfg);
+        e.detector = Arc::new(std::sync::RwLock::new(Arc::new(Detector::new(
+            models,
+            crate::config::DetectConfig::default(),
+        ))));
+        e
+    }
+
+    #[test]
+    fn a_typo_in_a_russian_word_is_fixed_and_can_be_taken_back() {
+        let mut e = engine_fixing_typos(&["привет"], &[]);
+        e.mode = EngineMode::DirectRussian;
+        // «првиет» typed in RU-direct.
+        let r = render(&e, &word("ghdbtn", "првиет"));
+        assert_eq!(r.shown, "привет");
+        assert_eq!(r.other, "првиет", "the first flip takes the fix back");
+        assert_eq!(r.spare, Some(("ghdbtn".to_string(), Lang::Ru)), "the second reaches Latin");
+        assert_eq!(r.typo.as_deref(), Some("првиет"));
+        assert_eq!(r.source, HeldSource::Typed);
+
+        // A word that is fine is not touched, and neither is its flip cycle.
+        let r = render(&e, &word("ghbdtn", "привет"));
+        assert_eq!((r.shown.as_str(), r.other.as_str(), &r.spare, &r.typo), ("привет", "ghbdtn", &None, &None));
+    }
+
+    #[test]
+    fn a_wrong_layout_word_with_a_typo_is_converted_and_then_fixed() {
+        // `ghdbtn` in EN mode: the keys of «првиет». The layout decision makes it Russian
+        // (here through the force list, standing in for the detector), the typo fix makes it
+        // a word — and flipping twice still gives back exactly what was typed.
+        let mut e = engine_fixing_typos(&["привет"], &[]);
+        let dict = UserDict::empty(std::env::temp_dir().join("puntu-test-typo-layout"));
+        e.dict = Arc::new(AsyncMutex::new(dict));
+        e.dict.try_lock().unwrap().add("ghdbtn", Lang::En, ListKind::Force).unwrap();
+        let r = render(&e, &word("ghdbtn", "првиет"));
+        assert_eq!(r.source, HeldSource::AutoConverted);
+        assert_eq!((r.shown.as_str(), r.shown_sep), ("привет", Lang::Ru));
+        assert_eq!((r.other.as_str(), r.other_sep), ("првиет", Lang::Ru));
+        assert_eq!(r.spare, Some(("ghdbtn".to_string(), Lang::En)));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("puntu-test-typo-layout"));
+    }
+
+    #[test]
+    fn typo_fixing_keeps_out_wherever_rewriting_does() {
+        let typo = word("ghdbtn", "првиет");
+        let mut e = engine_fixing_typos(&["привет"], &[]);
+        e.mode = EngineMode::DirectRussian;
+        assert_eq!(render(&e, &typo).shown, "привет", "the baseline: it is fixed");
+
+        // A fragment is not a word.
+        assert_eq!(render(&e, &fragment("ghdbtn", "првиет")).shown, "првиет");
+        // A terminal is manual-only.
+        e.purpose = PURPOSE_TERMINAL;
+        assert_eq!(render(&e, &typo).shown, "првиет");
+        e.purpose = 0;
+
+        // The switch is off by default, and off means off.
+        let off = crate::config::Config::default();
+        assert!(!EngineOptions::from_config(&off).fix_typos);
+        swap_settings(&e.settings, &off);
+        assert_eq!(render(&e, &typo).shown, "првиет");
+        // …as does `dry_run`, which forbids every rewrite.
+        let dry = crate::config::Config { fix_typos: true, dry_run: true, ..Default::default() };
+        swap_settings(&e.settings, &dry);
+        assert_eq!(render(&e, &typo).shown, "првиет");
+    }
+
+    #[test]
+    fn typo_fixing_needs_the_big_dictionary() {
+        // Without it "unknown" does not mean "mistyped" — most inflected forms are unknown
+        // to a 40 000-word list — so the corrector does nothing at all.
+        let cfg = crate::config::Config { fix_typos: true, ..Default::default() };
+        let (mut e, _slot) = test_engine(&cfg);
+        e.detector = Arc::new(std::sync::RwLock::new(Arc::new(Detector::new(
+            crate::detect::Models::from_words(vec!["привет"], Vec::<&str>::new()),
+            crate::config::DetectConfig::default(),
+        ))));
+        e.mode = EngineMode::DirectRussian;
+        assert_eq!(render(&e, &word("ghdbtn", "првиет")).shown, "првиет");
+    }
+
+    #[test]
+    fn a_capital_is_a_name_unless_it_starts_a_sentence() {
+        let mut e = engine_fixing_typos(&["привет"], &[]);
+        e.mode = EngineMode::DirectRussian;
+        let typo = word("Ghdbtn", "Првиет");
+        e.sentence_start = false;
+        assert_eq!(render(&e, &typo).shown, "Првиет", "mid-sentence: taken for a name");
+        e.sentence_start = true;
+        assert_eq!(render(&e, &typo).shown, "Привет");
+
+        // What "starts a sentence" means.
+        let mut t = Tail::default();
+        assert!(!starts_sentence(&t, None), "nothing known: assume not");
+        assert!(starts_sentence(&t, Some(None)), "the very start of the field");
+        assert!(!starts_sentence(&t, Some(Some(' '))), "one character is not enough to tell");
+        t.push("Привет. ");
+        assert!(starts_sentence(&t, None));
+        t.push("как ");
+        assert!(!starts_sentence(&t, None));
+        t.push("дела?  ");
+        assert!(starts_sentence(&t, None));
+        t.boundary();
+        assert!(starts_sentence(&t, None), "a new line");
+    }
+
+    #[test]
+    fn a_word_the_user_knows_or_refused_is_not_a_typo() {
+        let mut e = engine_fixing_typos(&["привет"], &["првиет"]);
+        e.mode = EngineMode::DirectRussian;
+        // In the big dictionary: a word, however rare.
+        assert_eq!(render(&e, &word("ghdbtn", "првиет")).shown, "првиет");
+
+        // Not in any dictionary, but on the never-correct list — where a flipped-back fix
+        // lands (`Flipped::refused_typo_fix`).
+        let mut e = engine_fixing_typos(&["привет"], &[]);
+        e.mode = EngineMode::DirectRussian;
+        let dir = std::env::temp_dir().join("puntu-test-typo-refused");
+        e.dict = Arc::new(AsyncMutex::new(UserDict::empty(dir.clone())));
+        assert_eq!(render(&e, &word("ghdbtn", "првиет")).shown, "привет");
+        e.dict.try_lock().unwrap().add("првиет", Lang::Ru, ListKind::Learned).unwrap();
+        assert_eq!(render(&e, &word("ghdbtn", "првиет")).shown, "првиет");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

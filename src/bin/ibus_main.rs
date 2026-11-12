@@ -263,6 +263,25 @@ fn cmd_doctor() -> Result<()> {
         );
     }
     row("autocorrect", if cfg.dry_run { "off (dry_run)" } else { "on" });
+    // Typo fixing only works with the big dictionary: without it "unknown word" means
+    // nothing, and the switch being on would look like the feature not working.
+    let big_dict = puntu::config::config_dir().join("russian.fst");
+    row(
+        "typo fixing",
+        match (cfg.fix_typos, big_dict.exists()) {
+            (false, _) => "off",
+            (true, true) => "on",
+            (true, false) => "ON, but russian.fst is missing",
+        },
+    );
+    if cfg.fix_typos && !big_dict.exists() {
+        problems.push(format!(
+            "fix_typos is on, but the big dictionary ({}) is missing, so no typo is ever \
+             fixed. Build it: `puntu build-dict dictionaries/russian.utf-8` from a checkout, \
+             or reinstall.",
+            big_dict.display()
+        ));
+    }
     row(
         "require_preedit_capability",
         &cfg.ibus_clients.require_preedit_capability.to_string(),

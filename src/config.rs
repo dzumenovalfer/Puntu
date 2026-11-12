@@ -56,6 +56,15 @@ pub struct Config {
     /// letter) and `ПРивет` → `Привет` (Shift released late; dictionary-checked). ALL-CAPS
     /// words and mixed-case names (iPhone, КамАЗ) are never touched.
     pub fix_case: bool,
+    /// Fix typos in Russian words: `првиет` → `привет`. Off by default.
+    ///
+    /// Unlike a layout fix this *chooses* a word, so it is deliberately timid — see
+    /// `detect/typo.rs` for everything that makes it say no: only a word no dictionary knows,
+    /// only a single mechanical slip (letters swapped, a letter doubled or missing, a
+    /// neighbouring key), only into a common word, only when exactly one fits. Needs the big
+    /// dictionary (`russian.fst`). The correction is held in the preedit like any other word:
+    /// the flip hotkey takes it back, and a correction taken back is not made again.
+    pub fix_typos: bool,
     /// Max duration (ms) between the first modifier press and the last release for a
     /// modifier tap to fire. Longer chains are held shortcuts (Ctrl+click, an app-consumed
     /// chord like Ctrl+Shift+V in a terminal) and are ignored. Default 500.
@@ -346,6 +355,7 @@ impl Default for Config {
             paste_convert: false,
             enable_modifier_taps: true,
             fix_case: true,
+            fix_typos: false,
             tap_max_hold_ms: DEFAULT_TAP_MAX_HOLD_MS,
             hold_commit_ms: DEFAULT_HOLD_COMMIT_MS,
             debug_log: false,
@@ -452,6 +462,17 @@ mod tests {
         assert!(cfg.enable_modifier_taps);
         let from_old: Config = toml::from_str("dry_run = false\n").unwrap();
         assert!(from_old.enable_modifier_taps, "old config files inherit the default");
+    }
+
+    #[test]
+    fn typo_fixing_is_opt_in() {
+        // It rewrites words on a heuristic, so nobody gets it without asking — including
+        // everyone upgrading with a config file written before the key existed.
+        assert!(!Config::default().fix_typos);
+        let old: Config = toml::from_str("fix_case = true\n").unwrap();
+        assert!(!old.fix_typos);
+        let on: Config = toml::from_str("fix_typos = true\n").unwrap();
+        assert!(on.fix_typos);
     }
 
     #[test]

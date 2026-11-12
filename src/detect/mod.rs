@@ -2,6 +2,7 @@
 
 pub mod ngram;
 pub mod translit;
+pub mod typo;
 pub mod userdict;
 
 use std::collections::HashSet;
@@ -77,6 +78,24 @@ impl Models {
         false
     }
 
+    /// Is `word` in the bundled frequency list of `lang` (or among the words the user taught
+    /// through `words.<lang>.txt`)? Unlike [`Self::is_word`] this leaves the big dictionary
+    /// out: its 1.5 million forms are mostly words nobody types.
+    pub fn is_common_word(&self, word: &str, lang: Lang) -> bool {
+        let w = word.to_lowercase();
+        match lang {
+            Lang::Ru => self.ru_words.contains(&w),
+            Lang::En => self.en_words.contains(&w),
+        }
+    }
+
+    /// Is the big Russian dictionary loaded? Typo correction needs it: with only the bundled
+    /// 40 000-word list most inflected forms are "unknown", and unknown stops meaning
+    /// mistyped.
+    pub fn has_big_dictionary(&self) -> bool {
+        self.ru_big.is_some()
+    }
+
     /// Is `word` one of the two-letter words of `lang` that people actually type?
     ///
     /// Two letters are too few for anything but a list: the trigram model sees three
@@ -120,6 +139,22 @@ impl Models {
             builtin_words(include_str!("../../data/ru.words"), None),
             builtin_words(include_str!("../../data/en.words"), None),
         )
+    }
+
+    /// These models with `words` as the big Russian dictionary — what [`Models::load`] reads
+    /// from `russian.fst`, built in memory. For tests, and for anything else that wants the
+    /// dictionary-dependent behaviour (typo correction) without a file on disk.
+    pub fn with_big_dictionary<I, S>(mut self, words: I) -> Models
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut words: Vec<String> = words.into_iter().map(|w| w.as_ref().to_lowercase()).collect();
+        words.sort();
+        words.dedup();
+        // Sorted and deduplicated above, which is all `from_iter` asks for.
+        self.ru_big = fst::Set::from_iter(words).ok().map(Arc::new);
+        self
     }
 
     /// Built-in word lists **plus** the user's recognized-words files (`words.{ru,en}.txt` in
@@ -187,6 +222,27 @@ impl Detector {
     /// DirectRussian mode).
     pub fn is_known_word(&self, word: &str, lang: Lang) -> bool {
         self.models.is_word(word, lang)
+    }
+
+    /// The word `word` is a one-slip typo of, if there is exactly one — see [`typo::fix`]
+    /// for what counts and for everything that makes it say no. `word` is the Russian text
+    /// about to be shown; `capitalized_ok` says whether a leading capital may be a sentence
+    /// start rather than a name.
+    ///
+    /// Besides the dictionaries, the user's own lists count: a word they taught is a word,
+    /// and one they put on a never-correct list — which is what flipping a correction back
+    /// does — is left alone for good.
+    pub fn typo_fix(&self, word: &str, capitalized_ok: bool, dict: &UserDict) -> Option<String> {
+        if !self.models.has_big_dictionary() {
+            return None;
+        }
+        typo::fix(
+            word,
+            capitalized_ok,
+            |w| self.models.is_word(w, Lang::Ru) || dict.is_recognized(w, Lang::Ru),
+            |w| self.models.is_common_word(w, Lang::Ru) || dict.is_recognized(w, Lang::Ru),
+            |w| dict.is_exception(w, Lang::Ru),
+        )
     }
 
     /// Decide what to do with a finished word. Only ever proposes a conversion in a trusted

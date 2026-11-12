@@ -9,9 +9,9 @@ engine passes a key on). Each check then compares what would be on screen with w
 Everything goes over a private `dbus-daemon`, never the session's IBus, so it is safe to run
 while Puntu is your active input method.
 
-Usage: driver.py <bus-address> [typing|caps|keys|secret|surrounding|order|all]
+Usage: driver.py <bus-address> [typing|caps|keys|secret|surrounding|typos|order|all]
 """
-import sys, time
+import os, sys, time
 from gi.repository import Gio, GLib
 
 ADDR = sys.argv[1]
@@ -327,6 +327,66 @@ def scenario_surrounding():
     check("click after a space, then a letter: a word (d→в)", field.screen(), "walke в ")
 
 
+def flip():
+    """Ctrl+` — the flip hotkey."""
+    call("ProcessKeyEvent", "(uuu)", (KEYSYMS["grave"], 0, CTRL))
+    call("ProcessKeyEvent", "(uuu)", (KEYSYMS["grave"], 0, CTRL | RELEASE))
+
+
+def scenario_typos():
+    print("== typos (fix_typos = true) ==")
+    if os.environ.get("PUNTU_E2E_TYPOS") != "1":
+        print("  skipped: no big dictionary could be built for the test config")
+        return
+    # RU-direct: the keys of «првиет» (two letters swapped).
+    fresh(mode_ru=True)
+    type_text("ghdbtn ")
+    check("RU-direct: првиет → привет", field.screen(), "привет ")
+    flip()
+    check("1st flip takes the fix back", field.screen(), "првиет ")
+    flip()
+    check("2nd flip reaches the other layout", field.screen(), "ghdbtn ")
+    flip()
+    check("3rd flip is the fixed word again", field.screen(), "привет ")
+
+    # A fix taken back is not made again.
+    fresh(mode_ru=True)
+    type_text("cgfc,bj ")           # спасбио
+    check("спасбио → спасибо", field.screen(), "спасибо ")
+    flip()
+    type_text("cgfc,bj ")
+    check("…and once refused, it is left alone", field.screen(), "спасбио спасбио ")
+
+    # What is not an obvious slip is left as typed: a word the dictionary lacks (ревью),
+    # a correct word, a short one.
+    fresh(mode_ru=True)
+    type_text("htdm. ghbdtn rfr ")
+    check("ревью / привет / как are not touched", field.screen(), "ревью привет как ")
+
+    # A capital marks a name — unless the word starts a sentence.
+    fresh(mode_ru=True)
+    type_text("Ctujlyz ")            # «Сегодня» typed right: stays
+    type_text("Ctuljyz ")            # «Сегдоня» mid-sentence: a name for all we know
+    check("capitalised mid-sentence: left alone", field.screen(), "Сегодня Сегдоня ")
+    fresh(mode_ru=True)
+    type_text("ghbdtn/ Ctuljyz ")    # «привет. Сегдоня»
+    check("capitalised after a full stop: fixed", field.screen(), "привет. Сегодня ")
+
+    # EN auto-correct mode: the wrong-layout word is converted first, then fixed.
+    fresh(mode_ru=False)
+    type_text("gj;fkeqcnf ")         # пожалуйста typed right, wrong layout
+    type_text("gj;fkeqncf ")         # пожалуйтса
+    check("wrong layout + typo: converted, then fixed", field.screen(), "пожалуйста пожалуйста ")
+    # English is never "fixed".
+    fresh(mode_ru=False)
+    type_text("hello wrold tommorow ")
+    check("English typos are not this feature's business", field.screen(), "hello wrold tommorow ")
+    # A retyped ending is a fragment, typo or not.
+    fresh(mode_ru=True)
+    type_text("ghbdtn \b\b\bnt ")     # привет → прив + те
+    check("a fragment is never 'fixed'", field.screen(), "привте ")
+
+
 def scenario_order(n=300):
     """Fire FocusOutId/FocusInId/SetCapabilities bursts without waiting, like ibus-daemon does,
     then check which client the engine believes it is talking to."""
@@ -361,6 +421,7 @@ SETS = {
     "keys": scenario_keys,
     "secret": scenario_secret,
     "surrounding": scenario_surrounding,
+    "typos": scenario_typos,
     "order": scenario_order,
 }
 focus()

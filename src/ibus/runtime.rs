@@ -181,12 +181,13 @@ fn apply_log_level(verbose: bool) {
 fn log_settings(cfg: &crate::config::Config) {
     info!(
         "hotkeys: undo={:?} mode_toggle={:?} convert_last={:?} taps_enabled={} autocorrect={} \
-         hold_commit_ms={} debug_log={}",
+         fix_typos={} hold_commit_ms={} debug_log={}",
         cfg.ibus_hotkeys.undo_key,
         cfg.ibus_hotkeys.mode_toggle,
         cfg.ibus_hotkeys.convert_last,
         cfg.enable_modifier_taps,
         !cfg.dry_run,
+        cfg.fix_typos,
         cfg.hold_commit_ms,
         cfg.debug_log,
     );

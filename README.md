@@ -266,10 +266,9 @@ puntu dict rm адр                          # remove a rule
 ```
 
 Matching is on the **whole word, exactly**. A rule for `портоилио` does nothing for
-`портоилиом` — each form you actually mistype needs its own line. Guessing corrections for
-words that aren't in the table is a different feature (dictionary-based typo correction) and is
-not built yet: today Puntu fixes the *layout* you typed in, not your spelling, so `какойто`
-stays `какойто`.
+`портоилиом` — each form you actually mistype needs its own line. Guessing a correction for a
+word that is *not* in the table is the job of typo fixing (next section), which only handles a
+single slip of the finger: a spelling habit like `какойто` still needs a rule here.
 
 The file is `~/.config/puntu/replacements.txt`, hand-editable and hot-reloaded like the word
 lists. A rule matches **both readings of the keys**, so `ривет = привет` fires whether you
@@ -280,6 +279,39 @@ values, where the capitalisation is part of your text.
 Unlike a correction, a replacement is a rule you wrote, so undoing one with `Ctrl+` `` ` ``
 teaches nothing and never triggers the "remember this word?" offer. Replacements are off
 wherever rewriting is: in terminals and under `dry_run`.
+
+### Typos (opt-in)
+
+```sh
+puntu config set fix_typos true      # or the «Исправление опечаток» switch in the Puntu app
+```
+
+With this on, a Russian word that no dictionary knows is fixed when it is **one obvious slip
+of the finger** away from a common word: two letters swapped (`првиет` → `привет`), a letter
+doubled or missing (`здравстуйте`), a neighbouring key hit instead of the right one
+(`работаьт`). It works on whatever ends up Russian — typed in RU-direct, or converted from the
+wrong layout first (`gj;fkeqncf` → `пожалуйтса` → `пожалуйста`).
+
+Unlike a layout fix, this *chooses* a word, so it is built to say no:
+
+- the word must be unknown — a rare word is still a word, and a word you taught
+  (`puntu dict learn`) is too;
+- the fix must be a **common** word, and the only one within one slip. `ревью` is not
+  "corrected" to `ревю`, `коммит` not to `комми`;
+- short words are believed only for the unmistakable slips: a swap or a doubled letter from
+  5 letters, a missing letter from 6, a neighbouring key from 7;
+- a capital letter marks a name, unless the word starts a sentence;
+- never English, never in a terminal, never a fragment you are retyping, and it needs the
+  big dictionary (`russian.fst`, which `install.sh` sets up).
+
+Measured on 7 600 synthetic typos of frequent words, this fixes two in three and never picks
+the wrong word; of 236 real words the dictionary lacks (IT slang, chat forms, names) it
+rewrites none.
+
+The fixed word is held like any other, so `Ctrl+` `` ` `` takes it back: the first press
+restores what you typed (and that word is left alone from then on — a notification says so),
+the second goes on to the other layout, the third returns to the fix. `puntu stdin` shows what
+the corrector would do with a word without typing it anywhere.
 
 ### The Puntu app (settings + dictionary)
 
