@@ -55,6 +55,94 @@ fn open_app() {
     }
 }
 
+/// A desktop notification (best effort).
+fn notify(body: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=Puntu", "--icon=puntu", "Puntu", body])
+        .spawn()
+        .map(|mut c| {
+            std::thread::spawn(move || {
+                let _ = c.wait();
+            })
+        });
+}
+
+/// «Проверить обновления…»: ask `puntu update --check`, and if there is a newer release,
+/// offer to install it. Off the tray's own thread — it talks to the network.
+fn check_for_updates() {
+    std::thread::spawn(|| {
+        let puntu = sibling("puntu");
+        let out = match std::process::Command::new(&puntu).args(["update", "--check"]).output() {
+            Ok(o) => o,
+            Err(e) => return notify(&format!("Не удалось проверить обновления: {e}")),
+        };
+        let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        match out.status.code() {
+            // 10 = "a newer release exists" (see `puntu update --check`).
+            Some(10) => {
+                let install = std::process::Command::new("zenity")
+                    .args([
+                        "--question",
+                        "--title=Puntu",
+                        &format!(
+                            "--text={said}\n\nОбновить сейчас? Ввод прервётся на пару секунд, \
+                             пока перезапускается IBus."
+                        ),
+                        "--ok-label=Обновить",
+                        "--cancel-label=Позже",
+                    ])
+                    .status();
+                match install {
+                    Ok(s) if s.success() => start_update(&puntu),
+                    Ok(_) => {}
+                    // No zenity to ask with: say how to do it by hand.
+                    Err(_) => notify(&format!("{said}\nОбновить: puntu update")),
+                }
+            }
+            Some(0) => notify(&said),
+            _ => notify(&format!(
+                "Не удалось проверить обновления:\n{}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+        }
+    });
+}
+
+/// Run `puntu update` detached from the tray: the installer restarts the tray (that is, kills
+/// this process) partway through, and must not die with it. Its output goes to a log next to
+/// the engine's, and a notification says how it ended.
+fn start_update(puntu: &std::path::Path) {
+    let log = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("puntu");
+    let _ = std::fs::create_dir_all(&log);
+    let log = log.join("update.log");
+    let script = r#""$0" update > "$1" 2>&1 \
+        && notify-send --app-name=Puntu --icon=puntu Puntu "Puntu обновлён." \
+        || notify-send --app-name=Puntu --icon=puntu Puntu "Обновление не удалось — подробности в $1""#;
+    let spawned = std::process::Command::new("setsid")
+        .arg("sh")
+        .arg("-c")
+        .arg(script)
+        .arg(puntu)
+        .arg(&log)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(mut child) => {
+            notify("Обновление запущено…");
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => notify(&format!("Не удалось запустить обновление: {e}")),
+    }
+}
+
 /// Is the Puntu engine the active IBus input source right now?
 fn engine_active() -> bool {
     std::process::Command::new("ibus")
@@ -181,6 +269,13 @@ impl Tray for PuntuTray {
                     t.state.paused = false;
                     set_paused(false);
                 }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Проверить обновления…".into(),
+                icon_name: "software-update-available-symbolic".into(),
+                activate: Box::new(|_| check_for_updates()),
                 ..Default::default()
             }
             .into(),

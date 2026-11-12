@@ -78,6 +78,19 @@ Copy that one file over and run:
 tar xzf puntu-x86_64-linux.tar.gz && ./puntu/install.sh
 ```
 
+To update a machine installed that way (or with the one-liner) later:
+
+```sh
+puntu update            # is there a newer release? download it and install it
+puntu update --check    # only say so (exit code 10 if there is)
+```
+
+The tray menu has the same thing as «Проверить обновления…». It asks GitHub for the latest
+release, and if that is newer than what is running, downloads the archive and runs the
+installer inside it — binaries and an IBus restart; your config and word lists stay. A copy
+built from a checkout is not replaced behind your back: there `./install.sh --update` is the
+way, and `puntu update` says so.
+
 The installer sees the binaries next to it and installs exactly those — nothing is downloaded
 and nothing is compiled. (An archive from the Releases page works the same way; it has the
 same layout.) Prebuilt binaries need a C library at least as new as the one they were built

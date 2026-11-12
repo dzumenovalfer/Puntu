@@ -16,6 +16,9 @@ pub mod detect;
 pub mod ipc;
 pub mod keymap;
 pub mod layout;
+// `puntu update`: the version arithmetic and the reading of GitHub's reply. Pure, so it lives
+// in the core and is tested there; the command that acts on it is in `main.rs`.
+pub mod update;
 
 #[cfg(feature = "daemon")]
 pub mod action;

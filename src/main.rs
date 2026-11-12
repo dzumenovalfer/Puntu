@@ -78,6 +78,16 @@ enum Cmd {
         input: PathBuf,
         output: Option<PathBuf>,
     },
+    /// Update Puntu to the latest release: downloads the archive from GitHub and runs the
+    /// installer inside it (binaries, IBus restart — your config and word lists stay).
+    Update {
+        /// Only say whether a newer release exists. Exit code 10 if it does, 0 if not.
+        #[arg(long)]
+        check: bool,
+        /// Replace a copy built from source with the prebuilt release.
+        #[arg(long)]
+        force: bool,
+    },
     /// Switch how Puntu intercepts your typing. Two frontends are available:
     ///   - `ibus`   — IBus engine: keystrokes go through us BEFORE the app; mostly race-free.
     ///   - `uinput` — Legacy daemon: reads /dev/input/event* + injects corrections via uinput.
@@ -212,6 +222,7 @@ fn main() -> Result<()> {
         Cmd::TestType { text } => test_type(cfg()?, text),
         Cmd::TestSwitch => test_switch(),
         Cmd::BuildDict { input, output } => build_dict(input, output),
+        Cmd::Update { check, force } => run_update(check, force),
         Cmd::Mode { target } => run_mode(target),
     }
 }
@@ -338,6 +349,120 @@ fn run_mode(target: ModeTarget) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `puntu update`: find the latest release, and install it if it is newer than this build.
+///
+/// The installing is done by the `install.sh` **inside the downloaded archive** (its bundle
+/// mode), not by a script fetched separately: the installer then always matches the binaries
+/// it installs, and nothing depends on what the default branch looks like that day.
+fn run_update(check_only: bool, force: bool) -> Result<()> {
+    use puntu::update::{self, Verdict};
+    use std::process::Command;
+
+    let repo = update::repo();
+    let current = env!("CARGO_PKG_VERSION");
+    let reply = Command::new("curl")
+        .args(["-fsSL", "--retry", "2", "-H", "Accept: application/vnd.github+json"])
+        .arg(update::latest_release_url())
+        .output()
+        .context("запуск curl (он установлен?)")?;
+    if !reply.status.success() {
+        anyhow::bail!(
+            "не удалось узнать последнюю версию у GitHub ({repo}): {}",
+            String::from_utf8_lossy(&reply.stderr).trim()
+        );
+    }
+    let json = String::from_utf8_lossy(&reply.stdout);
+    let tag = update::json_string(&json, "tag_name")
+        .with_context(|| format!("в ответе GitHub нет релиза для {repo}"))?;
+    let verdict = update::verdict(current, tag)
+        .with_context(|| format!("не удалось сравнить версии {current:?} и {tag:?}"))?;
+    let latest = match verdict {
+        Verdict::UpToDate { current } => {
+            println!("Puntu {current} — это последняя версия.");
+            return Ok(());
+        }
+        Verdict::Ahead { current, latest } => {
+            println!(
+                "Установлена {current}, последний релиз — {latest}: эта сборка новее релиза, \
+                 обновлять нечего."
+            );
+            return Ok(());
+        }
+        Verdict::Available { current, latest } => {
+            println!("Доступна версия {latest} (установлена {current}).");
+            latest
+        }
+    };
+    if check_only {
+        // For scripts and the tray: "there is something to install".
+        std::process::exit(10);
+    }
+
+    // A copy built from a checkout lives in ~/.cargo/bin; the release installs into
+    // ~/.local/bin. Quietly doing that would leave two installs and repoint IBus at the
+    // other one — the owner of a checkout almost certainly wants to rebuild it instead.
+    let exe = std::env::current_exe().unwrap_or_default();
+    if !force && exe.components().any(|c| c.as_os_str() == ".cargo") {
+        let checkout = Command::new("cargo")
+            .args(["install", "--list"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .find(|l| l.starts_with("puntu "))
+                    .and_then(|l| Some(l.split_once('(')?.1.split_once(')')?.0.to_string()))
+            })
+            .unwrap_or_else(|| "<каталог исходников>".to_string());
+        anyhow::bail!(
+            "эта копия собрана из исходников ({}).\n\
+             Обновить её:                    cd {checkout} && ./install.sh --update\n\
+             Перейти на готовый релиз {latest}:  puntu update --force",
+            exe.display()
+        );
+    }
+
+    let arch = std::env::consts::ARCH;
+    let url = update::asset_url(&json, arch).with_context(|| {
+        format!("в релизе {latest} нет готовой сборки для {arch} — соберите из исходников")
+    })?;
+    let dir = std::env::temp_dir().join(format!("puntu-update-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).with_context(|| format!("создание {}", dir.display()))?;
+    let result = (|| -> Result<()> {
+        let archive = dir.join("puntu.tar.gz");
+        println!("Скачиваю {url}…");
+        let ok = Command::new("curl")
+            .args(["-fsSL", "--retry", "2", "-o"])
+            .arg(&archive)
+            .arg(url)
+            .status()
+            .context("запуск curl")?
+            .success();
+        anyhow::ensure!(ok, "не удалось скачать {url}");
+        let ok = Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&dir)
+            .status()
+            .context("запуск tar")?
+            .success();
+        anyhow::ensure!(ok, "архив {url} не распаковывается");
+        let installer = dir.join("puntu").join("install.sh");
+        anyhow::ensure!(installer.exists(), "в архиве релиза {latest} нет install.sh");
+        let ok = Command::new("bash")
+            .arg(&installer)
+            .arg("--update")
+            .status()
+            .context("запуск установщика")?
+            .success();
+        anyhow::ensure!(ok, "установщик релиза {latest} завершился с ошибкой");
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 /// Build a compact FST set from a big word list (one Russian word per line) for low-memory

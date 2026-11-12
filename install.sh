@@ -40,11 +40,13 @@ install.sh — install or update Puntu.
 
   ./install.sh              full install: packages, binaries, IBus component, icons,
                             menu entry, tray autostart, Electron flags
-  ./install.sh --update     update an existing install: pull, rebuild, reinstall the
-                            binaries, restart IBus. Skips everything one-time (packages,
-                            icons, .desktop files, Electron flags) and needs no sudo
-                            unless the engine's path changed. Run it from a checkout —
-                            or from an unpacked archive, to move to the build inside it.
+  ./install.sh --update     update an existing install: reinstall the binaries and restart
+                            IBus, skipping everything one-time (packages, icons, .desktop
+                            files, Electron flags); no sudo unless the engine's path
+                            changed. From a checkout it pulls and rebuilds; from an unpacked
+                            archive it installs the build inside; piped from the web it
+                            downloads the latest release. `puntu update` does the latter two
+                            for you, and only when there is something newer.
   ./install.sh --no-sudo    skip apt and the system-wide component copy
 
 Run from an unpacked release archive (the script next to the binaries), it installs those
@@ -72,12 +74,12 @@ BUNDLE=0
 [[ "$LOCAL" -eq 0 && -f "$REPO_DIR/puntu-ibus" && -f "$REPO_DIR/puntu" ]] && BUNDLE=1
 
 # --- Update mode -------------------------------------------------------------
-# Needs something to update FROM: a checkout to rebuild, or an archive to install.
-if [[ "$UPDATE" -eq 1 && "$LOCAL" -eq 0 && "$BUNDLE" -eq 0 ]]; then
-  warn "--update rebuilds from source, so run it inside a checkout:"
-  warn "  git clone https://github.com/$PUNTU_REPO ~/puntu && cd ~/puntu && ./install.sh"
-  exit 1
-fi
+# Updates from whatever this script was started as: a checkout is pulled and rebuilt, an
+# unpacked archive is installed as it is, and piped from the web
+# (`curl … | bash -s -- --update`) the latest release is downloaded. Either way everything
+# that is one-time — packages, icons, the menu entry, Electron flags — is skipped.
+# (`puntu update` is the convenient form of the last two: it checks whether there is
+# anything newer first.)
 
 if [[ "$UPDATE" -eq 1 && -d "$REPO_DIR/.git" ]]; then
   say "Updating the checkout…"
