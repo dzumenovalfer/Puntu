@@ -11,8 +11,9 @@
 #
 # The binaries only run on systems whose C library is at least as new as the one they were
 # built against; the script prints that floor at the end, and install.sh checks it on the
-# target before replacing anything. For the widest reach, publish a release instead (CI
-# builds on an older Ubuntu) or build from source on the target.
+# target before replacing anything. For an OLDER target take the archive from the project's
+# Releases page instead (CI builds it inside Ubuntu 22.04, for glibc 2.35 — see
+# .github/workflows/release.yml), or build from source on the target.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,6 +55,7 @@ if command -v objdump >/dev/null 2>&1; then
     need="$(objdump -T "$TARGET/$bin" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n1)"
     printf '      %-11s %s\n' "$bin" "${need#GLIBC_}"
   done
+  echo "    For an older system: the archive from the Releases page is built for glibc 2.35."
 fi
 cat <<EOF
 

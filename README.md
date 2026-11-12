@@ -50,6 +50,10 @@ Rust toolchain needed), installs the runtime dependencies (`ibus`, `wl-clipboard
 the IBus component, restarts IBus, and adds **Puntu** to your GNOME input sources. Re-run any
 time to update — it's idempotent and never rewrites your existing layouts.
 
+Release binaries are built on Ubuntu 22.04, so they run on any x86_64 system with glibc 2.35
+or newer — Ubuntu 22.04+, Debian 12+, Fedora 36+. On something older the installer says so
+before it changes anything, and you build from source instead (next paragraph).
+
 From a source checkout, `./install.sh` does the same but builds with cargo (installing rustup
 if needed). To move an existing install to a newer build, use the update path instead:
 
@@ -96,7 +100,10 @@ and nothing is compiled. (An archive from the Releases page works the same way; 
 same layout.) Prebuilt binaries need a C library at least as new as the one they were built
 against: `package.sh` prints that floor, and on the target the installer checks it **before**
 replacing anything — if the engine cannot run there it stops and tells you to build from
-source; if only the settings window cannot, it installs the rest.
+source; if only the settings window cannot, it installs the rest. So an archive made on a
+new system is for systems at least as new; for an older one take
+`puntu-x86_64-linux.tar.gz` from the [Releases page](https://github.com/dzumenovalfer/Puntu/releases)
+instead — that one is built for glibc 2.35 and installs the same way, offline.
 
 Then switch to it with **Super+Space** (or the input-source icon) and pick **Puntu**.
 

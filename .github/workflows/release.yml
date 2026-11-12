@@ -3,18 +3,58 @@ name: Release
 # Tag a commit `vX.Y.Z` and push the tag — this builds the IBus engine, compiles the big
 # Russian dictionary FST, and publishes puntu-x86_64-linux.tar.gz on a GitHub Release.
 # `install.sh` (remote mode) downloads exactly that artifact, so end users never need Rust.
+#
+# It can also be started by hand, to build a tag that already exists once more:
+#
+#     gh workflow run release.yml -f tag=v0.9.6                  # build only
+#     gh workflow run release.yml -f tag=v0.9.6 -f publish=true  # …and replace the archive
+#
+# Without `publish` the archive is only kept with the run (Artifacts), to look at before
+# anything public changes.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build, e.g. v0.9.6"
+        required: true
+        type: string
+      publish:
+        description: "Replace the archive on that tag's release (off: build and keep with the run)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
+env:
+  # The oldest C library a release must run on: Ubuntu 22.04's (Debian 12 has 2.36). Goes
+  # together with the `container:` below — change one, change the other.
+  GLIBC_FLOOR: "2.35"
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Built INSIDE the oldest system a release should run on — not on whatever the runner
+    # image currently is. A binary needs at least the C library it was linked against, and
+    # `ubuntu-latest` moves: v0.9.6 was first built days after it had become Ubuntu 26.04,
+    # and its settings window came out asking for glibc 2.43 — it would not have started on
+    # Ubuntu 24.04, where every release before it ran. A container pins this for good; a
+    # runner label (`ubuntu-22.04`) would pin it only until GitHub retires that image.
+    container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash   # a container job would otherwise run these with plain `sh`
     steps:
+      - name: Build tools (the container image is bare)
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            ca-certificates curl git build-essential
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Build (release, IBus engine + app window)
         run: cargo build --release --no-default-features --features ibus,app,gui
@@ -26,8 +66,55 @@ jobs:
           cp target/release/puntu target/release/puntu-ibus target/release/puntu-app \
              target/release/puntu-gui russian.fst install.sh dist/puntu/
           tar -C dist -czf puntu-x86_64-linux.tar.gz puntu
+      # The tripwire for the comment on `container:` above. This job runs on the floor
+      # itself, so the binaries are also simply started here — the two that can be: the
+      # settings window and the tray take no arguments and would try to open a display, so
+      # for those the dynamic loader is asked instead (`ldd -r` resolves every library,
+      # symbol version and symbol without running the program).
+      - name: Check the binaries run on glibc ${{ env.GLIBC_FLOOR }}
+        run: |
+          # awk reads to the end: `head -n1` would close the pipe early, and under pipefail
+          # the SIGPIPE that gives ldd now and then fails the whole step.
+          built_on="$(ldd --version | awk 'NR == 1 { print $NF }')"
+          echo "Built on glibc $built_on; a release must not need more than $GLIBC_FLOOR."
+          bad=0
+          for bin in puntu puntu-ibus puntu-gui puntu-app; do
+            need="$(objdump -T "dist/puntu/$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n1 || true)"
+            need="${need#GLIBC_}"
+            echo "  $bin needs glibc ${need:-?}"
+            if [[ -z "$need" || "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$need" | sort -V | tail -n1)" != "$GLIBC_FLOOR" ]]; then
+              echo "::error::$bin needs glibc ${need:-?}, newer than the $GLIBC_FLOOR floor — was the container image changed?"
+              bad=1
+            fi
+            unresolved="$(ldd -r "dist/puntu/$bin" 2>&1 | grep -E "not found|undefined symbol" || true)"
+            if [[ -n "$unresolved" ]]; then
+              echo "::error::$bin does not load on glibc $built_on: $(head -n1 <<<"$unresolved")"
+              echo "$unresolved"
+              bad=1
+            fi
+          done
+          dist/puntu/puntu --version
+          dist/puntu/puntu-ibus --help >/dev/null
+          {
+            echo "### puntu-x86_64-linux.tar.gz"
+            echo "$(dist/puntu/puntu --version), built on glibc $built_on — runs on glibc $GLIBC_FLOOR and newer."
+            echo
+            echo '```'
+            sha256sum puntu-x86_64-linux.tar.gz
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$bad"
+      - name: Keep the archive with this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: puntu-x86_64-linux
+          path: puntu-x86_64-linux.tar.gz
+          if-no-files-found: error
+          retention-days: 14
       - name: Publish GitHub Release
+        if: github.event_name == 'push' || inputs.publish
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: puntu-x86_64-linux.tar.gz
           generate_release_notes: true
