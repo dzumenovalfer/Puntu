@@ -117,4 +117,6 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: puntu-x86_64-linux.tar.gz
-          generate_release_notes: true
+          # Only when the release is created. Asked for again on a rebuild, GitHub appends
+          # the generated notes to the ones already there — the text doubles each time.
+          generate_release_notes: ${{ github.event_name == 'push' }}
